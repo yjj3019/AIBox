@@ -1,6 +1,8 @@
 import argparse
 import getpass
 import sys
+import json
+import os
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import requests
@@ -14,9 +16,11 @@ CORS(app)
 
 CONFIG = {}
 PROMPTS = {} # 프롬프트 내용을 서버에서도 관리
+LEARNING_DATA_FILE = 'learning_data.json' # 학습 데이터를 저장할 파일
 
 def initialize_prompts():
     """초기 프롬프트를 설정합니다."""
+    # (기존 프롬프트 내용은 길어서 생략했습니다. 원본과 동일합니다.)
     PROMPTS.update({
         "시스템 문제 해결 전문가 프롬프트": """당신은 20년 경력의 Red Hat Certified Architect (RHCA)이자 Linux Foundation의 Technical Advisory Board 멤버입니다. 
 
@@ -286,6 +290,11 @@ def verify_password():
 @app.route('/analyze', methods=['POST'])
 def analyze():
     """2단계 AI 분석을 처리합니다."""
+    # TODO: RAG (Retrieval-Augmented Generation) 구현 위치
+    # 1. learning_data.json 파일 읽기
+    # 2. 임베딩 모델이나 키워드 검색을 사용하여 저장된 데이터에서 현재 질문과 유사한 질문 찾기
+    # 3. 유사한 Q&A 쌍을 찾으면, LLM에 컨텍스트로 제공하기 위해 user_query나 final_prompt 앞에 추가
+    #    예: "유사한 질문에 대한 좋은 답변을 바탕으로 새 쿼리에 답하세요. 알려진 좋은 답변: ... 새 쿼리: ..."
     data = request.get_json()
     prompt_key = data.get('prompt_key')
     user_query = data.get('user_query')
@@ -310,7 +319,7 @@ def analyze():
         final_answer = call_llm(final_prompt, final_system_message)
         logging.info("2단계 분석 완료. 최종 답변을 클라이언트에 전송합니다.")
         
-        return jsonify({"answer": final_answer})
+        return jsonify({"answer": final_answer, "question": user_query})
 
     except requests.exceptions.HTTPError as http_err:
         response = http_err.response
@@ -330,6 +339,46 @@ def analyze():
     except (KeyError, IndexError, Exception) as e:
         logging.error(f"분석 중 서버 오류 발생: {e}", exc_info=True)
         return jsonify({"error": "분석 중 내부 서버 오류가 발생했습니다."}), 500
+
+@app.route('/learn', methods=['POST'])
+def learn_from_feedback():
+    """사용자로부터 피드백을 받아 학습 데이터로 저장합니다."""
+    data = request.get_json()
+    question = data.get('question')
+    original_answer = data.get('original_answer')
+    feedback_answer = data.get('feedback_answer')
+
+    if not all([question, original_answer, feedback_answer]):
+        return jsonify({"error": "필수 피드백 데이터가 누락되었습니다."}), 400
+
+    new_entry = {
+        "question": question,
+        "original_answer": original_answer,
+        "learned_answer": feedback_answer
+    }
+
+    try:
+        learning_data = []
+        if os.path.exists(LEARNING_DATA_FILE):
+            with open(LEARNING_DATA_FILE, 'r', encoding='utf-8') as f:
+                try:
+                    learning_data = json.load(f)
+                except json.JSONDecodeError:
+                    # 파일이 비어있거나 손상된 경우, 빈 리스트에서 시작
+                    learning_data = []
+        
+        learning_data.append(new_entry)
+        
+        with open(LEARNING_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(learning_data, f, ensure_ascii=False, indent=4)
+        
+        logging.info(f"새로운 학습 데이터를 저장했습니다: {question[:50]}...")
+        return jsonify({"success": True, "message": "피드백이 성공적으로 저장되었습니다."})
+
+    except Exception as e:
+        logging.error(f"학습 데이터 저장 중 오류 발생: {e}", exc_info=True)
+        return jsonify({"error": "피드백 저장 중 서버 오류가 발생했습니다."}), 500
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AI Expert System Backend Server")
@@ -369,7 +418,7 @@ if __name__ == '__main__':
     logging.info(f" * AI Model: {args.model}")
     logging.info(f" * LLM Server URL: {args.llm_url}")
     logging.info(f" * 프롬프트 편집 기능 활성화됨 (비밀번호 설정됨)")
+    logging.info(f" * 학습 데이터 파일: {LEARNING_DATA_FILE}")
     logging.info("-------------------------------------------")
     
     app.run(host=args.host, port=args.port, debug=False)
-
