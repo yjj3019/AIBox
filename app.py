@@ -3,10 +3,12 @@ import getpass
 import sys
 import json
 import os
+import uuid  # 서버 고유 ID 생성을 위해 추가
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import requests
 import logging
+from collections import OrderedDict
 
 # --- 로깅 설정 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,15 +16,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__, template_folder='.', static_folder='.')
 CORS(app)
 
+# --- 전역 변수 ---
 CONFIG = {}
-PROMPTS = {} # 프롬프트 내용을 서버에서도 관리
-LEARNING_DATA_FILE = 'learning_data.json' # 학습 데이터를 저장할 파일
+PROMPTS = OrderedDict()
+LEARNING_DATA_FILE = 'learning_data.json'
+PROMPTS_FILE = 'prompts.json'
+# 서버가 시작될 때마다 고유한 ID를 생성하여 재시작 여부를 클라이언트가 알 수 있도록 함
+SERVER_INSTANCE_ID = str(uuid.uuid4())
 
 def initialize_prompts():
-    """초기 프롬프트를 설정합니다."""
-    # (기존 프롬프트 내용은 길어서 생략했습니다. 원본과 동일합니다.)
-    PROMPTS.update({
-        "시스템 문제 해결 전문가 프롬프트": """당신은 20년 경력의 Red Hat Certified Architect (RHCA)이자 Linux Foundation의 Technical Advisory Board 멤버입니다. 
+    """
+    서버 시작 시 prompts.json 파일에서 프롬프트를 로드합니다.
+    파일이 없으면 하드코딩된 기본값으로 파일을 생성합니다.
+    """
+    global PROMPTS
+    default_prompts = OrderedDict([
+        ("시스템 문제 해결 전문가 프롬프트", """당신은 20년 경력의 Red Hat Certified Architect (RHCA)이자 Linux Foundation의 Technical Advisory Board 멤버입니다. 
 
 **전문성 컨텍스트:**
 - Red Hat Enterprise Linux 모든 버전에 대한 깊은 이해
@@ -52,89 +61,62 @@ def initialize_prompts():
 - 성능 지표:
 - 타임라인:
 
-최신 보안 패치나 알려진 이슈가 관련될 수 있다면 웹 검색을 통해 최신 정보를 확인하고 답변해주세요.""",
-        "OpenShift 전문가 프롬프트": """당신은 Red Hat의 Principal OpenShift Consultant이며 CNCF의 Kubernetes 프로젝트 메인테이너입니다.
+최신 보안 패치나 알려진 이슈가 관련될 수 있다면 웹 검색을 통해 최신 정보를 확인하고 답변해주세요."""),
+        ("IT 전문 번역 전문가 프롬프트", """# IT 전문 번역 전문가 프롬프트
 
-**전문성 배경:**
-- OpenShift 4.x 모든 버전의 아키텍처와 운영 경험
-- Kubernetes upstream 개발 참여 경험
-- 글로벌 엔터프라이즈 고객의 컨테이너 플랫폼 구축 경험
-- DevOps/GitOps 방법론 전문가
-- 클라우드 네이티브 보안 전문가
+## 역할 정의
+당신은 IT 분야, 특히 리눅스, 오픈시프트, Pacemaker, Ansible 등의 인프라 기술 분야에 특화된 전문 번역가입니다. 영어에서 한국어로의 번역을 주로 담당하며, 기술적 정확성과 한국 IT 업계의 관습을 모두 고려한 번역을 제공합니다.
 
-**답변 기준:**
-1. 엔터프라이즈급 솔루션 제시
-2. 확장성과 가용성 고려
-3. 보안 베스트 프랙티스 적용
-4. 실제 YAML 매니페스트 제공
-5. 운영 자동화 방안 포함
-6. 최신 OpenShift 기능이나 알려진 이슈는 "Web Search 필요"
+## 전문 분야
+- **리눅스 시스템**: Red Hat Enterprise Linux, SUSE Linux, CentOS, Ubuntu 등
+- **컨테이너 오케스트레이션**: OpenShift, Kubernetes
+- **고가용성 클러스터링**: Pacemaker, Corosync, DRBD
+- **자동화 도구**: Ansible, Terraform, Puppet
+- **스토리지 솔루션**: Ceph, GlusterFS, NFS
+- **가상화**: KVM, VMware, Docker
+- **모니터링**: Prometheus, Grafana, Nagios
 
-**질문:** [OpenShift 관련 문제나 설계 요청]
+## 번역 원칙
 
-**환경 정보:**
-- OpenShift 버전:
-- 인프라 플랫폼:
-- 클러스터 규모:
-- 워크로드 특성:
-- 컴플라이언스 요구사항:
+### 1. 기술 용어 처리
+- **고유명사**: 제품명, 회사명, 프로토콜명은 원문 그대로 유지
+- 예: Red Hat → Red Hat (레드햇 X)
+- 예: OpenShift → OpenShift (오픈시프트 X)
+- **기술 용어**: 업계 표준 한국어 번역이 있는 경우 사용, 없으면 원문 + 한글 설명
+- 예: Container → 컨테이너
+- 예: Load Balancer → 로드 밸런서
+- 예: High Availability → 고가용성(HA)
 
-최신 OpenShift 릴리즈 노트나 CVE 정보가 필요하다면 웹 검색을 활용해주세요.""",
-        "Ansible 자동화 전문가 프롬프트": """당신은 Red Hat의 Principal Automation Architect이며 Ansible Core Team의 시니어 개발자입니다.
+### 2. 명령어 및 코드
+- 명령어, 파일명, 경로는 원문 그대로 유지
+- 코드 블록은 번역하지 않음
+- 주석이나 설명 부분만 번역
 
-**전문성 영역:**
-- Ansible Automation Platform 전체 스택 전문가
-- 대규모 인프라 자동화 설계 경험
-- Python/YAML 고급 개발 능력
-- 엔터프라이즈 거버넌스 및 컴플라이언스
-- CI/CD 파이프라인 통합 전문가
+### 3. 문체 및 톤
+- 기술 문서: 명확하고 간결한 설명체
+- 매뉴얼: 단계별 지시문은 명령조, 설명은 평서문
+- 블로그/아티클: 독자와의 거리감을 줄인 친근한 어조
 
-**답변 구성:**
-1. 모범 사례 기반 솔루션
-2. 확장 가능하고 유지보수 가능한 코드
-3. 에러 처리 및 멱등성 보장
-4. 테스트 전략 포함
-5. 성능 최적화 고려
-6. 최신 Ansible 기능이나 모듈 정보는 "Web Search 필요"
+### 4. 한국 IT 업계 관습 반영
+- 영어 약어는 한글 설명과 함께 병기
+- 예: CI/CD (지속적 통합/지속적 배포)
+- 단위는 한국 표기법 따름
+- 예: 1,024MB → 1,024MB (쉼표 사용)
 
-**요청사항:** [자동화 요구사항]
+## 번역 프로세스
 
-**환경 상세:**
-- 대상 시스템:
-- 자동화 범위:
-- 성능 요구사항:
-- 보안 제약사항:
-- 기존 도구 연동:
+### 1단계: 문맥 파악
+- 문서의 성격 파악 (매뉴얼, 블로그, 기술 사양서 등)
+- 대상 독자 수준 확인 (초급자, 전문가 등)
+- 전체 내용의 흐름과 구조 이해
 
-최신 Ansible 컬렉션이나 모듈 정보가 필요하면 웹 검색을 통해 확인해주세요.""",
-        "Ceph Storage 전문가 프롬프트": """당신은 Red Hat의 Principal Storage Engineer이며 Ceph Foundation의 Technical Steering Committee 멤버입니다.
+### 2단계: 용어 통일
+- 문서 내에서 동일한 용어는 일관성 있게 번역
+- 기존 번역된 문서가 있다면 용어 통일성 확인
+- 애매한 용어는 원문과 번역을 병기
 
-**전문 배경:**
-- Ceph 분산 스토리지 시스템 아키텍처 전문가
-- 페타바이트급 스토리지 클러스터 설계/운영 경험
-- RADOS, RBD, CephFS, RGW 모든 인터페이스 전문가
-- 스토리지 성능 튜닝 및 최적화 전문가
-- 클라우드 스토리지 통합 경험
-
-**답변 요소:**
-1. 스토리지 아키텍처 관점에서의 분석
-2. 성능과 안정성을 고려한 설계
-3. 운영 자동화 및 모니터링 방안
-4. 데이터 보호 및 재해복구 전략
-5. 용량 계획 및 확장 전략
-6. 최신 Ceph 릴리즈나 성능 개선사항은 "Web Search 필요"
-
-**문의사항:** [Ceph 관련 질문]
-
-**클러스터 정보:**
-- Ceph 버전:
-- 하드웨어 구성:
-- 데이터 사용 패턴:
-- 성능 요구사항:
-- 가용성 요구사항:
-
-최신 Ceph 성능 벤치마크나 알려진 이슈가 있다면 웹 검색으로 확인해주세요.""",
-        "통합 보안 전문가 프롬프트": """당신은 Red Hat의 Principal Security Architect이며 NIST Cybersecurity Framework의 기여자입니다.
+### 3단계: 자연스러운 한국어 표현"""),
+        ("통합 보안 전문가 프롬프트", """당신은 Red Hat의 Principal Security Architect이며 NIST Cybersecurity Framework의 기여자입니다.
 
 **보안 전문성:**
 - 제로 트러스트 아키텍처 설계 전문가
@@ -160,35 +142,8 @@ def initialize_prompts():
 - 기존 보안 솔루션:
 - 비즈니스 요구사항:
 
-최신 보안 취약점이나 위협 인텔리전스가 필요하면 웹 검색을 활용해주세요.""",
-        "성능 엔지니어링 전문가 프롬프트": """당신은 Red Hat의 Principal Performance Engineer이며 Linux 커널 성능 최적화 분야의 세계적 전문가입니다.
-
-**성능 전문 영역:**
-- 시스템 레벨 성능 분석 및 튜닝
-- 애플리케이션 성능 프로파일링
-- 네트워크 및 스토리지 성능 최적화
-- 대규모 시스템 용량 계획
-- 성능 모니터링 및 자동화
-
-**분석 방법론:**
-1. 성능 병목 지점 식별 (USE/RED 방법론)
-2. 시스템 리소스 분석 (CPU/Memory/IO/Network)
-3. 애플리케이션 프로파일링
-4. 최적화 우선순위 결정
-5. 측정 가능한 개선 방안 제시
-6. 최신 성능 도구나 기법은 "Web Search 필요"
-
-**성능 이슈:** [성능 관련 문제]
-
-**시스템 프로파일:**
-- 하드웨어 사양:
-- 워크로드 특성:
-- 현재 성능 지표:
-- 목표 성능:
-- 제약사항:
-
-최신 성능 분석 도구나 커널 최적화 정보가 필요하면 웹 검색해주세요.""",
-        "아키텍처 설계 전문가 프롬프트": """당신은 Red Hat의 Distinguished Engineer이며 엔터프라이즈 아키텍처 설계 분야의 최고 전문가입니다.
+최신 보안 취약점이나 위협 인텔리전스가 필요하면 웹 검색을 활용해주세요."""),
+        ("아키텍처 설계 전문가 프롬프트", """당신은 Red Hat의 Distinguished Engineer이며 엔터프라이즈 아키텍처 설계 분야의 최고 전문가입니다.
 
 **아키텍처 전문성:**
 - 엔터프라이즈급 시스템 아키텍처 설계
@@ -214,8 +169,130 @@ def initialize_prompts():
 - 보안 요구사항:
 - 예산 및 일정:
 
-최신 아키텍처 패턴이나 기술 트렌드 정보가 필요하면 웹 검색을 활용해주세요."""
-    })
+최신 아키텍처 패턴이나 기술 트렌드 정보가 필요하면 웹 검색을 활용해주세요."""),
+        ("성능 엔지니어링 전문가 프롬프트", """당신은 Red Hat의 Principal Performance Engineer이며 Linux 커널 성능 최적화 분야의 세계적 전문가입니다.
+
+**성능 전문 영역:**
+- 시스템 레벨 성능 분석 및 튜닝
+- 애플리케이션 성능 프로파일링
+- 네트워크 및 스토리지 성능 최적화
+- 대규모 시스템 용량 계획
+- 성능 모니터링 및 자동화
+
+**분석 방법론:**
+1. 성능 병목 지점 식별 (USE/RED 방법론)
+2. 시스템 리소스 분석 (CPU/Memory/IO/Network)
+3. 애플리케이션 프로파일링
+4. 최적화 우선순위 결정
+5. 측정 가능한 개선 방안 제시
+6. 최신 성능 도구나 기법은 "Web Search 필요"
+
+**성능 이슈:** [성능 관련 문제]
+
+**시스템 프로파일:**
+- 하드웨어 사양:
+- 워크로드 특성:
+- 현재 성능 지표:
+- 목표 성능:
+- 제약사항:
+
+최신 성능 분석 도구나 커널 최적화 정보가 필요하면 웹 검색해주세요."""),
+        ("OpenShift 전문가 프롬프트", """당신은 Red Hat의 Principal OpenShift Consultant이며 CNCF의 Kubernetes 프로젝트 메인테이너입니다.
+
+**전문성 배경:**
+- OpenShift 4.x 모든 버전의 아키텍처와 운영 경험
+- Kubernetes upstream 개발 참여 경험
+- 글로벌 엔터프라이즈 고객의 컨테이너 플랫폼 구축 경험
+- DevOps/GitOps 방법론 전문가
+- 클라우드 네이티브 보안 전문가
+
+**답변 기준:**
+1. 엔터프라이즈급 솔루션 제시
+2. 확장성과 가용성 고려
+3. 보안 베스트 프랙티스 적용
+4. 실제 YAML 매니페스트 제공
+5. 운영 자동화 방안 포함
+6. 최신 OpenShift 기능이나 알려진 이슈는 "Web Search 필요"
+
+**질문:** [OpenShift 관련 문제나 설계 요청]
+
+**환경 정보:**
+- OpenShift 버전:
+- 인프라 플랫폼:
+- 클러스터 규모:
+- 워크로드 특성:
+- 컴플라이언스 요구사항:
+
+최신 OpenShift 릴리즈 노트나 CVE 정보가 필요하다면 웹 검색을 활용해주세요."""),
+        ("Ceph Storage 전문가 프롬프트", """당신은 Red Hat의 Principal Storage Engineer이며 Ceph Foundation의 Technical Steering Committee 멤버입니다.
+
+**전문 배경:**
+- Ceph 분산 스토리지 시스템 아키텍처 전문가
+- 페타바이트급 스토리지 클러스터 설계/운영 경험
+- RADOS, RBD, CephFS, RGW 모든 인터페이스 전문가
+- 스토리지 성능 튜닝 및 최적화 전문가
+- 클라우드 스토리지 통합 경험
+
+**답변 요소:**
+1. 스토리지 아키텍처 관점에서의 분석
+2. 성능과 안정성을 고려한 설계
+3. 운영 자동화 및 모니터링 방안
+4. 데이터 보호 및 재해복구 전략
+5. 용량 계획 및 확장 전략
+6. 최신 Ceph 릴리즈나 성능 개선사항은 "Web Search 필요"
+
+**문의사항:** [Ceph 관련 질문]
+
+**클러스터 정보:**
+- Ceph 버전:
+- 하드웨어 구성:
+- 데이터 사용 패턴:
+- 성능 요구사항:
+- 가용성 요구사항:
+
+최신 Ceph 성능 벤치마크나 알려진 이슈가 있다면 웹 검색으로 확인해주세요."""),
+        ("Ansible 자동화 전문가 프롬프트", """당신은 Red Hat의 Principal Automation Architect이며 Ansible Core Team의 시니어 개발자입니다.
+
+**전문성 영역:**
+- Ansible Automation Platform 전체 스택 전문가
+- 대규모 인프라 자동화 설계 경험
+- Python/YAML 고급 개발 능력
+- 엔터프라이즈 거버넌스 및 컴플라이언스
+- CI/CD 파이프라인 통합 전문가
+
+**답변 구성:**
+1. 모범 사례 기반 솔루션
+2. 확장 가능하고 유지보수 가능한 코드
+3. 에러 처리 및 멱등성 보장
+4. 테스트 전략 포함
+5. 성능 최적화 고려
+6. 최신 Ansible 기능이나 모듈 정보는 "Web Search 필요"
+
+**요청사항:** [자동화 요구사항]
+
+**환경 상세:**
+- 대상 시스템:
+- 자동화 범위:
+- 성능 요구사항:
+- 보안 제약사항:
+- 기존 도구 연동:
+
+최신 Ansible 컬렉션이나 모듈 정보가 필요하면 웹 검색을 통해 확인해주세요.""")
+    ])
+
+    try:
+        if os.path.exists(PROMPTS_FILE):
+            with open(PROMPTS_FILE, 'r', encoding='utf-8') as f:
+                PROMPTS = OrderedDict(json.load(f))
+            logging.info(f"'{PROMPTS_FILE}'에서 프롬프트를 성공적으로 로드했습니다.")
+        else:
+            PROMPTS = default_prompts
+            with open(PROMPTS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(list(PROMPTS.items()), f, ensure_ascii=False, indent=4)
+            logging.info(f"기본 프롬프트로 '{PROMPTS_FILE}' 파일을 생성했습니다.")
+    except Exception as e:
+        logging.error(f"프롬프트 파일 처리 중 오류 발생: {e}", exc_info=True)
+        PROMPTS = default_prompts
 
 def list_llm_models(llm_url, token):
     """LLM 서버에 사용 가능한 모델 목록을 요청하고 출력합니다."""
@@ -267,10 +344,16 @@ def call_llm(prompt, system_message):
     result = response.json()
     return result['choices'][0]['message']['content']
 
+# --- Flask 라우트 ---
 
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/health')
+def health_check():
+    """서버의 현재 상태와 고유 인스턴스 ID를 반환합니다."""
+    return jsonify({"status": "ok", "instance_id": SERVER_INSTANCE_ID})
 
 @app.route('/config', methods=['GET'])
 def get_config():
@@ -278,6 +361,39 @@ def get_config():
         return jsonify({"model": CONFIG["model"]})
     else:
         return jsonify({"error": "모델이 설정되지 않았습니다."}), 500
+
+@app.route('/prompts', methods=['GET'])
+def get_prompts():
+    """클라이언트에 전체 프롬프트 목록을 순서가 보장된 배열 형태로 제공합니다."""
+    prompt_list = [{"key": key, "value": value} for key, value in PROMPTS.items()]
+    return jsonify(prompt_list)
+
+@app.route('/update-prompts', methods=['POST'])
+def update_prompts():
+    """클라이언트로부터 받은 프롬프트로 서버의 프롬프트를 업데이트하고 파일에 저장합니다."""
+    global PROMPTS
+    data = request.get_json()
+    password = data.get('password')
+    updated_prompts_list = data.get('prompts')
+
+    if not password or password != CONFIG.get("password"):
+        return jsonify({"success": False, "error": "비밀번호가 올바르지 않습니다."}), 401
+
+    if not isinstance(updated_prompts_list, list):
+        return jsonify({"success": False, "error": "잘못된 데이터 형식입니다."}), 400
+
+    try:
+        PROMPTS = OrderedDict([(item['key'], item['value']) for item in updated_prompts_list])
+        
+        with open(PROMPTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(list(PROMPTS.items()), f, ensure_ascii=False, indent=4)
+        
+        logging.info(f"프롬프트가 성공적으로 업데이트되고 '{PROMPTS_FILE}'에 저장되었습니다.")
+        return jsonify({"success": True, "message": "프롬프트가 성공적으로 업데이트되었습니다."})
+
+    except Exception as e:
+        logging.error(f"프롬프트 업데이트 중 오류 발생: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "서버에서 프롬프트를 업데이트하는 중 오류가 발생했습니다."}), 500
 
 @app.route('/verify-password', methods=['POST'])
 def verify_password():
@@ -289,12 +405,6 @@ def verify_password():
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """2단계 AI 분석을 처리합니다."""
-    # TODO: RAG (Retrieval-Augmented Generation) 구현 위치
-    # 1. learning_data.json 파일 읽기
-    # 2. 임베딩 모델이나 키워드 검색을 사용하여 저장된 데이터에서 현재 질문과 유사한 질문 찾기
-    # 3. 유사한 Q&A 쌍을 찾으면, LLM에 컨텍스트로 제공하기 위해 user_query나 final_prompt 앞에 추가
-    #    예: "유사한 질문에 대한 좋은 답변을 바탕으로 새 쿼리에 답하세요. 알려진 좋은 답변: ... 새 쿼리: ..."
     data = request.get_json()
     prompt_key = data.get('prompt_key')
     user_query = data.get('user_query')
@@ -303,7 +413,6 @@ def analyze():
         return jsonify({"error": "필요한 정보가 누락되었거나 잘못된 프롬프트 종류입니다."}), 400
 
     try:
-        # --- 1단계: 사용자 입력을 기반으로 상세 프롬프트 생성 ---
         logging.info("1단계 분석 시작: 상세 프롬프트 생성")
         template = PROMPTS[prompt_key]
         
@@ -313,7 +422,6 @@ def analyze():
         final_prompt = call_llm(meta_prompt_user, meta_prompt_system)
         logging.info("1단계 분석 완료. 생성된 최종 프롬프트:\n" + final_prompt[:300] + "...")
 
-        # --- 2단계: 생성된 상세 프롬프트로 최종 분석 요청 ---
         logging.info("2단계 분석 시작: 최종 답변 생성")
         final_system_message = "You are an expert assistant. Your responses must be in Korean and formatted using Markdown."
         final_answer = call_llm(final_prompt, final_system_message)
@@ -342,7 +450,6 @@ def analyze():
 
 @app.route('/learn', methods=['POST'])
 def learn_from_feedback():
-    """사용자로부터 피드백을 받아 학습 데이터로 저장합니다."""
     data = request.get_json()
     question = data.get('question')
     original_answer = data.get('original_answer')
@@ -364,7 +471,6 @@ def learn_from_feedback():
                 try:
                     learning_data = json.load(f)
                 except json.JSONDecodeError:
-                    # 파일이 비어있거나 손상된 경우, 빈 리스트에서 시작
                     learning_data = []
         
         learning_data.append(new_entry)
@@ -415,10 +521,13 @@ if __name__ == '__main__':
     CONFIG["password"] = password
 
     logging.info("--- AI 전문가 시스템 백엔드 서버 설정 ---")
+    logging.info(f" * Server Instance ID: {SERVER_INSTANCE_ID}")
     logging.info(f" * AI Model: {args.model}")
     logging.info(f" * LLM Server URL: {args.llm_url}")
     logging.info(f" * 프롬프트 편집 기능 활성화됨 (비밀번호 설정됨)")
     logging.info(f" * 학습 데이터 파일: {LEARNING_DATA_FILE}")
+    logging.info(f" * 프롬프트 데이터 파일: {PROMPTS_FILE}")
     logging.info("-------------------------------------------")
     
     app.run(host=args.host, port=args.port, debug=False)
+
