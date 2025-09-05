@@ -3,7 +3,7 @@ import getpass
 import sys
 import json
 import os
-import uuid  # 서버 고유 ID 생성을 위해 추가
+import uuid
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import requests
@@ -11,7 +11,20 @@ import logging
 from collections import OrderedDict
 
 # --- 로깅 설정 ---
+# '/health' 경로에 대한 액세스 로그를 필터링하기 위한 클래스 정의
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record):
+        # 로그 메시지에 'GET /health HTTP/1.1' 문자열이 포함되어 있으면 로그를 출력하지 않음
+        return 'GET /health HTTP/1.1' not in record.getMessage()
+
+# Flask의 기본 웹 서버인 Werkzeug의 로거를 가져옴
+log = logging.getLogger('werkzeug')
+# 위에서 정의한 필터를 로거에 추가
+log.addFilter(HealthCheckFilter())
+
+# 애플리케이션의 다른 로그를 위한 기본 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 app = Flask(__name__, template_folder='.', static_folder='.')
 CORS(app)
@@ -21,7 +34,6 @@ CONFIG = {}
 PROMPTS = OrderedDict()
 LEARNING_DATA_FILE = 'learning_data.json'
 PROMPTS_FILE = 'prompts.json'
-# 서버가 시작될 때마다 고유한 ID를 생성하여 재시작 여부를 클라이언트가 알 수 있도록 함
 SERVER_INSTANCE_ID = str(uuid.uuid4())
 
 def initialize_prompts():
