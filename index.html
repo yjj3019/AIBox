@@ -147,13 +147,49 @@
         }
         .copy-code-btn:hover { opacity: 1; background-color: var(--primary-color); }
         
-        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.6); backdrop-filter: blur(5px); }
-        .modal-content { background-color: var(--surface-color); margin: 10% auto; padding: 2rem; border: none; width: 80%; max-width: 700px; border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,0.2); }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+        .modal {
+            display: none; 
+            position: fixed; 
+            z-index: 1000; 
+            left: 0; top: 0; 
+            width: 100%; height: 100%; 
+            overflow: auto; 
+            background-color: rgba(0,0,0,0.6); 
+            backdrop-filter: blur(5px);
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-content {
+            background-color: var(--surface-color);
+            padding: 2rem;
+            border: none;
+            width: 90%;
+            max-width: 700px;
+            border-radius: 10px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.2);
+            display: flex;
+            flex-direction: column;
+            max-height: 85vh;
+        }
+        .modal-header {
+            flex-shrink: 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        #modal-body {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding-right: 1rem;
+        }
+
         .close-button { color: #aaa; font-size: 28px; font-weight: bold; cursor: pointer; }
         .prompt-edit-item, .feedback-item { margin-bottom: 1.5rem; }
         .prompt-edit-item label, .feedback-item label { display: block; font-weight: 500; margin-bottom: 0.5rem; }
-        .prompt-edit-item textarea { height: 120px; }
+        .prompt-edit-item textarea { height: 150px; resize: vertical; }
         .feedback-item .readonly-area {
             background-color: #f8f9fa;
             padding: 0.75rem;
@@ -272,9 +308,11 @@
 
 <script>
 // --- 전역 변수 및 상태 관리 ---
-let prompts = {};
-let currentQuestion = ''; // 현재 질문 저장
-let currentAnswer = ''; // 현재 답변 저장
+let prompts = []; 
+let currentPassword = null; 
+let currentQuestion = ''; 
+let currentAnswer = '';
+let serverInstanceId = null; // 서버의 고유 ID를 저장
 
 // --- DOM 요소 캐싱 ---
 const connStatusIndicator = document.getElementById('conn-status-indicator');
@@ -288,14 +326,10 @@ const resultContainer = document.getElementById('result-container');
 const resultOutput = document.getElementById('result-output');
 const saveHtmlBtn = document.getElementById('save-html-btn');
 const feedbackBtn = document.getElementById('feedback-btn');
-
-// --- 프롬프트 편집 모달 ---
 const editPromptsBtn = document.getElementById('edit-prompts-btn');
 const promptModal = document.getElementById('prompt-modal');
 const modalBody = document.getElementById('modal-body');
 const closePromptModalBtn = document.getElementById('close-prompt-modal');
-
-// --- 피드백 모달 ---
 const feedbackModal = document.getElementById('feedback-modal');
 const closeFeedbackModalBtn = document.getElementById('close-feedback-modal');
 const submitFeedbackBtn = document.getElementById('submit-feedback-btn');
@@ -303,41 +337,10 @@ const feedbackQuestionEl = document.getElementById('feedback-question');
 const feedbackOriginalAnswerEl = document.getElementById('feedback-original-answer');
 const feedbackInput = document.getElementById('feedback-input');
 
-
-function loadPromptsFromStorage() {
-    const savedPrompts = localStorage.getItem('customPrompts');
-    if (savedPrompts) {
-        try {
-            const parsedPrompts = JSON.parse(savedPrompts);
-            // 기본 프롬프트가 없는 경우를 대비하여 병합
-            prompts = { ...prompts, ...parsedPrompts };
-        } catch(e) {
-            console.error("Error parsing prompts from localStorage", e);
-            localStorage.removeItem('customPrompts');
-        }
-    }
-}
-
-function populatePrompts() {
-    const defaultPrompts = {
-        "시스템 문제 해결 전문가 프롬프트": `...`,
-        "OpenShift 전문가 프롬프트": `...`,
-        "Ansible 자동화 전문가 프롬프트": `...`,
-        "Ceph Storage 전문가 프롬프트": `...`,
-        "통합 보안 전문가 프롬프트": `...`,
-        "성능 엔지니어링 전문가 프롬프트": `...`,
-        "아키텍처 설계 전문가 프롬프트": `...`
-    };
-    prompts = defaultPrompts;
-    loadPromptsFromStorage();
-
-    promptSelect.innerHTML = '';
-    for (const key in prompts) {
-        const option = document.createElement('option');
-        option.value = key;
-        option.textContent = key;
-        promptSelect.appendChild(option);
-    }
+async function initializeApp() {
+    await fetchConfig();
+    await fetchAndLoadPrompts();
+    startHealthCheck(); // 주기적인 헬스 체크 시작
 }
 
 async function fetchConfig() {
@@ -345,18 +348,40 @@ async function fetchConfig() {
         const response = await fetch('/config');
         if (!response.ok) throw new Error(`Server responded with ${response.status}`);
         const data = await response.json();
-        if (data.model) {
-            modelNameSpan.textContent = data.model;
-            connStatusSpan.textContent = "연결됨";
-            connStatusIndicator.className = 'status-indicator connected';
-        } else {
-            throw new Error('Model name not in response');
-        }
+        modelNameSpan.textContent = data.model || 'N/A';
     } catch (error) {
         modelNameSpan.textContent = 'N/A';
-        connStatusSpan.textContent = '연결 실패';
-        connStatusIndicator.className = 'status-indicator disconnected';
         console.error('Failed to fetch config:', error);
+    }
+}
+
+async function fetchAndLoadPrompts() {
+    try {
+        const response = await fetch('/prompts');
+        if (!response.ok) throw new Error('Failed to fetch prompts from server.');
+        prompts = await response.json();
+        populatePromptSelect();
+    } catch (error) {
+        console.error("Error loading prompts:", error);
+        // 헬스 체크가 연결 실패를 처리하므로 여기서는 alert 생략
+    }
+}
+
+function populatePromptSelect() {
+    const currentSelection = promptSelect.value;
+    promptSelect.innerHTML = '';
+    
+    prompts.forEach(promptItem => {
+        const option = document.createElement('option');
+        option.value = promptItem.key;
+        option.textContent = promptItem.key;
+        promptSelect.appendChild(option);
+    });
+    
+    if (currentSelection && prompts.some(p => p.key === currentSelection)) {
+        promptSelect.value = currentSelection;
+    } else if (prompts.length > 0) {
+        promptSelect.selectedIndex = 0;
     }
 }
 
@@ -379,8 +404,8 @@ async function submitAnalysis() {
             throw new Error(errorData.error || `Server error: ${response.status}`);
         }
         const data = await response.json();
-        currentQuestion = data.question; // 응답에서 받은 질문 저장
-        currentAnswer = data.answer;     // 응답에서 받은 답변 저장
+        currentQuestion = data.question;
+        currentAnswer = data.answer;
         displayResult(data.answer);
     } catch (error) {
         displayResult(`**오류가 발생했습니다:**\n\n\`\`\`\n${error.message}\n\`\`\``);
@@ -389,9 +414,38 @@ async function submitAnalysis() {
     }
 }
 
+// --- 헬스 체크 및 서버 재시작 감지 ---
+async function checkServerStatus() {
+    try {
+        const response = await fetch('/health');
+        if (!response.ok) throw new Error('Server not healthy');
+        const data = await response.json();
+
+        connStatusSpan.textContent = "연결됨";
+        connStatusIndicator.className = 'status-indicator connected';
+
+        if (serverInstanceId === null) {
+            console.log("Connected to server instance:", data.instance_id);
+            serverInstanceId = data.instance_id;
+        } else if (serverInstanceId !== data.instance_id) {
+            console.log("Server has restarted. Reloading page...");
+            connStatusSpan.textContent = '서버 재시작 감지. 새로고침...';
+            setTimeout(() => location.reload(), 1000);
+        }
+    } catch (error) {
+        connStatusSpan.textContent = '연결 끊김. 재연결 중...';
+        connStatusIndicator.className = 'status-indicator disconnected';
+    }
+}
+
+function startHealthCheck() {
+    checkServerStatus(); // 페이지 로드 시 즉시 확인
+    setInterval(checkServerStatus, 5000); // 5초마다 주기적으로 확인
+}
+// --- 이하 나머지 함수들은 이전과 동일 ---
+
 function addCopyButtons(container) {
-    const pres = container.querySelectorAll('pre');
-    pres.forEach(pre => {
+    container.querySelectorAll('pre').forEach(pre => {
         if (pre.querySelector('.copy-code-btn')) return;
         const button = document.createElement('button');
         button.innerText = '복사';
@@ -412,7 +466,7 @@ function displayResult(markdownText) {
     resultOutput.innerHTML = marked.parse(markdownText || "No content received.");
     addCopyButtons(resultOutput);
     saveHtmlBtn.style.display = 'inline-flex';
-    feedbackBtn.style.display = 'inline-flex'; // 피드백 버튼 표시
+    feedbackBtn.style.display = 'inline-flex';
 }
 
 function setLoading(isLoading) {
@@ -435,7 +489,7 @@ function clearInputs() {
 function saveAsHtml() {
     const clone = resultOutput.cloneNode(true);
     clone.querySelectorAll('.copy-code-btn').forEach(btn => btn.remove());
-    const savedHtmlStyle = `...`; // (스타일 코드는 길어서 생략)
+    const savedHtmlStyle = `<style>body{font-family:sans-serif;line-height:1.6;padding:2em}pre{background:#f4f4f4;padding:1em;border-radius:5px;white-space:pre-wrap;word-wrap:break-word}code{font-family:monospace}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px}th{background:#f2f2f2}</style>`;
     const htmlContent = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><title>AI 분석 결과</title>${savedHtmlStyle}</head><body><h1>AI 분석 결과</h1><hr>${clone.innerHTML}</body></html>`;
     const blob = new Blob([htmlContent], { type: 'text/html' });
     const a = document.createElement('a');
@@ -445,8 +499,8 @@ function saveAsHtml() {
     URL.revokeObjectURL(a.href);
 }
 
-// --- 프롬프트 편집 모달 함수 ---
 function openPromptModal() {
+    currentPassword = null;
     modalBody.innerHTML = `<p>프롬프트 편집을 위해 비밀번호를 입력하세요.</p><input type="password" id="password-input" style="width:100%;padding:8px;box-sizing:border-box"><p id="password-error" style="color:red;display:none"></p><div class="button-group" style="justify-content:flex-end"><button id="password-submit" class="button" style="flex-grow:0">확인</button></div>`;
     promptModal.style.display = 'flex';
     document.getElementById('password-input').focus();
@@ -461,6 +515,7 @@ function openPromptModal() {
             });
             const data = await response.json();
             if (data.success) {
+                currentPassword = password;
                 showPromptEditForm();
             } else {
                 errorEl.textContent = data.error || '비밀번호가 올바르지 않습니다.';
@@ -475,34 +530,52 @@ function openPromptModal() {
 
 function showPromptEditForm() {
     let formHtml = '';
-    loadPromptsFromStorage(); // 최신 프롬프트 로드
-    for (const key in prompts) {
-        formHtml += `<div class="prompt-edit-item"><label for="edit-${key}">${key}</label><textarea id="edit-${key}">${prompts[key]}</textarea></div>`;
-    }
-    formHtml += `<div class="button-group" style="justify-content:flex-end"><button id="save-prompts-btn" class="button" style="flex-grow:0">저장</button><button id="cancel-prompts-btn" class="button secondary" style="flex-grow:0">취소</button></div>`;
+    prompts.forEach(promptItem => {
+        formHtml += `
+            <div class="prompt-edit-item">
+                <label for="edit-${promptItem.key}">${promptItem.key}</label>
+                <textarea id="edit-${promptItem.key}">${promptItem.value}</textarea>
+            </div>`;
+    });
+    formHtml += `<div class="button-group" style="justify-content:flex-end"><button id="save-prompts-btn" class="button" style="flex-grow:0">서버에 저장</button><button id="cancel-prompts-btn" class="button secondary" style="flex-grow:0">취소</button></div>`;
     modalBody.innerHTML = formHtml;
 
-    document.getElementById('save-prompts-btn').onclick = () => {
-        const newPrompts = {};
-        for (const key in prompts) {
-            newPrompts[key] = document.getElementById(`edit-${key}`).value;
+    document.getElementById('save-prompts-btn').onclick = async () => {
+        const updatedPrompts = prompts.map(p => ({
+            key: p.key,
+            value: document.getElementById(`edit-${p.key}`).value
+        }));
+
+        try {
+            const response = await fetch('/update-prompts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    password: currentPassword,
+                    prompts: updatedPrompts
+                })
+            });
+            const data = await response.json();
+            if (data.success) {
+                alert("프롬프트가 서버에 성공적으로 저장되었습니다.");
+                await fetchAndLoadPrompts();
+                promptModal.style.display = 'none';
+            } else {
+                throw new Error(data.error || "서버 저장 실패");
+            }
+        } catch (error) {
+            alert(`오류: ${error.message}`);
         }
-        prompts = newPrompts;
-        localStorage.setItem('customPrompts', JSON.stringify(prompts));
-        populatePrompts();
-        promptModal.style.display = 'none';
     };
     document.getElementById('cancel-prompts-btn').onclick = () => {
         promptModal.style.display = 'none';
     };
 }
 
-
-// --- 피드백 모달 함수 ---
 function openFeedbackModal() {
     feedbackQuestionEl.textContent = currentQuestion;
     feedbackOriginalAnswerEl.textContent = currentAnswer;
-    feedbackInput.value = ''; // 입력 필드 초기화
+    feedbackInput.value = '';
     feedbackModal.style.display = 'flex';
 }
 
@@ -512,10 +585,8 @@ async function submitFeedback() {
         alert("피드백 내용을 입력해주세요.");
         return;
     }
-
     submitFeedbackBtn.disabled = true;
     submitFeedbackBtn.textContent = '제출 중...';
-
     try {
         const response = await fetch('/learn', {
             method: 'POST',
@@ -526,7 +597,6 @@ async function submitFeedback() {
                 feedback_answer: feedbackText
             })
         });
-
         const data = await response.json();
         if (response.ok && data.success) {
             alert("피드백이 성공적으로 제출되었습니다. 학습에 반영됩니다.");
@@ -543,25 +613,15 @@ async function submitFeedback() {
 }
 
 // --- 이벤트 리스너 설정 ---
-window.addEventListener('DOMContentLoaded', () => {
-    populatePrompts();
-    fetchConfig();
-});
-promptSelect.addEventListener('change', () => questionInput.value = '');
+window.addEventListener('DOMContentLoaded', initializeApp);
 submitBtn.addEventListener('click', submitAnalysis);
 clearBtn.addEventListener('click', clearInputs);
 saveHtmlBtn.addEventListener('click', saveAsHtml);
-
-// 프롬프트 모달 리스너
 editPromptsBtn.addEventListener('click', openPromptModal);
 closePromptModalBtn.addEventListener('click', () => promptModal.style.display = 'none');
-
-// 피드백 모달 리스너
 feedbackBtn.addEventListener('click', openFeedbackModal);
 closeFeedbackModalBtn.addEventListener('click', () => feedbackModal.style.display = 'none');
 submitFeedbackBtn.addEventListener('click', submitFeedback);
-
-// 모달 외부 클릭 시 닫기
 window.addEventListener('click', (event) => {
     if (event.target == promptModal) promptModal.style.display = 'none';
     if (event.target == feedbackModal) feedbackModal.style.display = 'none';
@@ -569,3 +629,4 @@ window.addEventListener('click', (event) => {
 </script>
 </body>
 </html>
+
