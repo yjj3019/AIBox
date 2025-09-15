@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 기반 분석 시스템 (사용자용)</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #007bff;
+            --secondary-color: #6c757d;
+            --success-color: #28a745;
+            --background-color: #f0f4f8;
+            --surface-color: #ffffff;
+            --text-color: #212529;
+            --header-bg: #0d1b2a;
+            --header-text: #ffffff;
+            --border-color: #dee2e6;
+            --shadow: 0 4px 12px rgba(0,0,0,0.08);
+            --code-bg: #282c34;
+            --code-text: #abb2bf;
+        }
+
+        body {
+            font-family: 'Noto Sans KR', sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 2rem;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+        }
+
+        .container {
+            background: var(--surface-color);
+            border-radius: 12px;
+            box-shadow: var(--shadow);
+            width: 100%;
+            max-width: 960px;
+            overflow: hidden;
+        }
+
+        .header {
+            background-color: var(--header-bg);
+            color: var(--header-text);
+            padding: 2rem;
+            text-align: center;
+        }
+        .header h1 { margin: 0; font-size: 2rem; font-weight: 700; }
+        .header p { margin: 0.5rem 0 0; font-size: 1rem; opacity: 0.8; }
+        
+        #status { 
+            padding: 0.75rem 2rem; 
+            font-size: 0.9rem; 
+            text-align: right; 
+            background-color: #e9ecef; 
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 1.5rem;
+        }
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        .status-indicator.connected { background-color: #28a745; }
+        .status-indicator.disconnected { background-color: #dc3545; }
+
+        .content { padding: 2rem; }
+        .card { background: var(--surface-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+        
+        h2 {
+            font-size: 1.25rem;
+            margin-top: 0;
+            margin-bottom: 1rem;
+            color: var(--header-bg);
+            border-bottom: 2px solid #f0f4f8;
+            padding-bottom: 0.5rem;
+        }
+
+        select, textarea {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 0.95rem;
+            box-sizing: border-box;
+            margin-bottom: 1rem;
+            font-family: 'Noto Sans KR', sans-serif;
+        }
+
+        textarea { height: 200px; resize: vertical; }
+        .button-group { display: flex; gap: 1rem; margin-top: 1rem; }
+        
+        .button {
+            background-image: linear-gradient(to right, #007bff, #0056b3);
+            color: white; border: none; padding: 0.7rem 1.2rem;
+            border-radius: 6px;
+            cursor: pointer; font-size: 0.95rem;
+            font-weight: 500; text-align: center;
+            transition: all 0.3s ease; flex-grow: 0;
+            display: inline-flex;
+            align-items: center; justify-content: center; gap: 0.5rem;
+        }
+        .button:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0, 123, 255, 0.2); }
+        .button.secondary { background-image: linear-gradient(to right, #6c757d, #5a6268); }
+        .button.success { background-image: linear-gradient(to right, #28a745, #218838); }
+        .button.success:hover { box-shadow: 0 4px 8px rgba(40, 167, 69, 0.2); }
+        .button:disabled { background-image: none; background-color: #cccccc; cursor: not-allowed; transform: none; box-shadow: none; }
+        #result-container { display: none; }
+        
+        #result-output {
+            max-height: 500px; overflow-y: auto; line-height: 1.8;
+            word-wrap: break-word; padding: 1.5rem; background-color: #fdfdfd; 
+            border-radius: 6px; border: 1px solid var(--border-color);
+        }
+        #result-output h1, #result-output h2, #result-output h3, #result-output h4 { 
+            margin-top: 2em; margin-bottom: 0.8em; border-bottom: 1px solid #eee; 
+            padding-bottom: 0.4em; color: #1a2c42; font-weight: 600;
+        }
+        #result-output table { 
+            border-collapse: collapse; width: 100%; margin: 1.5em 0; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid #ddd;
+        }
+        #result-output th, #result-output td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        #result-output th { background-color: #f8f9fa; font-weight: 600; }
+        #result-output pre { 
+            position: relative; background-color: var(--code-bg); color: var(--code-text);
+            padding: 1.5rem 1rem; border-radius: 8px; overflow-x: auto; 
+            margin: 1.5em 0; font-family: 'JetBrains Mono', monospace; line-height: 1.6;
+        }
+        .copy-code-btn {
+            position: absolute; top: 10px; right: 10px; background-color: #555;
+            color: white; border: none; padding: 5px 10px; border-radius: 5px;
+            cursor: pointer; opacity: 0.7; transition: all 0.2s; font-size: 0.8em;
+        }
+        .copy-code-btn:hover { opacity: 1; background-color: var(--primary-color); }
+        
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.6); backdrop-filter: blur(5px); align-items: center; justify-content: center; }
+        .modal-content { background-color: var(--surface-color); padding: 2rem; border: none; width: 90%; max-width: 700px; border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,0.2); display: flex; flex-direction: column; max-height: 85vh; }
+        .modal-header { flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+        .modal-body { flex-grow: 1; overflow-y: auto; padding-right: 1rem; }
+        .close-button { color: #aaa; font-size: 28px; font-weight: bold; cursor: pointer; }
+        .feedback-item { margin-bottom: 1.5rem; }
+        .feedback-item label { display: block; font-weight: 500; margin-bottom: 0.5rem; }
+        .feedback-item .readonly-area { background-color: #f8f9fa; padding: 0.75rem; border-radius: 6px; border: 1px solid var(--border-color); max-height: 150px; overflow-y: auto; font-size: 0.9rem; white-space: pre-wrap; word-wrap: break-word; }
+        .icon { width: 1.2em; height: 1.2em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>AI 기반 분석 시스템</h1>
+            <p>척척 박사 유박사에게 질문하세요.</p>
+        </header>
+        <div id="status">
+            <div class="status-item">
+                <span>LLM 연결 상태:</span>
+                <span id="conn-status-indicator" class="status-indicator"></span>
+                <span id="conn-status">확인 중...</span>
+            </div>
+            <div class="status-item">
+                <span>현재 AI 모델:</span>
+                <span id="model-name">N/A</span>
+            </div>
+        </div>
+
+        <div id="error-banner" style="display: none; padding: 1rem 2rem; background-color: #f8d7da; color: #721c24; border-bottom: 1px solid #f5c6cb;">
+            <p style="margin: 0;"><strong>연결 오류:</strong> <span id="error-message"></span></p>
+            <button id="reconnect-btn" style="margin-top: 0.5rem; padding: 0.25rem 0.5rem; border: 1px solid #721c24; border-radius: 4px; background-color: transparent; cursor: pointer;">
+                재연결 시도
+            </button>
+        </div>
+
+        <div class="content">
+            <div class="card">
+                <h2>분석 프롬프트 선택</h2>
+                <select id="prompt-select"></select>
+                <textarea id="question-input" placeholder="이곳에 해결하고 싶은 문제나 분석 내용을 자유롭게 입력하세요. AI가 필요한 정보를 파악하여 프롬프트를 구성합니다."></textarea>
+                
+                <div class="button-group">
+                    <button id="submit-btn" class="button">
+                        <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z" clip-rule="evenodd"></path></svg>
+                        AI 분석 요청
+                    </button>
+                    <button id="clear-btn" class="button secondary">
+                        <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 012 0v6a1 1 0 11-2 0V8z" clip-rule="evenodd"></path></svg>
+                        질문 삭제
+                    </button>
+                </div>
+            </div>
+
+            <div id="result-container" class="card">
+                <h2>AI 분석 결과</h2>
+                <div id="result-output"></div>
+                <div class="button-group" style="justify-content: flex-end;">
+                     <button id="save-html-btn" class="button secondary">
+                        <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" clip-rule="evenodd"></path></svg>
+                         HTML로 저장
+                     </button>
+                     <button id="feedback-btn" class="button success">
+                        <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a6 6 0 00-6 6v3.586l-1.707 1.707A1 1 0 003 15v4a1 1 0 001 1h12a1 1 0 001-1v-4a1 1 0 00-.293-.707L16 11.586V8a6 6 0 00-6-6zM8.05 16h3.9a1.5 1.5 0 01-3.9 0zM10 4a4 4 0 00-4 4v4h8V8a4 4 0 00-4-4z" /></svg>
+                        피드백 제공
+                     </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="feedback-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 style="border:none; margin:0; padding:0;">LLM 답변 피드백</h2>
+                <span class="close-button" id="close-feedback-modal">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="feedback-item">
+                    <label>최초 질문</label>
+                    <div id="feedback-question" class="readonly-area"></div>
+                </div>
+                <div class="feedback-item">
+                    <label>AI 답변</label>
+                    <div id="feedback-original-answer" class="readonly-area"></div>
+                </div>
+                <div class="feedback-item">
+                    <label for="feedback-input">더 나은 답변 또는 수정 제안</label>
+                    <textarea id="feedback-input" placeholder="AI가 더 나은 답변을 할 수 있도록 수정된 답변이나 제안을 입력해주세요. 이 내용은 다음 학습에 사용됩니다."></textarea>
+                </div>
+                <div class="button-group" style="justify-content:flex-end">
+                    <button id="submit-feedback-btn" class="button success">피드백 제출</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+// --- Configuration ---
+// 백엔드 서버 주소. 비워두면 현재 페이지와 동일한 주소로 요청합니다.
+// 예: const BACKEND_URL = 'http://127.0.0.1:8000';
+const BACKEND_URL = 'http://70.2.250.35:5000'; 
+
+// --- 전역 변수 및 상태 관리 ---
+let prompts = []; 
+let currentQuestion = ''; 
+let currentAnswer = '';
+let serverInstanceId = null;
+
+// --- DOM 요소 캐싱 ---
+const connStatusIndicator = document.getElementById('conn-status-indicator');
+const connStatusSpan = document.getElementById('conn-status');
+const modelNameSpan = document.getElementById('model-name');
+const promptSelect = document.getElementById('prompt-select');
+const questionInput = document.getElementById('question-input');
+const submitBtn = document.getElementById('submit-btn');
+const clearBtn = document.getElementById('clear-btn');
+const resultContainer = document.getElementById('result-container');
+const resultOutput = document.getElementById('result-output');
+const saveHtmlBtn = document.getElementById('save-html-btn');
+const feedbackBtn = document.getElementById('feedback-btn');
+const feedbackModal = document.getElementById('feedback-modal');
+const closeFeedbackModalBtn = document.getElementById('close-feedback-modal');
+const submitFeedbackBtn = document.getElementById('submit-feedback-btn');
+const feedbackQuestionEl = document.getElementById('feedback-question');
+const feedbackOriginalAnswerEl = document.getElementById('feedback-original-answer');
+const feedbackInput = document.getElementById('feedback-input');
+const errorBanner = document.getElementById('error-banner');
+const errorMessageSpan = document.getElementById('error-message');
+const reconnectBtn = document.getElementById('reconnect-btn');
+
+// --- UI 제어 함수 ---
+function setUIEnabled(isEnabled) {
+    promptSelect.disabled = !isEnabled;
+    questionInput.disabled = !isEnabled;
+    submitBtn.disabled = !isEnabled;
+}
+
+// --- 오류 처리 UI 함수 ---
+function showError(message) {
+    errorMessageSpan.textContent = message;
+    errorBanner.style.display = 'block';
+    setUIEnabled(false);
+}
+
+function hideError() {
+    errorBanner.style.display = 'none';
+}
+
+async function initializeApp() {
+    hideError();
+    setUIEnabled(false);
+    connStatusSpan.textContent = '서버에 연결 중...';
+    
+    await checkInitialConnection();
+    startHealthCheck();
+}
+
+async function checkInitialConnection() {
+    try {
+        await checkServerStatus();
+        if (connStatusIndicator.classList.contains('connected')) {
+            await fetchConfig();
+            await fetchAndLoadPrompts();
+            setUIEnabled(true);
+        }
+    } catch (e) {
+        // checkServerStatus will handle showing the error
+    }
+}
+
+
+async function fetchConfig() {
+    try {
+        const response = await fetch(`${BACKEND_URL}/config`);
+        if (!response.ok) throw new Error(`Server responded with ${response.status}`);
+        const data = await response.json();
+        modelNameSpan.textContent = data.model || 'N/A';
+    } catch (error) {
+        modelNameSpan.textContent = 'N/A';
+        console.error('Failed to fetch config:', error);
+        showError('서버 설정을 불러오지 못했습니다. 백엔드 서버 연결을 확인해주세요.');
+        throw error; // Stop further execution
+    }
+}
+
+async function fetchAndLoadPrompts() {
+    promptSelect.innerHTML = '<option>프롬프트 목록을 불러오는 중...</option>';
+    try {
+        const response = await fetch(`${BACKEND_URL}/prompts`);
+        if (!response.ok) throw new Error('Failed to fetch prompts from server.');
+        prompts = await response.json();
+        populatePromptSelect();
+    } catch (error) {
+        console.error("Error loading prompts:", error);
+        promptSelect.innerHTML = '<option>프롬프트를 불러오지 못했습니다.</option>';
+        showError('프롬프트 목록을 불러오지 못했습니다. 백엔드 서버 연결을 확인해주세요.');
+        throw error; // Stop further execution
+    }
+}
+
+function populatePromptSelect() {
+    promptSelect.innerHTML = '';
+    
+    if (prompts.length === 0) {
+        promptSelect.innerHTML = '<option>사용 가능한 프롬프트가 없습니다.</option>';
+        return;
+    }
+
+    prompts.forEach(promptItem => {
+        const option = document.createElement('option');
+        option.value = promptItem.key;
+        option.textContent = promptItem.key;
+        promptSelect.appendChild(option);
+    });
+    promptSelect.selectedIndex = 0;
+}
+
+async function submitAnalysis() {
+    const userQuery = questionInput.value;
+    const promptKey = promptSelect.value;
+    if (!userQuery.trim()) {
+        alert("분석할 내용을 입력해주세요.");
+        return;
+    }
+    setLoading(true);
+    try {
+        const response = await fetch(`${BACKEND_URL}/analyze`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ prompt_key: promptKey, user_query: userQuery }),
+        });
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ error: 'Cannot parse server error response.' }));
+            throw new Error(errorData.error || `Server error: ${response.status}`);
+        }
+        const data = await response.json();
+        currentQuestion = data.question;
+        currentAnswer = data.answer;
+        displayResult(data.answer);
+    } catch (error) {
+        displayResult(`**오류가 발생했습니다:**\n\n\`\`\`\n${error.message}\n\`\`\``);
+    } finally {
+        setLoading(false);
+    }
+}
+
+async function checkServerStatus() {
+    try {
+        const response = await fetch(`${BACKEND_URL}/health`);
+        if (!response.ok) throw new Error('Server not healthy');
+        const data = await response.json();
+
+        hideError();
+        connStatusSpan.textContent = "연결됨";
+        connStatusIndicator.className = 'status-indicator connected';
+        setUIEnabled(true);
+
+        if (serverInstanceId === null) {
+            serverInstanceId = data.instance_id;
+        } else if (serverInstanceId !== data.instance_id) {
+            setTimeout(() => location.reload(), 1000);
+        }
+    } catch (error) {
+        connStatusSpan.textContent = '연결 끊김';
+        connStatusIndicator.className = 'status-indicator disconnected';
+        showError('서버 상태를 확인할 수 없습니다. 백엔드 서버가 실행 중인지 확인해 주세요.');
+        throw error; // Propagate error for initial check
+    }
+}
+
+function startHealthCheck() {
+    setInterval(checkServerStatus, 5000);
+}
+
+function addCopyButtons(container) {
+    container.querySelectorAll('pre').forEach(pre => {
+        if (pre.querySelector('.copy-code-btn')) return;
+        const button = document.createElement('button');
+        button.innerText = '복사';
+        button.className = 'copy-code-btn';
+        pre.appendChild(button);
+        button.addEventListener('click', () => {
+            const code = pre.querySelector('code');
+            navigator.clipboard.writeText(code.innerText).then(() => {
+                button.innerText = '복사 완료!';
+                setTimeout(() => { button.innerText = '복사'; }, 2000);
+            });
+        });
+    });
+}
+
+function displayResult(markdownText) {
+    resultContainer.style.display = 'block';
+    resultOutput.innerHTML = marked.parse(markdownText || "No content received.");
+    addCopyButtons(resultOutput);
+    saveHtmlBtn.style.display = 'inline-flex';
+    feedbackBtn.style.display = 'inline-flex';
+}
+
+function setLoading(isLoading) {
+    submitBtn.disabled = isLoading;
+    submitBtn.innerHTML = isLoading 
+        ? `<svg class="icon" version="1.1" id="L9" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px" viewBox="0 0 100 100" enable-background="new 0 0 0 0" xml:space="preserve" style="width: 20px; height: 20px;"><path fill="#fff" d="M73,50c0-12.7-10.3-23-23-23S27,37.3,27,50 M30.9,50c0-10.5,8.5-19.1,19.1-19.1S69.1,39.5,69.1,50"><animateTransform attributeName="transform" attributeType="XML" type="rotate" dur="1s" from="0 50 50" to="360 50 50" repeatCount="indefinite"></animateTransform></path></svg> 분석 중...`
+        : `<svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z" clip-rule="evenodd"></path></svg> AI 분석 요청`;
+}
+
+function clearInputs() {
+    questionInput.value = '';
+    resultContainer.style.display = 'none';
+    resultOutput.innerHTML = '';
+    currentQuestion = '';
+    currentAnswer = '';
+}
+
+function saveAsHtml() {
+    const clone = resultOutput.cloneNode(true);
+    clone.querySelectorAll('.copy-code-btn').forEach(btn => btn.remove());
+    const savedHtmlStyle = `<style>body{font-family:sans-serif;line-height:1.6;padding:2em}pre{background:#f4f4f4;padding:1em;border-radius:5px;white-space:pre-wrap;word-wrap:break-word}code{font-family:monospace}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px}th{background:#f2f2f2}</style>`;
+    const htmlContent = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><title>AI 분석 결과</title>${savedHtmlStyle}</head><body><h1>AI 분석 결과</h1><hr>${clone.innerHTML}</body></html>`;
+    const blob = new Blob([htmlContent], { type: 'text/html' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `AI_분석_결과_${new Date().toISOString().slice(0, 10)}.html`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+
+function openFeedbackModal() {
+    feedbackQuestionEl.textContent = currentQuestion;
+    feedbackOriginalAnswerEl.textContent = currentAnswer;
+    feedbackInput.value = '';
+    feedbackModal.style.display = 'flex';
+}
+
+async function submitFeedback() {
+    const feedbackText = feedbackInput.value;
+    if (!feedbackText.trim()) {
+        alert("피드백 내용을 입력해주세요.");
+        return;
+    }
+    submitFeedbackBtn.disabled = true;
+    submitFeedbackBtn.textContent = '제출 중...';
+    try {
+        const response = await fetch(`${BACKEND_URL}/learn`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                question: currentQuestion,
+                original_answer: currentAnswer,
+                feedback_answer: feedbackText
+            })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            alert("피드백이 성공적으로 제출되었습니다. 학습에 반영됩니다.");
+            feedbackModal.style.display = 'none';
+        } else {
+            throw new Error(data.error || "피드백 제출에 실패했습니다.");
+        }
+    } catch (error) {
+        alert(`오류가 발생했습니다: ${error.message}`);
+    } finally {
+        submitFeedbackBtn.disabled = false;
+        submitFeedbackBtn.textContent = '피드백 제출';
+    }
+}
+
+// --- Event Listeners ---
+window.addEventListener('DOMContentLoaded', initializeApp);
+submitBtn.addEventListener('click', submitAnalysis);
+clearBtn.addEventListener('click', clearInputs);
+saveHtmlBtn.addEventListener('click', saveAsHtml);
+feedbackBtn.addEventListener('click', openFeedbackModal);
+closeFeedbackModalBtn.addEventListener('click', () => feedbackModal.style.display = 'none');
+submitFeedbackBtn.addEventListener('click', submitFeedback);
+reconnectBtn.addEventListener('click', async () => {
+    reconnectBtn.textContent = '연결 중...';
+    reconnectBtn.disabled = true;
+    await initializeApp();
+    reconnectBtn.textContent = '재연결 시도';
+    reconnectBtn.disabled = false;
+});
+window.addEventListener('click', (event) => {
+    if (event.target == feedbackModal) feedbackModal.style.display = 'none';
+});
+</script>
+</body>
+</html>
+
