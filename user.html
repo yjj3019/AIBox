@@ -52,12 +52,12 @@
         }
         .header h1 { margin: 0; font-size: 2rem; font-weight: 700; }
         .header p { margin: 0.5rem 0 0; font-size: 1rem; opacity: 0.8; }
-        
-        #status { 
-            padding: 0.75rem 2rem; 
-            font-size: 0.9rem; 
-            text-align: right; 
-            background-color: #e9ecef; 
+
+        #status {
+            padding: 0.75rem 2rem;
+            font-size: 0.9rem;
+            text-align: right;
+            background-color: #e9ecef;
             border-bottom: 1px solid var(--border-color);
             display: flex;
             justify-content: flex-end;
@@ -79,7 +79,7 @@
 
         .content { padding: 2rem; }
         .card { background: var(--surface-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
-        
+
         h2 {
             font-size: 1.25rem;
             margin-top: 0;
@@ -102,7 +102,7 @@
 
         textarea { height: 200px; resize: vertical; }
         .button-group { display: flex; gap: 1rem; margin-top: 1rem; }
-        
+
         .button {
             background-image: linear-gradient(to right, #007bff, #0056b3);
             color: white; border: none; padding: 0.7rem 1.2rem;
@@ -119,25 +119,25 @@
         .button.success:hover { box-shadow: 0 4px 8px rgba(40, 167, 69, 0.2); }
         .button:disabled { background-image: none; background-color: #cccccc; cursor: not-allowed; transform: none; box-shadow: none; }
         #result-container { display: none; }
-        
+
         #result-output {
             max-height: 500px; overflow-y: auto; line-height: 1.8;
-            word-wrap: break-word; padding: 1.5rem; background-color: #fdfdfd; 
+            word-wrap: break-word; padding: 1.5rem; background-color: #fdfdfd;
             border-radius: 6px; border: 1px solid var(--border-color);
         }
-        #result-output h1, #result-output h2, #result-output h3, #result-output h4 { 
-            margin-top: 2em; margin-bottom: 0.8em; border-bottom: 1px solid #eee; 
+        #result-output h1, #result-output h2, #result-output h3, #result-output h4 {
+            margin-top: 2em; margin-bottom: 0.8em; border-bottom: 1px solid #eee;
             padding-bottom: 0.4em; color: #1a2c42; font-weight: 600;
         }
-        #result-output table { 
-            border-collapse: collapse; width: 100%; margin: 1.5em 0; 
+        #result-output table {
+            border-collapse: collapse; width: 100%; margin: 1.5em 0;
             box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid #ddd;
         }
         #result-output th, #result-output td { border: 1px solid #ddd; padding: 12px; text-align: left; }
         #result-output th { background-color: #f8f9fa; font-weight: 600; }
-        #result-output pre { 
+        #result-output pre {
             position: relative; background-color: var(--code-bg); color: var(--code-text);
-            padding: 1.5rem 1rem; border-radius: 8px; overflow-x: auto; 
+            padding: 1.5rem 1rem; border-radius: 8px; overflow-x: auto;
             margin: 1.5em 0; font-family: 'JetBrains Mono', monospace; line-height: 1.6;
         }
         .copy-code-btn {
@@ -146,7 +146,7 @@
             cursor: pointer; opacity: 0.7; transition: all 0.2s; font-size: 0.8em;
         }
         .copy-code-btn:hover { opacity: 1; background-color: var(--primary-color); }
-        
+
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.6); backdrop-filter: blur(5px); align-items: center; justify-content: center; }
         .modal-content { background-color: var(--surface-color); padding: 2rem; border: none; width: 90%; max-width: 700px; border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,0.2); display: flex; flex-direction: column; max-height: 85vh; }
         .modal-header { flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 1rem; margin-bottom: 1.5rem; }
@@ -161,8 +161,7 @@
 <body>
     <div class="container">
         <header class="header">
-            <h1>AI 기반 분석 시스템</h1>
-            <p>척척 박사 유박사에게 질문하세요.</p>
+            <h1>AIBox 분석 전문가 시스템 </h1>
         </header>
         <div id="status">
             <div class="status-item">
@@ -188,7 +187,7 @@
                 <h2>분석 프롬프트 선택</h2>
                 <select id="prompt-select"></select>
                 <textarea id="question-input" placeholder="이곳에 해결하고 싶은 문제나 분석 내용을 자유롭게 입력하세요. AI가 필요한 정보를 파악하여 프롬프트를 구성합니다."></textarea>
-                
+
                 <div class="button-group">
                     <button id="submit-btn" class="button">
                         <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z" clip-rule="evenodd"></path></svg>
@@ -217,7 +216,7 @@
             </div>
         </div>
     </div>
-    
+
     <div id="feedback-modal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -246,17 +245,15 @@
 
 <script>
 // --- Configuration ---
-// 백엔드 서버 주소. 비워두면 현재 페이지와 동일한 주소로 요청합니다.
-// 예: const BACKEND_URL = 'http://127.0.0.1:8000';
-const BACKEND_URL = 'http://70.2.250.35:5000'; 
+const API_BASE_URL = '/AIBox/api';
 
-// --- 전역 변수 및 상태 관리 ---
-let prompts = []; 
-let currentQuestion = ''; 
+// --- Global State ---
+let prompts = [];
+let currentQuestion = '';
 let currentAnswer = '';
 let serverInstanceId = null;
 
-// --- DOM 요소 캐싱 ---
+// --- DOM Element Caching ---
 const connStatusIndicator = document.getElementById('conn-status-indicator');
 const connStatusSpan = document.getElementById('conn-status');
 const modelNameSpan = document.getElementById('model-name');
@@ -268,24 +265,26 @@ const resultContainer = document.getElementById('result-container');
 const resultOutput = document.getElementById('result-output');
 const saveHtmlBtn = document.getElementById('save-html-btn');
 const feedbackBtn = document.getElementById('feedback-btn');
+
 const feedbackModal = document.getElementById('feedback-modal');
 const closeFeedbackModalBtn = document.getElementById('close-feedback-modal');
 const submitFeedbackBtn = document.getElementById('submit-feedback-btn');
 const feedbackQuestionEl = document.getElementById('feedback-question');
 const feedbackOriginalAnswerEl = document.getElementById('feedback-original-answer');
 const feedbackInput = document.getElementById('feedback-input');
+
 const errorBanner = document.getElementById('error-banner');
 const errorMessageSpan = document.getElementById('error-message');
 const reconnectBtn = document.getElementById('reconnect-btn');
 
-// --- UI 제어 함수 ---
+
+// --- UI Control Functions ---
 function setUIEnabled(isEnabled) {
     promptSelect.disabled = !isEnabled;
     questionInput.disabled = !isEnabled;
     submitBtn.disabled = !isEnabled;
 }
 
-// --- 오류 처리 UI 함수 ---
 function showError(message) {
     errorMessageSpan.textContent = message;
     errorBanner.style.display = 'block';
@@ -296,11 +295,20 @@ function hideError() {
     errorBanner.style.display = 'none';
 }
 
+function setLoading(isLoading) {
+    submitBtn.disabled = isLoading;
+    submitBtn.innerHTML = isLoading
+        ? `<svg class="icon" version="1.1" id="L9" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px" viewBox="0 0 100 100" enable-background="new 0 0 0 0" xml:space="preserve" style="width: 20px; height: 20px;"><path fill="#fff" d="M73,50c0-12.7-10.3-23-23-23S27,37.3,27,50 M30.9,50c0-10.5,8.5-19.1,19.1-19.1S69.1,39.5,69.1,50"><animateTransform attributeName="transform" attributeType="XML" type="rotate" dur="1s" from="0 50 50" to="360 50 50" repeatCount="indefinite"></animateTransform></path></svg> 분석 중...`
+        : `<svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z" clip-rule="evenodd"></path></svg> AI 분석 요청`;
+}
+
+
+// --- Initialization and Health Check ---
 async function initializeApp() {
     hideError();
     setUIEnabled(false);
     connStatusSpan.textContent = '서버에 연결 중...';
-    
+
     await checkInitialConnection();
     startHealthCheck();
 }
@@ -314,89 +322,19 @@ async function checkInitialConnection() {
             setUIEnabled(true);
         }
     } catch (e) {
-        // checkServerStatus will handle showing the error
+        // Error is already shown by checkServerStatus
     }
 }
 
-
-async function fetchConfig() {
-    try {
-        const response = await fetch(`${BACKEND_URL}/config`);
-        if (!response.ok) throw new Error(`Server responded with ${response.status}`);
-        const data = await response.json();
-        modelNameSpan.textContent = data.model || 'N/A';
-    } catch (error) {
-        modelNameSpan.textContent = 'N/A';
-        console.error('Failed to fetch config:', error);
-        showError('서버 설정을 불러오지 못했습니다. 백엔드 서버 연결을 확인해주세요.');
-        throw error; // Stop further execution
-    }
+function startHealthCheck() {
+    setInterval(checkServerStatus, 5000); // Check server status every 5 seconds
 }
 
-async function fetchAndLoadPrompts() {
-    promptSelect.innerHTML = '<option>프롬프트 목록을 불러오는 중...</option>';
-    try {
-        const response = await fetch(`${BACKEND_URL}/prompts`);
-        if (!response.ok) throw new Error('Failed to fetch prompts from server.');
-        prompts = await response.json();
-        populatePromptSelect();
-    } catch (error) {
-        console.error("Error loading prompts:", error);
-        promptSelect.innerHTML = '<option>프롬프트를 불러오지 못했습니다.</option>';
-        showError('프롬프트 목록을 불러오지 못했습니다. 백엔드 서버 연결을 확인해주세요.');
-        throw error; // Stop further execution
-    }
-}
 
-function populatePromptSelect() {
-    promptSelect.innerHTML = '';
-    
-    if (prompts.length === 0) {
-        promptSelect.innerHTML = '<option>사용 가능한 프롬프트가 없습니다.</option>';
-        return;
-    }
-
-    prompts.forEach(promptItem => {
-        const option = document.createElement('option');
-        option.value = promptItem.key;
-        option.textContent = promptItem.key;
-        promptSelect.appendChild(option);
-    });
-    promptSelect.selectedIndex = 0;
-}
-
-async function submitAnalysis() {
-    const userQuery = questionInput.value;
-    const promptKey = promptSelect.value;
-    if (!userQuery.trim()) {
-        alert("분석할 내용을 입력해주세요.");
-        return;
-    }
-    setLoading(true);
-    try {
-        const response = await fetch(`${BACKEND_URL}/analyze`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ prompt_key: promptKey, user_query: userQuery }),
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({ error: 'Cannot parse server error response.' }));
-            throw new Error(errorData.error || `Server error: ${response.status}`);
-        }
-        const data = await response.json();
-        currentQuestion = data.question;
-        currentAnswer = data.answer;
-        displayResult(data.answer);
-    } catch (error) {
-        displayResult(`**오류가 발생했습니다:**\n\n\`\`\`\n${error.message}\n\`\`\``);
-    } finally {
-        setLoading(false);
-    }
-}
-
+// --- API Call Functions ---
 async function checkServerStatus() {
     try {
-        const response = await fetch(`${BACKEND_URL}/health`);
+        const response = await fetch(`${API_BASE_URL}/health`);
         if (!response.ok) throw new Error('Server not healthy');
         const data = await response.json();
 
@@ -413,13 +351,108 @@ async function checkServerStatus() {
     } catch (error) {
         connStatusSpan.textContent = '연결 끊김';
         connStatusIndicator.className = 'status-indicator disconnected';
-        showError('서버 상태를 확인할 수 없습니다. 백엔드 서버가 실행 중인지 확인해 주세요.');
-        throw error; // Propagate error for initial check
+        showError('API 서버 상태를 확인할 수 없습니다. 백엔드 서버가 실행 중인지 확인해 주세요.');
+        throw error;
     }
 }
 
-function startHealthCheck() {
-    setInterval(checkServerStatus, 5000);
+async function fetchConfig() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/config`);
+        if (!response.ok) throw new Error(`Server responded with ${response.status}`);
+        const data = await response.json();
+        modelNameSpan.textContent = data.model || 'N/A';
+    } catch (error) {
+        modelNameSpan.textContent = 'N/A';
+        console.error('Failed to fetch config:', error);
+        showError('서버 설정을 불러오지 못했습니다.');
+        throw error;
+    }
+}
+
+async function fetchAndLoadPrompts() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/prompts`);
+        if (!response.ok) throw new Error('Failed to fetch prompts from server.');
+        prompts = await response.json();
+        populatePromptSelect();
+    } catch (error) {
+        console.error("Error loading prompts:", error);
+        promptSelect.innerHTML = '<option>프롬프트를 불러오지 못했습니다.</option>';
+        showError('프롬프트 목록을 불러오지 못했습니다.');
+        throw error;
+    }
+}
+
+
+// --- Analysis and Result Handling ---
+async function submitAnalysis() {
+    const userQuery = questionInput.value;
+    const promptKey = promptSelect.value;
+    if (!userQuery.trim()) {
+        alert("분석할 내용을 입력해주세요.");
+        return;
+    }
+    setLoading(true);
+    try {
+        const response = await fetch(`${API_BASE_URL}/analyze`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ prompt_key: promptKey, user_query: userQuery }),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            let errorMessage;
+            try {
+                const errorData = JSON.parse(errorText);
+                errorMessage = errorData.error || errorText;
+            } catch (e) {
+                errorMessage = errorText || `Server returned status ${response.status} with no message.`;
+            }
+            throw new Error(errorMessage);
+        }
+
+        const data = await response.json();
+        currentQuestion = data.question;
+        currentAnswer = data.answer;
+        displayResult(data.answer);
+    } catch (error) {
+        displayResult(`**오류가 발생했습니다:**\n\n\`\`\`\n${error.message}\n\`\`\``);
+    } finally {
+        setLoading(false);
+    }
+}
+
+function displayResult(markdownText) {
+    resultContainer.style.display = 'block';
+    resultOutput.innerHTML = marked.parse(markdownText || "No content received.");
+    addCopyButtons(resultOutput);
+    saveHtmlBtn.style.display = 'inline-flex';
+    feedbackBtn.style.display = 'inline-flex';
+}
+
+
+// --- Helper Functions ---
+function populatePromptSelect() {
+    const currentSelection = promptSelect.value;
+    promptSelect.innerHTML = '';
+
+    if (prompts.length > 0) {
+        prompts.forEach(promptItem => {
+            const option = document.createElement('option');
+            option.value = promptItem.key;
+            option.textContent = promptItem.key;
+            promptSelect.appendChild(option);
+        });
+        if (currentSelection && prompts.some(p => p.key === currentSelection)) {
+            promptSelect.value = currentSelection;
+        } else {
+            promptSelect.selectedIndex = 0;
+        }
+    } else {
+        promptSelect.innerHTML = '<option>사용 가능한 프롬프트가 없습니다.</option>';
+    }
 }
 
 function addCopyButtons(container) {
@@ -437,21 +470,6 @@ function addCopyButtons(container) {
             });
         });
     });
-}
-
-function displayResult(markdownText) {
-    resultContainer.style.display = 'block';
-    resultOutput.innerHTML = marked.parse(markdownText || "No content received.");
-    addCopyButtons(resultOutput);
-    saveHtmlBtn.style.display = 'inline-flex';
-    feedbackBtn.style.display = 'inline-flex';
-}
-
-function setLoading(isLoading) {
-    submitBtn.disabled = isLoading;
-    submitBtn.innerHTML = isLoading 
-        ? `<svg class="icon" version="1.1" id="L9" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px" viewBox="0 0 100 100" enable-background="new 0 0 0 0" xml:space="preserve" style="width: 20px; height: 20px;"><path fill="#fff" d="M73,50c0-12.7-10.3-23-23-23S27,37.3,27,50 M30.9,50c0-10.5,8.5-19.1,19.1-19.1S69.1,39.5,69.1,50"><animateTransform attributeName="transform" attributeType="XML" type="rotate" dur="1s" from="0 50 50" to="360 50 50" repeatCount="indefinite"></animateTransform></path></svg> 분석 중...`
-        : `<svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z" clip-rule="evenodd"></path></svg> AI 분석 요청`;
 }
 
 function clearInputs() {
@@ -491,7 +509,7 @@ async function submitFeedback() {
     submitFeedbackBtn.disabled = true;
     submitFeedbackBtn.textContent = '제출 중...';
     try {
-        const response = await fetch(`${BACKEND_URL}/learn`, {
+        const response = await fetch(`${API_BASE_URL}/learn`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
@@ -515,7 +533,7 @@ async function submitFeedback() {
     }
 }
 
-// --- Event Listeners ---
+// --- Event Listener Setup ---
 window.addEventListener('DOMContentLoaded', initializeApp);
 submitBtn.addEventListener('click', submitAnalysis);
 clearBtn.addEventListener('click', clearInputs);
@@ -536,4 +554,3 @@ window.addEventListener('click', (event) => {
 </script>
 </body>
 </html>
-
