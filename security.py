@@ -14,7 +14,7 @@ ANALYSIS_PERIOD_DAYS = 180
 # 최종 리포트에 포함할 상위 CVE 개수
 TOP_CVE_COUNT = 20
 # 랭킹 기록을 저장할 파일
-HISTORY_FILE = 'ranking_history.json'
+HISTORY_FILE = '/data/iso/AIBox/ranking_history.json'
 # 분석 대상으로 고려할 최소 CVSSv3 점수
 MIN_CVSS_SCORE = 7.0
 # [수정] 사용자가 요청한 분석 대상 RHEL 제품 목록
@@ -48,7 +48,7 @@ def call_llm(prompt, system_message="You are a helpful assistant designed to out
         "max_tokens": 4096, # [수정] Executive Summary 잘림 현상 방지를 위해 토큰 증가 (2048 -> 4096)
         "temperature": 0.0
     }
-    
+
     try:
         response = requests.post(f'{LLM_URL.rstrip("/")}/v1/chat/completions', headers=headers, json=payload, timeout=120)
         response.raise_for_status()
@@ -71,12 +71,12 @@ def list_llm_models():
     headers = {}
     if LLM_TOKEN:
         headers['Authorization'] = f'Bearer {LLM_TOKEN}'
-    
+
     try:
         response = requests.get(models_url, headers=headers, timeout=20)
         response.raise_for_status()
         models_data = response.json()
-        
+
         if 'data' in models_data and models_data['data']:
             print("\n--- Available Models ---")
             for model in models_data['data']:
@@ -92,7 +92,7 @@ def fetch_redhat_cves(start_date):
     print(f"Step 1: Fetching all recent CVEs from Red Hat API since {start_date}...")
     url = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
     params = {'after': start_date}
-    
+
     try:
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
@@ -123,13 +123,13 @@ def filter_cves_by_strict_criteria(all_cves):
     """
     print(f"\nStep 3: Applying strict filtering to {len(all_cves)} CVEs...")
     passed_cves = []
-    
+
     for cve in all_cves:
         if not isinstance(cve, dict):
             continue
-        
+
         cve_id = cve.get('CVE', 'N/A')
-        
+
         # 조건 1: 제품 관련성 확인
         package_states = cve.get('package_state', [])
         is_relevant_product = False
@@ -138,7 +138,7 @@ def filter_cves_by_strict_criteria(all_cves):
                 if state.get('fix_state') == 'Affected' and state.get('product_name') in TARGET_RHEL_PRODUCTS:
                     is_relevant_product = True
                     break
-        
+
         if not is_relevant_product:
             # print(f"  -> Excluding {cve_id}: Not relevant to target products.") # 로그가 너무 많아질 수 있으므로 주석 처리
             continue
@@ -160,11 +160,11 @@ def filter_cves_by_strict_criteria(all_cves):
                     cvss3_score = float(score_str)
             except (ValueError, TypeError):
                 pass
-        
+
         if cvss3_score < MIN_CVSS_SCORE:
             print(f"  -> Excluding {cve_id}: CVSS score is {cvss3_score}, which is below {MIN_CVSS_SCORE}.")
             continue
-        
+
         # 모든 조건을 통과한 CVE만 추가
         print(f"  -> Including {cve_id}: Meets all criteria (Severity: {severity}, CVSS: {cvss3_score}, Relevant).")
         passed_cves.append(cve)
@@ -175,12 +175,12 @@ def filter_cves_by_strict_criteria(all_cves):
 def extract_summary_from_cve(cve_data):
     """CVE 데이터 객체에서 요약 정보를 추출합니다."""
     if not isinstance(cve_data, dict): return ""
-    
+
     details = cve_data.get('details', [])
     if details and isinstance(details, list):
         summary = " ".join(details)
         if summary.strip(): return summary.strip()
-            
+
     statement = cve_data.get('statement', "")
     if statement and isinstance(statement, str):
         if statement.strip(): return statement.strip()
@@ -206,7 +206,7 @@ def analyze_cve_with_llm_single(cve, total_count, current_index):
 
     # LLM 프롬프트를 위한 추가 정보 추출
     cvss3_score = cve.get('cvss3', {}).get('cvss3_base_score', 'N/A') if isinstance(cve.get('cvss3'), dict) else 'N/A'
-    
+
     package_states = cve.get('package_state', [])
     affected_products = sorted(list({
         state.get('product_name') for state in package_states
@@ -256,10 +256,10 @@ def analyze_cve_with_llm_single(cve, total_count, current_index):
     try:
         json_match = re.search(r'\{.*\}', llm_response_str, re.DOTALL)
         if not json_match: raise json.JSONDecodeError("Could not find JSON object in response", llm_response_str, 0)
-        
+
         cleaned_json_str = json_match.group(0)
         cleaned_json_str = re.sub(r',\s*([\]}])', r'\1', cleaned_json_str)
-        
+
         return json.loads(cleaned_json_str)
     except json.JSONDecodeError as e:
         print(f"  -> Failed to parse analysis for {cve_id}. Reason: {e}.")
@@ -268,7 +268,7 @@ def analyze_cve_with_llm_single(cve, total_count, current_index):
 def analyze_and_prioritize_with_llm(cves):
     """Step 4: 각 필터링된 CVE를 개별적으로 분석합니다."""
     print(f"\nStep 4: Starting LLM analysis for {len(cves)} CVEs that met the criteria...")
-    
+
     analyzed_cves = []
     for i, cve in enumerate(cves):
         if not isinstance(cve, dict): continue
@@ -280,25 +280,25 @@ def analyze_and_prioritize_with_llm(cves):
         else:
             print(f"  -> Warning: LLM analysis failed for {cve.get('CVE')}. It will be excluded from the final report.")
         time.sleep(1)
-    
+
     print("\n--- LLM analysis for all CVEs is complete ---")
     return analyze_and_prioritize_manual(analyzed_cves)
 
 def analyze_and_prioritize_manual(cves):
     """Step 5: 수집된 데이터와 점수 모델을 기반으로 CVE 우선순위를 정합니다."""
     print(f"\nStep 5: Starting priority ranking based on scoring model...")
-    
+
     for cve in cves:
         if not isinstance(cve, dict): continue
         score = 0
         summary = extract_summary_from_cve(cve)
         threat_tags = cve.get('threat_tags', [])
-        
+
         if isinstance(threat_tags, list):
             if "Exploited in the wild" in threat_tags or re.search(r'in the wild|actively exploited', summary, re.IGNORECASE): score += 1000
             if "RCE" in threat_tags or re.search(r'remote code execution|rce', summary, re.IGNORECASE): score += 200
             if "Privilege Escalation" in threat_tags or re.search(r'privilege escalation', summary, re.IGNORECASE): score += 150
-        
+
         if cve.get('severity') == 'critical': score += 100
         elif cve.get('severity') == 'important': score += 50
 
@@ -310,14 +310,14 @@ def analyze_and_prioritize_manual(cves):
                 if score_str: cvss3_score = float(score_str)
              except (ValueError, TypeError): pass
         score += cvss3_score * 10
-        
+
         components = cve.get('affected_components', [])
         critical_components = {'kernel', 'glibc', 'openssl', 'systemd', 'qemu-kvm', 'grub2', 'httpd', 'nginx'}
         if isinstance(components, list) and any(comp.lower() in critical_components for comp in components):
             score += 100
 
         cve['priority_score'] = score
-    
+
     cves.sort(key=lambda x: x.get('priority_score', 0), reverse=True)
     top_cves = cves[:TOP_CVE_COUNT]
     print(f"-> Analysis complete. Finalized top {len(top_cves)} CVEs.")
@@ -347,7 +347,7 @@ def process_ranking_changes(todays_cves, previous_ranks):
         if not isinstance(cve, dict): continue
         rank, cve_id = i + 1, cve.get('CVE')
         if not cve_id: continue
-        
+
         cve_data = cve.copy()
         if cve_id in previous_ranks:
             previous_rank_data = previous_ranks[cve_id]
@@ -364,16 +364,16 @@ def process_ranking_changes(todays_cves, previous_ranks):
         first_seen_date = datetime.strptime(cve_data['first_seen_date'], '%Y-%m-%d')
         days_in_rank = (today_date - first_seen_date).days + 1
         cve_data['days_in_rank'] = days_in_rank
-        
+
         processed_cves.append(cve_data)
         todays_ranks_for_saving[cve_id] = {'rank': rank, 'first_seen_date': cve_data['first_seen_date']}
-        
+
     return processed_cves, todays_ranks_for_saving
 
 def generate_executive_summary(top_cves):
     """LLM을 사용하여 리포트용 Executive Summary를 생성합니다."""
     print("\nGenerating Executive Summary with LLM...")
-    
+
     summary_data = [f"{i+1}. {cve.get('CVE')}: {cve.get('concise_summary', '')} (Severity: {cve.get('severity', 'N/A')}, Tags: {cve.get('threat_tags', [])})" for i, cve in enumerate(top_cves)]
 
     prompt = f"""
@@ -387,7 +387,7 @@ def generate_executive_summary(top_cves):
     [Task]
     Write a professional Executive Summary in Korean. Be insightful and clear.
     """
-    
+
     summary = call_llm(prompt, "You are a cybersecurity expert writing an executive summary for a technical audience.")
     return summary.replace("\n", "<br>") if summary else "상위 취약점에 대한 요약 정보를 생성하지 못했습니다."
 
@@ -415,7 +415,7 @@ def print_selection_reasons_to_console(cves):
 def generate_report(processed_cves, executive_summary):
     """최종 분석 리포트를 HTML 파일로 생성합니다."""
     print("\nGenerating final HTML analysis report...")
-    
+
     table_rows_html = ""
     for i, cve in enumerate(processed_cves):
         if not isinstance(cve, dict): continue
@@ -424,30 +424,30 @@ def generate_report(processed_cves, executive_summary):
         default_summary = " ".join(cve.get('details', [])) or '요약 정보 없음'
         summary = cve.get('concise_summary', default_summary) if cve.get('concise_summary') else default_summary
         selection_reason = cve.get('selection_reason', 'RHEL 관련성 및 심각도 등급 기반으로 선정되었습니다.')
-        
+
         tags_html, packages_html = "", ""
         threat_tags = cve.get('threat_tags', [])
         if isinstance(threat_tags, list) and threat_tags:
             for tag in threat_tags:
                 tag_class = "tag-exploited" if "Exploited" in str(tag) else "tag-threat"
                 tags_html += f'<span class="threat-tag {tag_class}">{tag}</span>'
-        
+
         affected_components = cve.get('affected_components', [])
         if isinstance(affected_components, list) and affected_components:
             for pkg in affected_components[:3]:
                 packages_html += f'<span class="threat-tag tag-pkg">{pkg}</span>'
             if len(affected_components) > 3: packages_html += f'<span class="threat-tag tag-pkg">...</span>'
-        
+
         final_tags_html = f'<div class="summary-tags">{tags_html}{packages_html}</div>'
         rhsa_ids = get_rhsa_ids_from_cve(cve)
         remediation_html = " ".join([f'<a href="https://access.redhat.com/errata/{rhsa_id}" target="_blank">{rhsa_id}</a>' for rhsa_id in rhsa_ids]) if rhsa_ids else "발행 예정"
         if rhsa_ids: remediation_html += "<br><small>해당 RHSA 최신 패키지로 업데이트하십시오.</small>"
-        
+
         severity_icon, severity_class = ('🔥', 'severity-critical') if severity == 'critical' else ('⚠️', 'severity-important')
         rank_change_icon = {'up': '▲', 'down': '▼', 'same': '—', 'new': 'N'}.get(cve.get('rank_change'), '—')
         rank_change_class = f"rank-{cve.get('rank_change', 'same')}"
         days_in_rank = cve.get('days_in_rank', 1)
-        
+
         cvss3_score = 0.0
         cvss3_data = cve.get('cvss3', {})
         if isinstance(cvss3_data, dict):
@@ -462,10 +462,9 @@ def generate_report(processed_cves, executive_summary):
             <td class="center-align"><span class="{severity_class} severity-badge">{severity_icon} {str(severity).capitalize()}</span><br><small>CVSS: {cvss3_score}</small></td>
             <td class="center-align">{days_in_rank}일</td>
             <td>{final_tags_html}{summary}</td><td>{selection_reason}</td><td>{remediation_html}</td></tr>"""
-    
+
     analysis_date, report_month = datetime.now().strftime('%Y-%m-%d'), datetime.now().strftime('%Y-%m')
 
-    # [수정] index.html과 조화로운 라이트 테마의 새로운 스타일 적용
     html_content = f"""<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RHEL 보안 위협 분석 리포트 ({report_month})</title>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
@@ -540,6 +539,29 @@ def generate_report(processed_cves, executive_summary):
     .tag-exploited{{ background-color: var(--danger-color); }}
     .tag-threat{{ background-color: #f57c00; }}
     .tag-pkg{{ background-color: var(--secondary-color); }}
+    .button-container {{
+        text-align: right;
+        margin-top: 2rem;
+    }}
+    .button {{
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        background-image: linear-gradient(to right, #007bff, #0056b3);
+        color: white;
+        border: none;
+        padding: 0.8rem 1.5rem;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 1rem;
+        font-weight: 500;
+        text-decoration: none;
+        transition: all 0.3s ease;
+    }}
+    .button:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0, 123, 255, 0.2);
+    }}
     </style></head><body><div class="container">
     <div class="header"><h1>RHEL 보안 위협 분석 리포트</h1><p><strong>분석 기준일: {analysis_date}</strong> | <strong>분석 대상 기간:</strong> 최근 {ANALYSIS_PERIOD_DAYS}일 및 과거 주요 취약점</p></div>
     <div class="summary-card"><h2>Executive Summary</h2><p>{executive_summary}</p></div>
@@ -547,9 +569,38 @@ def generate_report(processed_cves, executive_summary):
     <th style="width:5%">순위</th><th style="width:12%">CVE-ID & 공개일</th><th style="width:10%">심각도 & 점수</th>
     <th style="width:8%">순위 유지일</th><th style="width:25%">취약점 요약</th><th style="width:28%">취약점 선정 이유</th>
     <th style="width:12%">조치 방안 (RHSA)</th>
-    </tr></thead><tbody>{table_rows_html}</tbody></table></div></div></body></html>"""
-    
-    report_filename = "rhel_top20_report.html"
+    </tr></thead><tbody>{table_rows_html}</tbody></table></div>
+    <div class="button-container">
+        <button id="save-html-btn" class="button">HTML로 저장</button>
+    </div>
+    </div>
+    <script>
+        document.getElementById('save-html-btn').addEventListener('click', function() {{
+            const docClone = document.documentElement.cloneNode(true);
+
+            // 복제된 문서에서 버튼과 스크립트 제거
+            const buttonContainerClone = docClone.querySelector('.button-container');
+            if (buttonContainerClone) buttonContainerClone.remove();
+
+            const scriptTagClone = docClone.querySelector('script');
+            if (scriptTagClone) scriptTagClone.remove();
+
+            const htmlContent = '<!DOCTYPE html>\\n' + docClone.outerHTML;
+            const blob = new Blob([htmlContent], {{ type: 'text/html;charset=utf-8' }});
+
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'rhel_top20_report_{report_month}.html';
+            document.body.appendChild(a);
+            a.click();
+
+            document.body.removeChild(a);
+            URL.revokeObjectURL(a.href);
+        }});
+    </script>
+    </body></html>"""
+
+    report_filename = "/data/iso/AIBox/rhel_top20_report.html"
     try:
         with open(report_filename, "w", encoding="utf-8") as f: f.write(html_content)
         print(f"-> Success: Report '{report_filename}' has been generated.")
@@ -571,7 +622,7 @@ def main():
         list_llm_models(); sys.exit(0)
 
     start_date = (datetime.now() - timedelta(days=ANALYSIS_PERIOD_DAYS)).strftime('%Y-%m-%d')
-    
+
     previous_ranks = load_history()
     recent_cves_summary = fetch_redhat_cves(start_date)
 
@@ -585,7 +636,7 @@ def main():
 
     print(f"\nStep 2: Fetching and merging full details for {len(candidate_cves)} candidate CVEs...")
     all_cve_data = []
-    
+
     for i, (cve_id, summary_data) in enumerate(candidate_cves.items()):
         print(f"  ({i+1}/{len(candidate_cves)}) Fetching {cve_id}...")
         resource_url = summary_data.get('resource_url')
@@ -594,7 +645,7 @@ def main():
             continue
 
         detailed_data = fetch_cve_details(resource_url)
-        
+
         if detailed_data:
             merged_data = {**summary_data, **detailed_data}
             all_cve_data.append(merged_data)
@@ -607,21 +658,21 @@ def main():
 
     if not cves_meeting_criteria:
         print("\nNo CVEs meeting the specified criteria were found. Exiting program."); return
-    
+
     if not (LLM_URL and LLM_MODEL):
          print("\nError: LLM URL and Model must be provided to get recommendations. Exiting program.")
          sys.exit(1)
 
     llm_recommended_cves = analyze_and_prioritize_with_llm(cves_meeting_criteria)
-        
+
     processed_cves, todays_ranks_to_save = process_ranking_changes(llm_recommended_cves, previous_ranks)
-    
+
     executive_summary = "LLM 정보가 제공되지 않아 Executive Summary를 생성할 수 없습니다."
     if LLM_URL and LLM_MODEL:
         executive_summary = generate_executive_summary(processed_cves)
 
     print_selection_reasons_to_console(processed_cves)
-    
+
     generate_report(processed_cves, executive_summary)
     save_history(todays_ranks_to_save)
 
