@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIBox 스케줄 관리</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #0d6efd;
+            --secondary-color: #6c757d;
+            --success-color: #198754;
+            --danger-color: #dc3545;
+            --background-color: #f4f7f9;
+            --surface-color: #ffffff;
+            --text-color: #212529;
+            --header-bg: linear-gradient(135deg, #0d1b2a 0%, #1a2c42 100%);
+            --header-text: #ffffff;
+            --border-color: #e9ecef;
+            --shadow: 0 6px 24px rgba(0,0,0,0.07);
+            --shadow-hover: 0 8px 32px rgba(0,0,0,0.1);
+            --code-bg: #282c34;
+        }
+
+        body {
+            font-family: 'Noto Sans KR', sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 2.5rem;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            min-height: 100vh;
+        }
+
+        .container {
+            background: var(--surface-color);
+            border-radius: 16px;
+            box-shadow: var(--shadow);
+            width: 100%;
+            max-width: 1024px;
+            overflow: hidden;
+            transition: box-shadow 0.3s ease;
+        }
+
+        .header {
+            background: var(--header-bg);
+            color: var(--header-text);
+            padding: 2.5rem;
+            text-align: center;
+        }
+        .header h1 { margin: 0; font-size: 2.25rem; font-weight: 700; }
+        
+        .content { padding: 2.5rem; }
+        .card { 
+            background: var(--surface-color); 
+            border: 1px solid var(--border-color); 
+            border-radius: 12px; 
+            padding: 2rem; 
+            margin-bottom: 2rem;
+            transition: all 0.3s ease;
+        }
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-hover);
+        }
+        
+        h2 {
+            font-size: 1.5rem;
+            margin-top: 0;
+            margin-bottom: 1.5rem;
+            color: #1a2c42;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 1rem;
+        }
+        th, td {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            text-align: left;
+            vertical-align: middle;
+        }
+        th {
+            background-color: #f8f9fa;
+            font-weight: 500;
+            font-size: 0.9rem;
+            color: #495057;
+            text-transform: uppercase;
+        }
+        tbody tr {
+            transition: background-color 0.2s ease;
+        }
+        tbody tr:hover {
+            background-color: #f8f9fa;
+        }
+
+        input[type="text"], input[type="time"], input[type="password"] {
+            width: 100%;
+            padding: 0.8rem 1rem;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 1rem;
+            box-sizing: border-box;
+            font-family: 'Noto Sans KR', sans-serif;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(13, 110, 253, 0.1);
+        }
+
+        .button {
+            background-color: var(--primary-color);
+            color: white; border: none; padding: 0.8rem 1.5rem;
+            border-radius: 8px;
+            cursor: pointer; font-size: 1rem;
+            font-weight: 500; text-align: center;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center; justify-content: center; gap: 0.5rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .button:hover { transform: translateY(-3px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+        .button.secondary { background-color: var(--secondary-color); }
+        .button.success { background-color: var(--success-color); }
+        .button.danger { background-color: var(--danger-color); }
+        .button:disabled { background-color: #cccccc; cursor: not-allowed; transform: none; box-shadow: none; }
+
+        .log-container {
+            background-color: var(--code-bg);
+            color: #f1f1f1;
+            padding: 1.5rem;
+            border-radius: 8px;
+            height: 350px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            white-space: pre-wrap;
+            line-height: 1.6;
+            border: 1px solid #444;
+        }
+        
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.6); backdrop-filter: blur(5px); align-items: center; justify-content: center; }
+        .modal-content { background-color: var(--surface-color); padding: 2.5rem; border: none; width: 90%; max-width: 450px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.2); }
+        
+        #main-content { display: none; }
+        .action-buttons { display: flex; gap: 0.75rem; justify-content: center; }
+        .flex-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+        .icon { width: 1.2em; height: 1.2em; }
+        #last-updated { font-size: 0.85rem; color: var(--secondary-color); font-weight: 400; }
+    </style>
+</head>
+<body>
+
+    <div id="password-modal" class="modal" style="display: flex;">
+        <div class="modal-content">
+            <h2 style="text-align: center;">비밀번호 인증</h2>
+            <p style="text-align: center; color: #6c757d; margin-bottom: 1.5rem;">스케줄 관리를 위해 비밀번호를 입력하세요.</p>
+            <input type="password" id="password-input" placeholder="비밀번호" style="margin-bottom: 1.5rem;">
+            <button id="password-submit" class="button" style="width: 100%;">인증</button>
+            <p id="password-error" style="color:red; display:none; margin-top:1rem; text-align:center;"></p>
+        </div>
+    </div>
+
+    <div id="main-content" class="container">
+        <header class="header">
+            <h1>AIBox Schedule Manager</h1>
+        </header>
+
+        <div class="content">
+            <div class="card">
+                <h2>
+                    <span>등록된 작업</span>
+                    <span id="last-updated"></span>
+                </h2>
+                <table id="schedule-table">
+                    <thead>
+                        <tr>
+                            <th>스크립트 경로</th>
+                            <th style="width: 150px;">실행 시간 (매일)</th>
+                            <th style="width: 220px; text-align: center;">작업</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>새 작업 추가</h2>
+                <table>
+                    <tbody>
+                        <tr>
+                            <td><input type="text" id="new-script-path" placeholder="/data/iso/AIBox/scripts/my_script.sh"></td>
+                            <td style="width: 150px;"><input type="time" id="new-schedule-time"></td>
+                            <td style="width: 120px; text-align:center;"><button id="add-schedule-btn" class="button">추가</button></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- [수정] 버튼을 감싸는 div 추가 및 중앙 정렬 -->
+            <div style="text-align: center; margin-bottom: 2rem;">
+                <button id="save-changes-btn" class="button success">
+                    <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M7.75 2.5a.75.75 0 00-1.5 0v1.25H4a2 2 0 00-2 2v8.5a2 2 0 002 2h8a2 2 0 002-2V6.25a2 2 0 00-2-2h-2.25V2.5zM5.5 10.25a.75.75 0 000 1.5h5a.75.75 0 000-1.5h-5z"></path><path d="M10 2a.75.75 0 01.75.75v1.543a3.25 3.25 0 11-1.5 0V2.75A.75.75 0 0110 2z"></path></svg>
+                    변경사항 저장
+                </button>
+            </div>
+
+            <div class="card">
+                <div class="flex-container">
+                    <h2>스케줄러 로그</h2>
+                    <!-- [수정] 로그 삭제 버튼 추가 -->
+                    <div style="display: flex; gap: 0.75rem;">
+                        <button id="refresh-logs-btn" class="button secondary">
+                            <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 110 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"></path></svg>
+                            로그 새로고침
+                        </button>
+                        <button id="delete-logs-btn" class="button danger">
+                             <svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 012 0v6a1 1 0 11-2 0V8z" clip-rule="evenodd"></path></svg>
+                            로그 삭제
+                        </button>
+                    </div>
+                </div>
+                <div id="log-viewer" class="log-container">
+                    로그를 불러오는 중...
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // --- Configuration ---
+        const API_BASE_URL = '/AIBox/api'; 
+        const REFRESH_INTERVAL = 5000;
+
+        // --- DOM Element Caching ---
+        const passwordModal = document.getElementById('password-modal');
+        const mainContent = document.getElementById('main-content');
+        const passwordInput = document.getElementById('password-input');
+        const passwordSubmitBtn = document.getElementById('password-submit');
+        const passwordError = document.getElementById('password-error');
+        
+        const scheduleTableBody = document.querySelector('#schedule-table tbody');
+        const addScheduleBtn = document.getElementById('add-schedule-btn');
+        const saveChangesBtn = document.getElementById('save-changes-btn');
+        const refreshLogsBtn = document.getElementById('refresh-logs-btn');
+        const deleteLogsBtn = document.getElementById('delete-logs-btn'); // [수정]
+        const logViewer = document.getElementById('log-viewer');
+        const newScriptPathInput = document.getElementById('new-script-path');
+        const newScheduleTimeInput = document.getElementById('new-schedule-time');
+        const lastUpdatedSpan = document.getElementById('last-updated');
+
+        // --- Global State ---
+        let serverPassword = null;
+        let scheduleRefreshInterval = null;
+        let currentSchedulesState = '[]';
+
+        // --- Helper for robust API calls ---
+        async function robustFetch(url, options) {
+            let responseText = '';
+            try {
+                const response = await fetch(url, options);
+                responseText = await response.text();
+                if (!response.ok) throw new Error(responseText || `Server Error (${response.status})`);
+                if (!responseText.trim()) return {};
+                return JSON.parse(responseText.replace(/\u00A0/g, ' '));
+            } catch (error) {
+                console.error('Fetch Error:', error, 'URL:', url, 'Response Text:', responseText);
+                throw new Error(`서버 응답 처리 실패: ${error.message}`);
+            }
+        }
+
+        // --- 1. Password Verification ---
+        async function verifyPassword() {
+            // ... (기존과 동일)
+            const password = passwordInput.value;
+            if (!password) { showError("비밀번호를 입력하세요."); return; }
+            passwordSubmitBtn.disabled = true;
+            passwordSubmitBtn.textContent = '확인 중...';
+            try {
+                const result = await robustFetch(`${API_BASE_URL}/verify-password`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                if (result.success) {
+                    serverPassword = password;
+                    passwordModal.style.display = 'none';
+                    mainContent.style.display = 'block';
+                    await loadSchedules();
+                    await loadLogs();
+                    startScheduleRefresh();
+                } else {
+                    throw new Error(result.error || "비밀번호가 올바르지 않습니다.");
+                }
+            } catch (error) { showError(error.message);
+            } finally {
+                passwordSubmitBtn.disabled = false;
+                passwordSubmitBtn.textContent = '인증';
+            }
+        }
+
+        function showError(message) {
+            passwordError.textContent = message;
+            passwordError.style.display = 'block';
+        }
+
+        // --- 2. Load and Render Schedules ---
+        async function loadSchedules() {
+            // ... (기존과 동일)
+            try {
+                const result = await robustFetch(`${API_BASE_URL}/schedules?_=${new Date().getTime()}`);
+                const schedules = Array.isArray(result) ? result : result.schedules || [];
+                const newSchedulesState = JSON.stringify(schedules);
+                if (newSchedulesState !== currentSchedulesState) {
+                    currentSchedulesState = newSchedulesState;
+                    renderSchedules(schedules);
+                }
+                lastUpdatedSpan.textContent = `(Last updated: ${new Date().toLocaleTimeString()})`;
+            } catch (error) {
+                lastUpdatedSpan.textContent = `(Error: ${error.message})`;
+            }
+        }
+        
+        function startScheduleRefresh() {
+            if (scheduleRefreshInterval) clearInterval(scheduleRefreshInterval);
+            scheduleRefreshInterval = setInterval(loadSchedules, REFRESH_INTERVAL);
+        }
+
+        function renderSchedules(schedules) {
+            // ... (기존과 동일)
+            scheduleTableBody.innerHTML = '';
+            if (schedules.length === 0) {
+                scheduleTableBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">등록된 작업이 없습니다.</td></tr>';
+            } else {
+                schedules.forEach(schedule => {
+                    if (schedule.script && schedule.time) addScheduleRow(schedule.script, schedule.time);
+                });
+            }
+        }
+        
+        function addScheduleRow(scriptPath, scheduleTime) {
+            // ... (기존과 동일)
+            if (scheduleTableBody.querySelector('td[colspan="3"]')) scheduleTableBody.innerHTML = '';
+            const row = scheduleTableBody.insertRow();
+            row.innerHTML = `
+                <td><input type="text" class="script-path" value="${scriptPath.replace(/"/g, '&quot;')}"></td>
+                <td><input type="time" class="schedule-time" value="${scheduleTime.replace(/"/g, '&quot;')}"></td>
+                <td class="action-buttons">
+                    <button class="button run-now" title="즉시 실행"><svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z"></path></svg></button>
+                    <button class="button danger delete-schedule" title="삭제"><svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 012 0v6a1 1 0 11-2 0V8z" clip-rule="evenodd"></path></svg></button>
+                </td>
+            `;
+            row.querySelector('.delete-schedule').addEventListener('click', () => row.remove());
+            row.querySelector('.run-now').addEventListener('click', () => executeScript(row.querySelector('.script-path').value));
+        }
+
+        // --- 3. Add/Delete/Save Schedules ---
+        function handleAddSchedule() {
+            // ... (기존과 동일)
+            const newScriptPath = newScriptPathInput.value.trim();
+            const newScheduleTime = newScheduleTimeInput.value;
+            if (!newScriptPath || !newScheduleTime) {
+                alert('스크립트 경로와 실행 시간을 모두 입력하세요.');
+                return;
+            }
+            addScheduleRow(newScriptPath, newScheduleTime);
+            newScriptPathInput.value = '';
+            newScheduleTimeInput.value = '';
+        }
+
+        async function handleSaveChanges() {
+            // ... (기존과 동일)
+            const schedulesToSave = Array.from(scheduleTableBody.querySelectorAll('tr')).map(row => {
+                const scriptInput = row.querySelector('.script-path');
+                const timeInput = row.querySelector('.schedule-time');
+                return scriptInput ? { script: scriptInput.value.trim(), time: timeInput.value } : null;
+            }).filter(Boolean);
+            
+            const originalButtonContent = saveChangesBtn.innerHTML;
+            saveChangesBtn.disabled = true;
+            saveChangesBtn.innerHTML = '저장 중...';
+            try {
+                await robustFetch(`${API_BASE_URL}/schedules`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: serverPassword, schedules: schedulesToSave })
+                });
+                alert('스케줄이 성공적으로 저장되었습니다.');
+                await loadSchedules();
+            } catch (error) {
+                alert(`저장 실패: ${error.message}`);
+                await loadSchedules();
+            } finally {
+                saveChangesBtn.disabled = false;
+                saveChangesBtn.innerHTML = originalButtonContent;
+            }
+        }
+        
+        // --- 4. Execute Script Immediately ---
+        async function executeScript(scriptPath) {
+            // ... (기존과 동일)
+            if (!confirm(`'${scriptPath}' 스크립트를 지금 실행하시겠습니까?`)) return;
+            try {
+                const result = await robustFetch(`${API_BASE_URL}/schedules/execute`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: serverPassword, script: scriptPath })
+                });
+                alert(result.message || '실행 요청이 성공적으로 전송되었습니다.');
+                setTimeout(loadLogs, 2000); 
+            } catch (error) {
+                alert(`실행 실패: ${error.message}`);
+            }
+        }
+        
+        // --- 5. View Logs & Delete Logs ---
+        async function loadLogs() {
+            // ... (기존과 동일)
+            logViewer.textContent = '로그를 새로고침하는 중...';
+            try {
+                const result = await robustFetch(`${API_BASE_URL}/logs/scheduler?_=${new Date().getTime()}`);
+                let logContent = '표시할 로그가 없습니다.';
+                if (result.logs) {
+                    logContent = Array.isArray(result.logs) ? result.logs.join('\n') : String(result.logs);
+                } else if (Array.isArray(result)) {
+                    if (result.length > 0) logContent = result.join('\n');
+                } else if (typeof result === 'string' && result) {
+                    logContent = result;
+                }
+                logViewer.textContent = logContent;
+                logViewer.scrollTop = logViewer.scrollHeight;
+            } catch (error) {
+                logViewer.textContent = `로그 로딩 중 오류: ${error.message}`;
+            }
+        }
+
+        // [수정] 로그 삭제 기능 함수
+        async function handleDeleteLogs() {
+            if (!confirm('정말로 모든 스케줄러 로그를 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.')) {
+                return;
+            }
+            try {
+                await robustFetch(`${API_BASE_URL}/logs/scheduler`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: serverPassword })
+                });
+                alert('로그가 성공적으로 삭제되었습니다.');
+                await loadLogs(); // 로그 뷰 새로고침
+            } catch (error) {
+                alert(`로그 삭제 실패: ${error.message}`);
+            }
+        }
+
+        // --- Event Listener Setup ---
+        passwordSubmitBtn.addEventListener('click', verifyPassword);
+        passwordInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') verifyPassword();
+        });
+        addScheduleBtn.addEventListener('click', handleAddSchedule);
+        saveChangesBtn.addEventListener('click', handleSaveChanges);
+        refreshLogsBtn.addEventListener('click', loadLogs);
+        deleteLogsBtn.addEventListener('click', handleDeleteLogs); // [수정]
+    });
+</script>
+
+</body>
+</html>
+
