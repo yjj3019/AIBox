@@ -4,7 +4,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 # path of backup file
-DIR="/tmp"
+DIR="/data/iso/AIBox/log"
 # date at run time
 DATE=`date +%Y%m%d`
 # Backup log file settings
@@ -24,9 +24,10 @@ export no_proxy="localhost, 127.0.0.1, 172.21.135.113"
 # 2. requirements.txt에 명시된 필수 패키지를 설치합니다.
 # 3. gunicorn WSGI 서버를 사용하여 Flask 애플리케이션을 실행합니다.
 
-export LLM_URL="http://x.x.x.x:4000" # 여기에 LLM 서버 URL을 입력하세요. 예: http://192.168.1.10:8080
-export MODEL="xxxx"   # 여기에 사용할 모델 이름을 입력하세요. 예: mistral-7b-instruct-v0.2.Q4_K_M.gguf
-export TOKEN="xxxx"   # LLM 서버에 토큰이 필요하면 여기에 입력하세요. (선택 사항)
+export LLM_URL="http://172.21.135.113:4000" # 여기에 LLM 서버 URL을 입력하세요. 예: http://192.168.1.10:8080
+export MODEL="S-Core/Qwen3-235B-A22B"   # 여기에 사용할 모델 이름을 입력하세요. 예: mistral-7b-instruct-v0.2.Q4_K_M.gguf
+#export MODEL="openai/gpt-oss-120b"   # 여기에 사용할 모델 이름을 입력하세요. 예: mistral-7b-instruct-v0.2.Q4_K_M.gguf
+export TOKEN="sk-iX9Azu30JV3E-WByjwm2PQ"   # LLM 서버에 토큰이 필요하면 여기에 입력하세요. (선택 사항)
 
 # waitress 서버 실행 (기존 app.py와 호환)
-/usr/bin//python3.6  /data/iso/AIBox/security.py --llm-url "$LLM_URL" --model "$MODEL" --token "$TOKEN" | send
+/usr/bin/python3.6  /data/iso/AIBox/security.py --llm-url "$LLM_URL" --model "$MODEL" --token "$TOKEN" | send
