@@ -1,5 +1,9 @@
+#pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org 
+#/usr/bin/python3.6 -m pip install -r requirements.txt
 Flask
 Flask-Cors
 requests
 waitress
 gunicorn
+matplotlib
+schedule
