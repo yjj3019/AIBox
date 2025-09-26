@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>지능형 CVE 보안 리포트 생성기</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Noto Sans KR', sans-serif;
+        }
+        .card {
+            transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+        }
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+        }
+        .btn {
+            transition: all 0.2s ease-in-out;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        .card-header-icon {
+            margin-right: 0.75rem;
+            width: 1.5rem;
+            height: 1.5rem;
+            color: #475569;
+        }
+        th {
+            position: sticky;
+            top: 0;
+            background-color: #f1f5f9;
+            z-index: 1;
+        }
+        .table-container {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        #comprehensive-summary h3 {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-top: 1.5rem;
+            margin-bottom: 0.5rem;
+            padding-bottom: 0.25rem;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        #comprehensive-summary ul {
+            list-style-type: disc;
+            padding-left: 1.5rem;
+            margin-top: 0.5rem;
+        }
+         #comprehensive-summary li {
+            margin-bottom: 0.25rem;
+        }
+        #comprehensive-summary p {
+            line-height: 1.7;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 text-slate-800">
+
+    <div class="container mx-auto p-4 md:p-8 max-w-7xl">
+        <!-- Header -->
+        <header class="text-center mb-10 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-700 text-white p-8 shadow-lg">
+            <h1 class="text-3xl md:text-4xl font-bold">지능형 CVE 보안 리포트 생성기</h1>
+            <p class="text-indigo-200 mt-2">CVE 정보를 취합하고 LLM을 통해 최신 동향을 포함한 종합 리포트를 생성합니다.</p>
+        </header>
+
+        <!-- Search Bar -->
+        <div id="search-card" class="card bg-white shadow-md rounded-lg mb-8">
+            <div class="card-content flex flex-col md:flex-row items-center gap-4 p-5">
+                <input type="text" id="cve-input" placeholder="예: CVE-2024-3094" class="w-full px-4 py-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition duration-150 ease-in-out text-lg">
+                <button id="search-btn" class="btn w-full md:w-auto inline-flex items-center justify-center bg-gradient-to-r from-blue-600 to-indigo-700 text-white font-bold text-base px-6 py-2 rounded-lg shadow-lg hover:shadow-xl hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                    리포트 생성
+                </button>
+            </div>
+        </div>
+        
+        <!-- Loading Spinner -->
+        <div id="loading" class="text-center my-10 hidden">
+            <div class="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+            <p id="loading-message" class="mt-4 text-slate-600 text-lg">AIBox 서버에서 리포트를 생성 중입니다...</p>
+        </div>
+        
+        <!-- Error Message -->
+        <div id="error" class="hidden text-center my-10 p-5 bg-red-100 text-red-700 border border-red-300 rounded-lg shadow">
+            <p id="error-message" class="font-semibold"></p>
+        </div>
+
+        <!-- Report Container -->
+        <div id="report-container" class="hidden">
+            <!-- Report Header -->
+            <div class="mb-8 p-6 bg-white rounded-lg shadow-md border-l-4 border-blue-600">
+                <h2 id="report-title" class="text-2xl md:text-3xl font-bold text-slate-900"></h2>
+                <p id="report-date" class="text-slate-500 mt-2"></p>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <!-- Left Column for Analysis -->
+                <div class="lg:col-span-2 space-y-8">
+                    <div class="card bg-white shadow-md rounded-lg">
+                        <div class="card-header flex items-center bg-slate-50 border-b border-slate-200 p-4 font-bold text-slate-700 text-lg">
+                           <svg class="card-header-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M-3 9.75h-1.5a1.5 1.5 0 01-1.5-1.5v-1.5a1.5 1.5 0 011.5-1.5h1.5a1.5 1.5 0 011.5 1.5v1.5a1.5 1.5 0 01-1.5 1.5zm1.5-6h.008v.008h-.008v-.008z" /></svg>
+                            종합 분석 리포트 (Comprehensive Analysis)
+                        </div>
+                        <div id="comprehensive-summary" class="card-content p-6 text-base"></div>
+                    </div>
+                </div>
+
+                <!-- Right Column for Structured Data -->
+                <div class="lg:col-span-1 space-y-8">
+                    <div class="card bg-white shadow-md rounded-lg">
+                        <div class="card-header flex items-center bg-slate-50 border-b border-slate-200 p-4 font-bold text-slate-700 text-lg">
+                            <svg class="card-header-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M10.125 2.25h-4.5c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125v-9M10.125 2.25h.375a9 9 0 019 9v.375M10.125 2.25A3.375 3.375 0 0113.5 5.625v1.5c0 .621.504 1.125 1.125 1.125h1.5a3.375 3.375 0 013.375 3.375M9 15l2.25 2.25L15 12" /></svg>
+                            보안 등급
+                        </div>
+                        <div id="security-impact" class="card-content p-6"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card bg-white shadow-md rounded-lg mt-8">
+                <div class="card-header flex items-center bg-slate-50 border-b border-slate-200 p-4 font-bold text-slate-700 text-lg">
+                    <svg class="card-header-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M21 7.5l-9-5.25L3 7.5m18 0l-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9" /></svg>
+                    영향받는 패키지 상태 (Package State)
+                </div>
+                <div class="card-content p-0">
+                    <div id="affected-packages" class="table-container"></div>
+                </div>
+            </div>
+
+            <div id="save-btn-container" class="mt-10 text-center">
+                 <button id="save-html-btn" class="btn bg-slate-600 hover:bg-slate-700 shadow-md hover:shadow-lg text-white font-bold text-lg px-8 py-3 rounded-lg">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 mr-2" fill="none" viewBox="0 0 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                    HTML로 저장
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const searchBtn = document.getElementById('search-btn');
+            const cveInput = document.getElementById('cve-input');
+            const loading = document.getElementById('loading');
+            const loadingMessage = document.getElementById('loading-message');
+            const error = document.getElementById('error');
+            const errorMessage = document.getElementById('error-message');
+            const reportContainer = document.getElementById('report-container');
+
+            searchBtn.addEventListener('click', generateReport);
+            cveInput.addEventListener('keyup', (event) => {
+                if (event.key === 'Enter') generateReport();
+            });
+
+            async function generateReport() {
+                const cveId = cveInput.value.trim().toUpperCase();
+                
+                const cveRegex = /^CVE-\d{4}-\d{4,}$/;
+                if (!cveRegex.test(cveId)) {
+                    showError('올바른 CVE-ID 형식이 아닙니다. (예: CVE-2024-3094)');
+                    return;
+                }
+
+                reportContainer.classList.add('hidden');
+                error.classList.add('hidden');
+                loading.classList.remove('hidden');
+                loadingMessage.textContent = `AIBox 서버에서 ${cveId} 리포트를 생성 중입니다...`;
+
+                try {
+                    // [수정] 404 오류의 근본적 해결을 위해 API 통신 방식을 POST로 변경
+                    const apiUrl = `/api/cve/report`;
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ cve_id: cveId }),
+                    });
+                    
+                    if (response.status === 404) {
+                        throw new Error(`API 엔드포인트를 찾을 수 없습니다. (404 Not Found)\nURL: ${apiUrl}`);
+                    }
+
+                    const contentType = response.headers.get("content-type");
+                    if (contentType && contentType.includes("application/json")) {
+                        const data = await response.json();
+                        if (!response.ok) {
+                            throw new Error(data.error || `서버 응답 오류 (상태 코드: ${response.status})`);
+                        }
+                        renderReport(cveId, data);
+                    } else {
+                        const textResponse = await response.text();
+                        console.error("Received non-JSON response from server:", textResponse);
+                        throw new Error(`서버로부터 예기치 않은 응답을 받았습니다. (상태 코드: ${response.status})`);
+                    }
+
+                } catch (err) {
+                    console.error('Report Generation Error:', err);
+                    showError(err.message || '리포트 생성 중 알 수 없는 오류가 발생했습니다.');
+                } finally {
+                    loading.classList.add('hidden');
+                }
+            }
+            
+            function markdownToHtml(md) {
+                if (!md || md.toLowerCase().includes("error:")) {
+                    return '<p>LLM 분석 리포트를 생성하지 못했습니다. 서버 로그를 확인해주세요.</p>';
+                }
+                
+                let html = '';
+                let inList = false;
+
+                // Process line by line for structure
+                md.split('\n').forEach(line => {
+                    line = line.trim();
+                    if (line.startsWith('### ')) {
+                        if (inList) { html += '</ul>'; inList = false; }
+                        html += `<h3>${line.substring(4)}</h3>`;
+                    } else if (line.startsWith('- ')) {
+                        if (!inList) { html += '<ul>'; inList = true; }
+                        html += `<li>${line.substring(2)}</li>`;
+                    } else if (line) {
+                        if (inList) { html += '</ul>'; inList = false; }
+                        html += `<p>${line}</p>`;
+                    }
+                });
+                if (inList) { html += '</ul>'; }
+
+                // Apply bold styling after structure is built
+                html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+                
+                return html;
+            }
+
+
+            function renderReport(cveId, data) {
+                const title = data.bugzilla?.description?.replace(/CVE-\d{4}-\d{4,}\s/, '') || ``;
+                const publicDate = data.public_date ? new Date(data.public_date).toLocaleDateString('ko-KR') : 'N/A';
+                
+                document.getElementById('report-title').textContent = `${cveId} - ${title || 'LLM 기반 종합 분석'}`;
+                document.getElementById('report-date').textContent = `공개일: ${publicDate}`;
+                
+                const severity = data.threat_severity || '정보 없음';
+                const cvss3Score = data.cvss3?.cvss3_base_score || '정보 없음';
+                document.getElementById('security-impact').innerHTML = `<div class="info-box bg-blue-50 border-blue-200 p-4 rounded-lg"><p class="font-bold text-lg text-blue-800">Impact: ${severity}</p><p class="text-blue-600">CVSS v3 Score: ${cvss3Score}</p></div>`;
+
+                document.getElementById('comprehensive-summary').innerHTML = markdownToHtml(data.comprehensive_summary);
+                
+                const packageStates = data.package_state || [];
+                const tableRows = packageStates.length > 0
+                    ? packageStates.map(pkg => `<tr class="hover:bg-gray-50"><td class="p-3">${pkg.product_name}</td><td class="p-3">${pkg.package_name}</td><td class="p-3">${pkg.fix_state}</td></tr>`).join('')
+                    : '<tr><td colspan="3" class="p-3 text-center">패키지 정보가 없습니다.</td></tr>';
+                document.getElementById('affected-packages').innerHTML = `<div class="p-2"><table class="table-auto border-collapse w-full"><thead><tr class="bg-slate-100 text-slate-600 uppercase text-sm leading-normal"><th>Product Name</th><th>Package Name</th><th>Fix State</th></tr></thead><tbody class="text-gray-600 text-sm font-light">${tableRows}</tbody></table></div>`;
+                
+                reportContainer.classList.remove('hidden');
+                
+                const saveBtn = document.getElementById('save-html-btn');
+                const newSaveBtn = saveBtn.cloneNode(true);
+                saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+                newSaveBtn.addEventListener('click', () => saveReportAsHtml(cveId));
+            }
+            
+            function showError(message) {
+                // 개행 문자를 <br> 태그로 변환하여 HTML에 올바르게 표시
+                errorMessage.innerHTML = message.replace(/\n/g, '<br>');
+                error.classList.remove('hidden');
+                reportContainer.classList.add('hidden');
+            }
+
+            function saveReportAsHtml(cveId) {
+                const docClone = document.documentElement.cloneNode(true);
+                docClone.querySelector('#search-card')?.remove();
+                docClone.querySelector('#save-btn-container')?.remove();
+                docClone.querySelector('script')?.remove();
+                const html = `<!DOCTYPE html>\n${docClone.outerHTML}`;
+                const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `${cveId}-security-report.html`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+            }
+        });
+    </script>
+
+</body>
+</html>
+
