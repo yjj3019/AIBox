@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIBox - SOSReport 분석</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #007bff;
+            --success-color: #28a745;
+            --error-color: #dc3545;
+            --background-color: #f0f4f8;
+            --surface-color: #ffffff;
+            --text-color: #212529;
+            --header-bg: #0d1b2a;
+            --header-text: #ffffff;
+            --border-color: #dee2e6;
+            --shadow: 0 4px 12px rgba(0,0,0,0.08);
+        }
+
+        body {
+            font-family: 'Noto Sans KR', sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 2rem;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            min-height: 100vh;
+        }
+
+        .container {
+            background: var(--surface-color);
+            border-radius: 12px;
+            box-shadow: var(--shadow);
+            width: 100%;
+            max-width: 960px;
+            overflow: hidden;
+        }
+
+        .header {
+            background-color: var(--header-bg);
+            color: var(--header-text);
+            padding: 2rem;
+            text-align: center;
+        }
+        .header h1 { margin: 0; font-size: 2rem; font-weight: 700; }
+
+        #status {
+            padding: 0.75rem 2rem;
+            font-size: 0.9rem;
+            background-color: #e9ecef;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 1.5rem;
+        }
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        .status-indicator.connected { background-color: var(--success-color); }
+        .status-indicator.disconnected { background-color: var(--error-color); }
+
+
+        .content { padding: 2rem; }
+        .card { background: var(--surface-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+
+        h2 {
+            font-size: 1.25rem;
+            margin-top: 0;
+            margin-bottom: 1.5rem;
+            color: var(--header-bg);
+            border-bottom: 2px solid #f0f4f8;
+            padding-bottom: 0.5rem;
+        }
+
+        .button {
+            background-image: linear-gradient(to right, #007bff, #0056b3);
+            color: white; border: none; padding: 0.8rem 1.5rem;
+            border-radius: 8px;
+            cursor: pointer; font-size: 1rem;
+            font-weight: 500; text-align: center;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center; justify-content: center; gap: 0.5rem;
+            box-shadow: 0 2px 4px rgba(0, 123, 255, 0.2);
+        }
+        .button:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0, 123, 255, 0.3); }
+        .button:disabled { background-image: none; background-color: #cccccc; cursor: not-allowed; transform: none; box-shadow: none; }
+        .button.small { padding: 0.4rem 0.8rem; font-size: 0.85rem; }
+        .button.danger { background-image: linear-gradient(to right, #dc3545, #c82333); box-shadow: 0 2px 4px rgba(220, 53, 69, 0.2); }
+        .button.danger:hover:not(:disabled) { box-shadow: 0 6px 12px rgba(220, 53, 69, 0.3); }
+
+        /* Custom File Input */
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: block;
+            width: 100%;
+            border: 2px dashed var(--border-color);
+            border-radius: 8px;
+            padding: 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.3s, background-color 0.3s;
+            margin-bottom: 1.5rem;
+        }
+        .file-input-wrapper.dragover {
+            border-color: var(--primary-color);
+            background-color: #f8f9fa;
+        }
+        .file-input-wrapper input[type="file"] {
+            position: absolute;
+            left: 0; top: 0; opacity: 0;
+            width: 100%; height: 100%; cursor: pointer;
+        }
+        #file-name { color: var(--primary-color); font-weight: 500; margin-top: 1rem; }
+
+        .form-actions { text-align: center; }
+
+        /* Progress Bar */
+        #progress-card { display: none; }
+        .progress-steps {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+            font-size: 0.85rem;
+        }
+        .step { color: #aaa; }
+        .step.active { color: var(--primary-color); font-weight: 500; }
+        .progress-container {
+            width: 100%;
+            background-color: #e9ecef;
+            border-radius: 8px;
+            height: 10px;
+            overflow: hidden;
+        }
+        .progress-bar {
+            width: 0%;
+            height: 100%;
+            background-color: var(--success-color);
+            border-radius: 8px;
+            transition: width 0.4s ease;
+        }
+        #progress-status-text {
+            margin-top: 1rem;
+            font-weight: 500;
+            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(0, 123, 255, 0.3);
+            border-top-color: var(--primary-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            display: none; /* Initially hidden */
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        #timer {
+            margin-left: 10px;
+            font-weight: normal;
+            color: #6c757d;
+            font-size: 0.9em;
+            display: none; /* Initially hidden */
+        }
+
+        /* Report List */
+        #reportList ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        #reportList li {
+            background: #fdfdfd;
+            margin-bottom: 8px;
+            padding: 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background-color 0.3s;
+        }
+        #reportList li.new {
+            background-color: #e7f3ff;
+            border-left: 5px solid var(--primary-color);
+        }
+        #reportList .file-name {
+            font-weight: 500;
+            color: #333;
+        }
+        #reportList .button-group {
+            display: flex;
+            gap: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>SOSReport 분석 시스템</h1>
+        </header>
+
+        <div id="status">
+            <div class="status-item">
+                <span>LLM 연결 상태:</span>
+                <span id="conn-status-indicator" class="status-indicator"></span>
+                <span id="conn-status">확인 중...</span>
+            </div>
+            <div class="status-item">
+                <span>현재 AI 모델:</span>
+                <span id="model-name">N/A</span>
+            </div>
+        </div>
+
+        <div id="error-banner" style="display: none; padding: 1rem 2rem; background-color: #f8d7da; color: #721c24; border-bottom: 1px solid #f5c6cb;">
+            <p style="margin: 0;"><strong>연결 오류:</strong> <span id="error-message"></span></p>
+        </div>
+
+        <div class="content">
+            <div class="card">
+                <h2>리포트 업로드</h2>
+                <form id="uploadForm">
+                    <label for="sosreportFile" class="file-input-wrapper">
+                        <span id="file-label-text">분석할 파일을 드래그하거나 여기를 클릭하세요. (.tar.xz)</span>
+                        <div id="file-name"></div>
+                        <input type="file" id="sosreportFile" name="sosreportFile" accept=".tar.xz" required>
+                    </label>
+                    <div class="form-actions">
+                        <button type="submit" id="submitBtn" class="button" disabled>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+                            <span>분석 시작</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <div class="card" id="progress-card">
+                <h2>분석 진행 상태</h2>
+                <div class="progress-steps">
+                    <span class="step" id="step-1">업로드</span>
+                    <span class="step" id="step-2">분석 시작</span>
+                    <span class="step" id="step-3">리포트 생성</span>
+                    <span class="step" id="step-4">완료</span>
+                </div>
+                <div class="progress-container">
+                    <div id="progressBar" class="progress-bar"></div>
+                </div>
+                <div id="progress-status-text">
+                    <div id="spinner" class="spinner"></div>
+                    <span id="progress-text"></span>
+                    <span id="timer"></span>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>분석 완료된 리포트</h2>
+                <div id="reportList">
+                    <p>로딩 중...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = '/AIBox/api';
+
+        const connStatusIndicator = document.getElementById('conn-status-indicator');
+        const connStatusSpan = document.getElementById('conn-status');
+        const modelNameSpan = document.getElementById('model-name');
+        const errorBanner = document.getElementById('error-banner');
+        const errorMessageSpan = document.getElementById('error-message');
+        const uploadForm = document.getElementById('uploadForm');
+        const sosreportFile = document.getElementById('sosreportFile');
+        const fileInputWrapper = document.querySelector('.file-input-wrapper');
+        const submitBtn = document.getElementById('submitBtn');
+        const reportListDiv = document.getElementById('reportList');
+        const fileNameDiv = document.getElementById('file-name');
+        const fileLabelText = document.getElementById('file-label-text');
+        const progressCard = document.getElementById('progress-card');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progress-text');
+        const spinner = document.getElementById('spinner');
+        const timerEl = document.getElementById('timer');
+        const steps = [document.getElementById('step-1'), document.getElementById('step-2'), document.getElementById('step-3'), document.getElementById('step-4')];
+
+        let timerInterval = null;
+        let secondsElapsed = 0;
+        let pollInterval = null;
+
+        function formatTime(seconds) {
+            const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
+            const secs = (seconds % 60).toString().padStart(2, '0');
+            return `(${mins}:${secs})`;
+        }
+
+        function startTimer() {
+            stopTimer();
+            secondsElapsed = 0;
+            timerEl.style.display = 'inline';
+            timerEl.textContent = formatTime(secondsElapsed);
+            timerInterval = setInterval(() => {
+                secondsElapsed++;
+                timerEl.textContent = formatTime(secondsElapsed);
+            }, 1000);
+        }
+
+        function stopTimer() {
+            clearInterval(timerInterval);
+            timerEl.style.display = 'none';
+        }
+
+        function showError(message) {
+            errorMessageSpan.textContent = message;
+            errorBanner.style.display = 'block';
+        }
+
+        function hideError() {
+            errorBanner.style.display = 'none';
+        }
+        
+        function resetProgress() {
+            progressCard.style.display = 'none';
+            progressBar.style.width = '0%';
+            progressBar.style.backgroundColor = 'var(--success-color)';
+            progressText.textContent = '';
+            spinner.style.display = 'none';
+            steps.forEach(step => step.classList.remove('active'));
+        }
+
+        function updateProgress(stepNumber, text, showSpinner = false, isError = false) {
+            progressCard.style.display = 'block';
+            
+            const percentage = stepNumber > 0 ? (stepNumber / steps.length) * 100 : 0;
+            
+            progressBar.style.width = `${percentage}%`;
+            progressBar.style.backgroundColor = isError ? 'var(--error-color)' : 'var(--success-color)';
+            progressText.textContent = text;
+            spinner.style.display = showSpinner ? 'block' : 'none';
+
+            steps.forEach((step, index) => {
+                if (index < stepNumber) {
+                    step.classList.add('active');
+                } else {
+                    step.classList.remove('active');
+                }
+            });
+        }
+
+        async function checkServerStatus() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/health`);
+                if (!response.ok) throw new Error('서버 상태가 비정상입니다.');
+                hideError();
+                connStatusSpan.textContent = "연결됨";
+                connStatusIndicator.className = 'status-indicator connected';
+                return true;
+            } catch (error) {
+                connStatusSpan.textContent = '연결 끊김';
+                connStatusIndicator.className = 'status-indicator disconnected';
+                showError('API 서버에 연결할 수 없습니다. 백엔드가 실행 중인지 확인해 주세요.');
+                return false;
+            }
+        }
+
+        async function fetchConfig() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/config`);
+                if (!response.ok) throw new Error(`서버 응답 오류: ${response.status}`);
+                const data = await response.json();
+                modelNameSpan.textContent = data.model || 'N/A';
+            } catch (error) {
+                modelNameSpan.textContent = 'N/A';
+                console.error('설정 로드 실패:', error);
+            }
+        }
+
+        async function initializeApp() {
+            const isConnected = await checkServerStatus();
+            if (isConnected) {
+                await fetchConfig();
+            }
+            await fetchReports();
+            setInterval(checkServerStatus, 10000);
+        }
+
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            fileInputWrapper.addEventListener(eventName, e => {
+                e.preventDefault();
+                e.stopPropagation();
+            }, false);
+        });
+        ['dragenter', 'dragover'].forEach(eventName => {
+            fileInputWrapper.addEventListener(eventName, () => fileInputWrapper.classList.add('dragover'), false);
+        });
+        ['dragleave', 'drop'].forEach(eventName => {
+            fileInputWrapper.addEventListener(eventName, () => fileInputWrapper.classList.remove('dragover'), false);
+        });
+        fileInputWrapper.addEventListener('drop', e => {
+            sosreportFile.files = e.dataTransfer.files;
+            sosreportFile.dispatchEvent(new Event('change'));
+        }, false);
+
+        sosreportFile.addEventListener('change', () => {
+            if (sosreportFile.files.length > 0) {
+                fileNameDiv.textContent = `선택된 파일: ${sosreportFile.files[0].name}`;
+                fileLabelText.style.display = 'none';
+                submitBtn.disabled = false;
+            } else {
+                fileNameDiv.textContent = '';
+                fileLabelText.style.display = 'block';
+                submitBtn.disabled = true;
+            }
+        });
+
+        uploadForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            submitBtn.disabled = true;
+            submitBtn.querySelector('span').textContent = '업로드 중...';
+            resetProgress();
+            updateProgress(1, '파일을 서버로 전송 중입니다...');
+            const file = sosreportFile.files[0];
+            const formData = new FormData();
+            formData.append('sosreportFile', file);
+            
+            try {
+                const response = await fetch(`${API_BASE_URL}/upload`, { method: 'POST', body: formData });
+
+                let responseData;
+                try {
+                    responseData = await response.json();
+                } catch (jsonError) {
+                    responseData = { error: response.statusText };
+                }
+
+                if (!response.ok) {
+                    throw new Error(responseData.error || `서버 오류 (코드: ${response.status})`);
+                }
+
+                const analysisId = responseData.analysis_id;
+                if (!analysisId) {
+                    throw new Error("서버에서 분석 ID를 반환하지 않았습니다.");
+                }
+
+                updateProgress(2, '서버에서 분석이 시작되었습니다.', true);
+                startTimer();
+                pollForStatus(analysisId);
+                
+                uploadForm.reset();
+                sosreportFile.dispatchEvent(new Event('change'));
+
+            } catch (error) {
+                console.error('Upload error:', error);
+                updateProgress(1, `업로드 실패: ${error.message}`, false, true);
+                stopTimer();
+            } finally {
+                submitBtn.querySelector('span').textContent = '분석 시작';
+            }
+        });
+
+        async function pollForStatus(analysisId) {
+            if (pollInterval) clearInterval(pollInterval);
+            
+            const pollStartTime = Date.now();
+            // [MODIFIED] Increased timeout from 10 minutes to 30 minutes
+            const maxPollDuration = 1800000; // 30 minutes timeout
+
+            pollInterval = setInterval(async () => {
+                if (Date.now() - pollStartTime > maxPollDuration) {
+                    clearInterval(pollInterval);
+                    const timeoutMessage = `분석 시간 초과(${analysisId}). 서버 응답을 확인해주세요.`;
+                    updateProgress(3, timeoutMessage, false, true);
+                    stopTimer();
+                    return;
+                }
+
+                try {
+                    const response = await fetch(`${API_BASE_URL}/status/${analysisId}`, { cache: 'no-store' });
+                    if (!response.ok) {
+                        console.warn(`상태 확인 실패 (HTTP ${response.status}), 재시도합니다.`);
+                        return;
+                    }
+
+                    const data = await response.json();
+
+                    switch (data.status) {
+                        case 'running':
+                            updateProgress(3, '리포트 생성 중...', true);
+                            break;
+                        case 'complete':
+                            clearInterval(pollInterval);
+                            stopTimer();
+                            updateProgress(4, `분석 완료! (총 ${secondsElapsed}초 소요)`);
+                            await fetchReports(true);
+                            setTimeout(resetProgress, 10000);
+                            break;
+                        case 'error':
+                            clearInterval(pollInterval);
+                            stopTimer();
+                            updateProgress(3, `분석 실패: ${data.message}`, false, true);
+                            break;
+                        default:
+                            console.warn(`알 수 없는 상태 수신: ${data.status}`);
+                            updateProgress(3, '알 수 없는 상태...', true);
+                    }
+                } catch (error) {
+                    console.warn('상태 확인 폴링 실패, 재시도합니다:', error);
+                }
+            }, 3000);
+        }
+
+        async function viewReport(filename) {
+            window.open(`/AIBox/output/${filename}`, '_blank');
+        }
+        
+        async function deleteReport(filename) {
+            if (!confirm(`'${filename}' 파일을 정말 삭제하시겠습니까? 관련 로그 및 JSON 파일도 함께 삭제됩니다.`)) return;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/reports/${filename}`, { method: 'DELETE' });
+                const result = await response.json();
+                if (!response.ok || result.error) {
+                    throw new Error(result.error || '삭제 중 서버 오류 발생');
+                }
+                await fetchReports();
+            } catch (error) {
+                alert(`삭제 실패: ${error.message}`);
+            }
+        }
+        
+        async function fetchReports(highlightNew = false) {
+            try {
+                const response = await fetch(`${API_BASE_URL}/reports`, { cache: 'no-store' });
+                if (!response.ok) throw new Error('리포트 목록을 가져오는 데 실패했습니다.');
+                const reports = await response.json();
+                
+                reportListDiv.innerHTML = '';
+
+                if (reports.length === 0) {
+                    reportListDiv.innerHTML = '<p>분석 완료된 리포트가 없습니다.</p>';
+                    return;
+                }
+                
+                const ul = document.createElement('ul');
+                reports.forEach((report, index) => {
+                    const li = document.createElement('li');
+                    if (highlightNew && index === 0) {
+                        li.classList.add('new');
+                    }
+                    const fileNameSpan = document.createElement('span');
+                    fileNameSpan.className = 'file-name';
+                    fileNameSpan.textContent = report;
+                    
+                    const btnGroup = document.createElement('div');
+                    btnGroup.className = 'button-group';
+                    
+                    const viewBtn = document.createElement('button');
+                    viewBtn.className = 'button small';
+                    viewBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg> 보기`;
+                    viewBtn.onclick = () => viewReport(report);
+                    
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.className = 'button small danger';
+                    deleteBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg> 삭제`;
+                    deleteBtn.onclick = () => deleteReport(report);
+                    
+                    btnGroup.append(viewBtn, deleteBtn);
+                    li.append(fileNameSpan, btnGroup);
+                    ul.appendChild(li);
+                });
+                reportListDiv.appendChild(ul);
+            } catch (error) {
+                console.error('리포트 목록 로드 오류:', error);
+                reportListDiv.innerHTML = `<p style="color: red;">${error.message}</p>`;
+            }
+        }
+
+        window.addEventListener('DOMContentLoaded', initializeApp);
+    </script>
+</body>
+</html>
