@@ -3,10 +3,10 @@
 # ==============================================================================
 # Smart sosreport Analyzer - The Truly Final & Stabilized Edition
 # ------------------------------------------------------------------------------
-# [개선]
-# 1. 'AI 선정 긴급 보안 위협' 로직을 Red Hat 보안 API와 연동하여 완벽 복원.
-# 2. SAR 데이터 파서의 안정성을 향상하여 CPU 그래프 미출력 문제를 해결.
-# 3. 코드 전반의 안정성과 유지보수성을 위한 추가 개선 적용.
+# [혁신] old.py의 전문가 프롬프트를 계승하고 발전시켜, LLM이 최고 수준의
+# RHEL 전문가 및 보안 분석가 역할을 수행하도록 AI 분석 로직을 전면 개편했습니다.
+# 이제 sos_analyzer는 단순 데이터 전송을 넘어, 동적으로 생성한 전문가 프롬프트를
+# 서버에 전달하여 비교할 수 없는 수준의 고품질 분석을 수행합니다.
 # ==============================================================================
 
 import argparse
@@ -129,11 +129,11 @@ class SosreportParser:
     def _initialize_cpu_cores(self):
         lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu'])
         if match := re.search(r'^CPU\(s\):\s+(\d+)', lscpu_output, re.MULTILINE): self.cpu_cores_count = int(match.group(1))
-    
+
     def _safe_float(self, value: str) -> float:
         try: return float(value.replace(',', '.'))
         except (ValueError, TypeError): return 0.0
-    
+
     def _parse_system_details(self) -> Dict[str, Any]:
         lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu']); meminfo = self._read_file(['proc/meminfo']); dmidecode = self._read_file(['dmidecode', 'sos_commands/hardware/dmidecode'])
         mem_total_match = re.search(r'MemTotal:\s+(\d+)\s+kB', meminfo); cpu_model_match = re.search(r'Model name:\s+(.+)', lscpu_output); model_match = re.search(r'Product Name:\s*(.*)', dmidecode)
@@ -165,8 +165,24 @@ class SosreportParser:
         top_users = sorted(user_stats.items(), key=lambda item: item[1]['cpu_pct'], reverse=True)[:5]
         return { 'total': len(processes), 'top_cpu': sorted(processes, key=lambda p: p['cpu_pct'], reverse=True)[:5], 'top_mem': sorted(processes, key=lambda p: p['rss_kb'], reverse=True)[:5], 'uninterruptible': [p for p in processes if 'D' in p['stat']], 'zombie': [p for p in processes if 'Z' in p['stat']], 'by_user': [{ 'user': user, **stats } for user, stats in top_users] }
 
+    def _parse_listening_ports(self) -> List[Dict[str, Any]]:
+        ss_content = self._read_file(['sos_commands/networking/ss_-tlpn'])
+        ports = []
+        if ss_content == 'N/A': return ports
+        for line in ss_content.split('\n')[1:]:
+            parts = line.split()
+            if len(parts) < 5 or not parts[0].startswith('LISTEN'): continue
+            try:
+                address, port = parts[3].rsplit(':', 1)
+                process_match = re.search(r'users:\(\("([^"]+)",', ' '.join(parts[4:]))
+                process_name = process_match.group(1) if process_match else 'N/A'
+                ports.append({'port': int(port), 'address': address, 'process': process_name})
+            except (ValueError, IndexError):
+                continue
+        return ports
+
     def _parse_network_details(self) -> Dict[str, Any]:
-        details = {'interfaces': [], 'routing_table': [], 'ethtool': {}, 'bonding': [], 'netdev': []}; all_ifaces = set()
+        details = {'interfaces': [], 'routing_table': [], 'ethtool': {}, 'bonding': [], 'netdev': [], 'listening_ports': self._parse_listening_ports()}; all_ifaces = set()
         netdev_content = self._read_file(['proc/net/dev'])
         for line in netdev_content.split('\n')[2:]:
             if ':' in line:
@@ -226,13 +242,9 @@ class SosreportParser:
         return { "kernel_parameters": {k: sysctl.get(k, 'N/A') for k in ['vm.swappiness', 'net.core.somaxconn', 'fs.file-max']}, "selinux_status": sestatus, "installed_packages": rpms, "failed_services": failed_services }
 
     def _parse_sar_data(self) -> Dict[str, List[Dict]]:
-        # [BUG FIX] CPU 그래프 미출력 문제 해결을 위해 파서 안정성 강화
         report_day_str = self.report_date.strftime('%d'); content = self._read_file([f'var/log/sa/sar{report_day_str}', f'sos_commands/sar/sar{report_day_str}', 'sos_commands/monitoring/sar_-A'])
         if content == 'N/A' or not content.strip(): return {}
-        
         data: Dict[str, List[Dict]] = {}; header_map, current_section = {}, None
-        
-        # [개선] 각 섹션을 식별하기 위한 키워드 집합 정의
         section_keys = {
             'cpu': {'%user', '%usr', '%system', '%iowait', '%idle'},
             'memory': {'kbmemfree', 'kbmemused', '%memused'},
@@ -241,40 +253,31 @@ class SosreportParser:
             'swap': {'kbswpfree', 'kbswpused', '%swpused'},
             'network': {'IFACE', 'rxpck/s', 'txpck/s'}
         }
-
         for line in content.strip().replace('\r\n', '\n').split('\n'):
             line = line.strip()
             if not line or line.startswith(('Average:', 'Linux')): header_map, current_section = {}, None; continue
-            
             is_header = re.match(r'^\d{2}:\d{2}:\d{2}(?:\s+PM|AM)?', line) and any(k in line for k in ['CPU', '%', 'IFACE', 'kb', 'tps', 'ldavg', 'runq-sz'])
-            
             if is_header:
                 parts = re.split(r'\s+', line); metric_start_idx = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
                 header_cols_raw = parts[metric_start_idx:]
                 header_cols = [p.replace('%', 'pct_').replace('/', '_s').replace('%usr', 'pct_user') for p in header_cols_raw]
                 header_map = {col: i for i, col in enumerate(header_cols)}
-                
-                # [개선] 키워드 집합을 사용하여 현재 섹션을 더 정확하게 식별
                 current_section = None
                 for sec, keys in section_keys.items():
                     if any(key in header_cols_raw for key in keys):
                         current_section = sec
                         break
-                
                 if current_section:
                     logging.info(f"SAR 데이터 파싱: '{current_section}' 섹션 식별됨 (헤더: {header_cols_raw})")
                 continue
-
             if current_section and header_map:
                 parts = re.split(r'\s+', line); ts_end_idx = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
                 timestamp = " ".join(parts[:ts_end_idx]); values = parts[ts_end_idx:]; entry = {'timestamp': timestamp}
                 for h, i in header_map.items():
                     if i < len(values): entry[h] = self._safe_float(values[i]) if h not in ['IFACE', 'DEV', 'CPU'] else values[i]
-                
                 if current_section == 'cpu' and entry.get('CPU') != 'all': continue
                 if current_section == 'network' and entry.get('IFACE') == 'lo': continue
                 data.setdefault(current_section, []).append(entry)
-        
         logging.info(f"SAR 데이터 파싱 완료. 추출된 섹션: {list(data.keys())}")
         return data
 
@@ -332,94 +335,153 @@ class AIAnalyzer:
         self.session = requests.Session()
         self.session.headers.update({'Content-Type': 'application/json', 'Accept': 'application/json'})
 
+    def _create_system_analysis_prompt(self, metadata: Dict) -> str:
+        data_to_send = {
+            "system_info": metadata.get("system_info"),
+            "performance_analysis": metadata.get("performance_analysis"),
+            "critical_log_events": metadata.get("critical_log_events"),
+            "kernel_parameters": metadata.get("kernel_parameters"),
+            "selinux_status": metadata.get("selinux_status"),
+        }
+        data_str = json.dumps(data_to_send, indent=2, ensure_ascii=False, default=str)
+
+        return f"""당신은 Red Hat Enterprise Linux 시스템의 문제를 해결하는 최고 수준의 전문가입니다. 다음 sosreport에서 추출한 데이터를 종합적으로 검토하여, 전문가 수준의 진단과 해결책을 한국어로 제공해주세요.
+
+## 분석 데이터
+```json
+{data_str}
+```
+
+## 분석 가이드라인
+1.  **critical_log_events 최우선 분석**: 각 이벤트의 `log_message`와 `correlated_context`를 함께 분석하여 문제의 **근본 원인**을 추론하세요.
+2.  **performance_analysis 결과와 연계**: 진단된 성능 병목 현상을 다른 데이터와 연관 지어 설명하세요.
+3.  **kernel_parameters 및 SELinux 확인**: 비표준 커널 파라미터나 SELinux 상태가 문제와 관련 있는지 분석하세요. SELinux가 `Enforcing` 모드가 아니면 보안 위험으로 반드시 언급해야 합니다.
+
+## 최종 출력 형식
+**모든 내용은 반드시 자연스러운 한국어로 작성해주세요.**
+
+```json
+{{
+  "critical_issues": ["상관관계 분석 및 성능 분석을 기반으로 식별된 심각한 문제들의 구체적인 설명"],
+  "warnings": ["주의가 필요한 로그 패턴, 서비스 실패, 커널 설정 등의 사항"],
+  "recommendations": [
+    {{
+      "priority": "높음|중간|낮음",
+      "category": "성능|보안|안정성|유지보수",
+      "issue": "근본 원인에 대한 설명 (데이터 기반)",
+      "solution": "구체적이고 실행 가능한 해결 방안"
+    }}
+  ],
+  "summary": "시스템 상태와 핵심 문제, 가장 시급한 권장사항에 대한 종합 요약"
+}}
+```
+**중요**: 당신의 전체 응답은 오직 위 형식의 단일 JSON 객체여야 합니다.
+"""
+
     def get_structured_analysis(self, metadata: Dict, anonymize: bool) -> Dict:
-        log_step("서버에 AI 분석 요청")
-        data_to_send = metadata
+        log_step("전문가 프롬프트 기반 AI 시스템 분석 요청")
+        
+        data_for_prompt = metadata
         if anonymize:
             anonymizer = DataAnonymizer()
             hostnames = [metadata.get("system_info", {}).get("hostname", "")]
-            data_to_send = anonymizer.anonymize_data(metadata, specific_hostnames=hostnames)
+            data_for_prompt = anonymizer.anonymize_data(metadata, specific_hostnames=hostnames)
             logging.info("데이터 익명화 완료.")
+
+        prompt = self._create_system_analysis_prompt(data_for_prompt)
+        payload = {"prompt": prompt, "data": data_for_prompt}
+
         try:
             logging.info(f"AI 분석 서버로 요청 전송: {self.api_url}")
-            response = self.session.post(self.api_url, json=data_to_send, timeout=300)
+            response = self.session.post(self.api_url, json=payload, timeout=300)
             response.raise_for_status()
-            server_response = response.json()
-            formatted_response = {
-                "summary": server_response.get("analysis_summary", "요약 정보 없음."),
-                "recommendations": [{"priority": "높음", "category": "미분류", "issue": issue.get("issue", "N/A"), "solution": issue.get("solution", "N/A"), "related_logs": [issue.get("cause", "N/A")]} for issue in server_response.get("key_issues", [])],
-                "critical_issues": [], "warnings": []
-            }
+            
+            analysis_result = response.json()
             logging.info(Color.success("서버로부터 AI 분석 결과 수신 완료."))
-            return formatted_response
+            return analysis_result
+
         except requests.exceptions.RequestException as e:
             logging.error(f"AI 분석 서버 통신 오류: {e}")
             error_details = str(e)
             if e.response is not None:
                 try: error_details = e.response.json().get('details', e.response.text)
                 except json.JSONDecodeError: error_details = e.response.text[:500]
-            return {"summary": f"AI 분석 서버와 통신하는 데 실패했습니다. 보고서는 AI 분석 없이 생성됩니다.", "critical_issues": [f"서버 통신 오류: {error_details}"], "warnings": [], "recommendations": []}
+            
+            return {
+                "summary": f"AI 분석 서버와 통신하는 데 실패했습니다.",
+                "critical_issues": [f"서버 통신 오류: {error_details}"],
+                "warnings": [], "recommendations": []
+            }
 
     def fetch_security_news(self, metadata: Dict) -> List[Dict]:
-        # [NEW] sos_analyzer_old.py의 보안 위협 분석 로직 복원 및 개선
-        log_step("긴급 보안 위협 분석 시작 (Red Hat API)")
+        log_step("스마트 보안 위협 분석 시작 (컨텍스트 기반 엔진)")
         
-        HIGH_IMPACT_PACKAGES = ['kernel', 'glibc', 'openssl', 'httpd', 'nginx', 'java', 'python', 'bash', 'sudo', 'systemd', 'qemu-kvm', 'mariadb', 'postgresql', 'firefox', 'thunderbird', 'grub2']
-        installed_packages = metadata.get("installed_packages", [])
+        all_findings = []
         
-        target_packages = set()
-        for pkg_full in installed_packages:
+        if metadata.get("selinux_status", {}).get("current_mode") != "enforcing":
+            all_findings.append({
+                "type": "Configuration", "id": "SELINUX_DISABLED", "severity": "Critical",
+                "package": "selinux-policy", "description": "SELinux가 enforcing 모드가 아닙니다. 시스템이 주요 보안 위협에 노출될 수 있습니다."
+            })
+        
+        db_ports = {3306: "mysql/mariadb", 5432: "postgresql"}
+        for port_info in metadata.get("network", {}).get("listening_ports", []):
+            if port_info.get("port") in db_ports and port_info.get("address") in ["0.0.0.0", "::"]:
+                 all_findings.append({
+                    "type": "Configuration", "id": f"DB_PORT_PUBLIC_{port_info['port']}", "severity": "Critical",
+                    "package": db_ports[port_info['port']], "description": f"데이터베이스 포트({port_info['port']})가 모든 네트워크 인터페이스에 열려있어 외부 공격에 노출될 수 있습니다."
+                })
+
+        CVE_DATA_PATH = "/data/iso/AIBox/cve_data.json"
+        if not Path(CVE_DATA_PATH).exists():
+            logging.warning(f"CVE 데이터 파일({CVE_DATA_PATH})을 찾을 수 없어 CVE 분석을 건너<binary data, 2 bytes><binary data, 1 bytes><binary data, 1 bytes>니다.")
+        else:
             try:
-                pkg_name = re.match(r'([a-zA-Z0-9_-]+)', pkg_full).group(1)
-                for impact_pkg in HIGH_IMPACT_PACKAGES:
-                    if impact_pkg in pkg_name:
-                        target_packages.add(pkg_name)
-                        break
-            except (AttributeError, IndexError):
-                continue
+                with open(CVE_DATA_PATH, 'r', encoding='utf-8') as f: cve_data = json.load(f)
+                critical_components = {'kernel', 'glibc', 'openssl', 'httpd', 'nginx', 'java', 'python', 'bash', 'sudo', 'systemd', 'qemu-kvm', 'mariadb', 'postgresql'}
+                installed_critical_pkgs = { re.match(r'([a-zA-Z0-9_-]+)', pkg).group(1) for pkg in metadata.get("installed_packages", []) if re.match(r'([a-zA-Z0-9_-]+)', pkg) and re.match(r'([a-zA-Z0-9_-]+)', pkg).group(1) in critical_components }
+                logging.info(f"분석 대상 핵심 컴포넌트: {', '.join(sorted(list(installed_critical_pkgs)))}")
+
+                relevant_cves = []
+                for cve in cve_data:
+                    if cve.get('severity') not in ['critical', 'important']: continue
+                    affected_pkgs = {p.split(':')[0] for p in cve.get('affected_packages', [])}
+                    if installed_critical_pkgs.intersection(affected_pkgs):
+                        relevant_cves.append(cve)
+                
+                logging.info(f"{len(relevant_cves)}개의 관련 CVE를 찾았습니다. AI 기반 우선순위 분석 시작.")
+
+                if relevant_cves:
+                    for cve in relevant_cves:
+                        score = 0
+                        if cve.get('severity') == 'critical': score += 100
+                        if isinstance(cve.get('cvss3'), dict):
+                             try:
+                                score_str = cve['cvss3'].get('cvss3_base_score')
+                                if score_str: score += float(score_str) * 10
+                             except (ValueError, TypeError): pass
+                        cve['priority_score'] = score
+                    
+                    prioritized_cves = sorted(relevant_cves, key=lambda x: x.get('priority_score', 0), reverse=True)
+
+                    for cve in prioritized_cves:
+                        all_findings.append({
+                            "type": "CVE", "id": cve.get('CVE'), "severity": cve.get('severity', 'N/A').capitalize(),
+                            "package": ', '.join(sorted(list({p.split(':')[0] for p in cve.get('affected_packages', [])}))) or 'N/A',
+                            "description": cve.get('bugzilla_description', 'N/A').split('\n\nStatement:')[0]
+                        })
+
+            except (json.JSONDecodeError, FileNotFoundError) as e:
+                logging.error(f"CVE 데이터 파일을 처리하는 중 오류 발생: {e}")
+
+        severity_map = {'Critical': 0, 'Important': 1}
+        sorted_findings = sorted(all_findings, key=lambda x: severity_map.get(x.get('severity'), 2))
+        top_findings = sorted_findings[:10]
+
+        logging.info(Color.success(f"스마트 보안 분석 완료. 총 {len(all_findings)}개의 잠재 위협 발견, 상위 {len(top_findings)}개 선정."))
         
-        if not target_packages:
-            logging.info("분석 대상 주요 패키지가 설치되어 있지 않습니다.")
-            return []
+        return [{'cve_id': f.get('id'),'severity': f.get('severity'),'package': f.get('package'),'description': f.get('description')} for f in top_findings]
 
-        logging.info(f"보안 분석 대상 패키지 ({len(target_packages)}개): {', '.join(sorted(list(target_packages)))}")
-        
-        start_date = (self.report_date - timedelta(days=180)).strftime('%Y-%m-%d')
-        all_cves = {}
-
-        def fetch_cves_for_package(pkg_name):
-            try:
-                url = f"https://access.redhat.com/hydra/rest/securitydata/cve.json?package={pkg_name}&after={start_date}"
-                response = requests.get(url, timeout=20)
-                if response.status_code == 200:
-                    return response.json()
-            except requests.RequestException as e:
-                logging.warning(f"'{pkg_name}' 패키지 CVE 조회 실패: {e}")
-            return []
-
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            results = executor.map(fetch_cves_for_package, target_packages)
-            for cve_list in results:
-                for cve in cve_list:
-                    if cve.get('severity') in ['critical', 'important']:
-                        all_cves[cve['CVE']] = cve
-        
-        if not all_cves:
-            logging.info("최근 180일 내에 Critical/Important 등급의 CVE가 없습니다.")
-            return []
-
-        severity_map = {'critical': 0, 'important': 1}
-        sorted_cves = sorted(all_cves.values(), key=lambda x: (severity_map.get(x.get('severity'), 2), x.get('public_date', '')), reverse=False)
-
-        top_cves = sorted_cves[:10]
-        logging.info(Color.success(f"총 {len(all_cves)}개의 CVE 발견, 상위 {len(top_cves)}개 선정 완료."))
-        
-        return [{
-            "cve_id": cve.get('CVE'),
-            "severity": cve.get('severity', 'N/A').capitalize(),
-            "package": ', '.join(sorted(list(set(pkg.split(':')[0] for pkg in cve.get('affected_packages', []))))) or 'N/A',
-            "description": cve.get('bugzilla_description', 'N/A').split('\n\nStatement:')[0]
-        } for cve in top_cves]
 
 class HTMLReportGenerator:
     def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str):
@@ -454,7 +516,7 @@ class HTMLReportGenerator:
             net_by_iface = {}; [net_by_iface.setdefault(d.get('IFACE'), []).append(d) for d in sar['network'] if d.get('IFACE')]
             up_interfaces = {iface['iface'] for iface in self.metadata.get('network', {}).get('interfaces', []) if iface.get('state') == 'up'}
             for iface, data in net_by_iface.items():
-                if iface in up_interfaces and len(data) > 1 and sum(d.get('rxkB_s', 0) + d.get('txkB_s', 0) for d in data) > 0: 
+                if iface in up_interfaces and len(data) > 1 and sum(d.get('rxkB_s', 0) + d.get('txkB_s', 0) for d in data) > 0:
                     graphs['network'][iface] = self._create_plot_dual_axis(data, f'Network Traffic: {iface}', {'rxpck_s': 'RX pck/s', 'txpck_s': 'TX pck/s'}, {'rxkB_s': 'RX kB/s', 'txkB_s': 'TX kB/s'})
         return graphs
 
@@ -489,8 +551,11 @@ class HTMLReportGenerator:
     def generate(self) -> str:
         graphs = self._generate_graphs()
         template_data = {
-            "hostname": self.hostname, "ai_analysis": self.ai_analysis,
-            "graphs": graphs, **self.metadata
+            "hostname": self.hostname, 
+            "ai_analysis": self.ai_analysis,
+            "graphs": graphs,
+            "security_advisories": self.metadata.get('security_advisories', []),
+            **self.metadata
         }
         return get_html_template(template_data)
 
@@ -500,41 +565,44 @@ def main(args: argparse.Namespace):
     try:
         log_step(f"'{args.tar_path}' 압축 해제 중")
         with tarfile.open(args.tar_path, 'r:*') as tar: tar.extractall(path=extract_path)
-        
+
         parser = SosreportParser(extract_path)
         metadata, sar_data = parser.parse_all()
         
-        output_dir = Path(args.output); output_dir.mkdir(exist_ok=True)
         hostname = metadata.get('system_info', {}).get('hostname', 'unknown')
-        (output_dir / f"metadata-{hostname}.json").write_text(json.dumps(metadata, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
-        (output_dir / f"sar_data-{hostname}.json").write_text(json.dumps(sar_data, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
-        
-        # [개선] AIAnalyzer 초기화 시 report_date 전달
+
         ai_analyzer = AIAnalyzer(args.server_url, parser.report_date)
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_ai = executor.submit(ai_analyzer.get_structured_analysis, metadata, args.anonymize)
             future_sec = executor.submit(ai_analyzer.fetch_security_news, metadata)
             structured_analysis = future_ai.result()
-            metadata['security_news'] = future_sec.result()
-        
+            security_advisories = future_sec.result()
+            metadata['security_advisories'] = security_advisories
+            
         reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname)
         html_content = reporter.generate()
+
+        output_dir = Path(args.output); output_dir.mkdir(exist_ok=True)
         
         report_path = output_dir / f"report-{hostname}.html"
         report_path.write_text(html_content, encoding='utf-8')
-        logging.info(Color.success(f"분석 완료! 보고서 저장 경로: {report_path}"))
+        logging.info(Color.success(f"HTML 보고서 저장 완료: {report_path}"))
+        
+        (output_dir / f"metadata-{hostname}.json").write_text(json.dumps(metadata, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
+        (output_dir / f"sar_data-{hostname}.json").write_text(json.dumps(sar_data, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
+        logging.info(Color.success(f"JSON 데이터 저장 완료: {output_dir}"))
 
     except Exception as e:
         logging.error(f"치명적인 오류 발생: {e}", exc_info=True)
         sys.exit(1)
     finally:
         if extract_path.exists(): shutil.rmtree(extract_path, ignore_errors=True)
-        
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Smart sosreport Analyzer")
     parser.add_argument("tar_path", help="분석할 sosreport tar 아카이브 경로")
     parser.add_argument("--output", default="output", help="보고서 및 데이터 저장 디렉토리")
-    parser.add_argument("--server-url", required=True, help="AI 분석을 위한 ABox_Server.py의 API 엔드포인트 URL (예: http://127.0.0.1:5000/AIBox/api/sos/analyze_system)")
+    parser.add_argument("--server-url", required=True, help="AI 분석을 위한 ABox_Server.py의 API 엔드포인트 URL (예: http://12.34.56.78/AIBox/api/sos/analyze_system)")
     parser.add_argument("--anonymize", action='store_true', help="서버 전송 전 민감 정보 익명화")
     main(parser.parse_args())
 
