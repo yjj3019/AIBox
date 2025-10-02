@@ -2,9 +2,9 @@
 # ==============================================================================
 # HTML Template Module
 # ------------------------------------------------------------------------------
-# [BUG FIX] sos_analyzer.py에서 파싱된 데이터(프로세스, 네트워크)의 키(key)
-# 이름이 일치하지 않던 문제를 수정하여 데이터가 보고서에 정상적으로
-# 표시되도록 수정했습니다.
+# [BUG FIX] 네트워크 그래프 생성 시 발생하던 TypeError를 해결하기 위해
+#           잘못된 중괄호 문법을 수정했습니다.
+# [BUG FIX] 누락되었던 'Last Boot' 정보가 시스템 요약 테이블에 표시되도록 수정.
 # ==============================================================================
 
 import html
@@ -124,10 +124,10 @@ def get_html_template(data):
     system_info = data.get('system_info', {})
     ai_analysis = data.get('ai_analysis', {})
     graphs = data.get('graphs', {})
-    # [BUG FIX] network_details -> network, process_stats -> processes 로 키 이름 수정
     network_details = data.get('network', {})
     process_stats = data.get('processes', {})
-
+    security_news = data.get('security_advisories', [])
+    
     summary_raw = ai_analysis.get('summary', '분석 결과 없음')
     summary_html = h(summary_raw).replace('\n', '<br>')
 
@@ -213,7 +213,7 @@ def get_html_template(data):
                     {render_graph('load', 'System Load Average', graphs)}
                     {render_graph('disk', 'Disk I/O', graphs)}
                     {render_graph('swap', 'Swap Usage (%)', graphs)}
-                    {''.join(render_graph(iface, f'Network Traffic ({iface})', graphs['network']) for iface in graphs.get('network', {{}}))}
+                    {''.join(render_graph(iface, f'Network Traffic ({iface})', graphs.get('network', {})) for iface in graphs.get('network', {}))}
                 </div>
             </div>
 
@@ -285,7 +285,7 @@ def get_html_template(data):
                  <div class="card-body">
                     <table class="data-table">
                         <thead><tr><th>CVE</th><th>Severity</th><th>Package</th><th>Description</th></tr></thead>
-                        <tbody>{create_security_news_rows(data.get('security_news', []))}</tbody>
+                        <tbody>{create_security_news_rows(security_news)}</tbody>
                     </table>
                 </div>
             </div>
