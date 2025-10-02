@@ -213,6 +213,27 @@ def get_rhsa_ids_from_cve(cve_data):
     rhsa_ids = cve_data.get('advisories', [])
     return sorted([rhsa for rhsa in rhsa_ids if isinstance(rhsa, str) and rhsa.startswith("RHSA-")])
 
+def generate_fallback_analysis(cve, affected_packages):
+    """서버 오류 시 기본 분석 결과를 생성합니다."""
+    severity = cve.get('severity', 'N/A')
+    summary = extract_summary_from_cve(cve)
+    
+    # 기본 태그 생성
+    threat_tags = []
+    if severity == 'critical':
+        threat_tags.append("Critical Vulnerability")
+    if re.search(r'remote code execution|rce', summary, re.IGNORECASE):
+        threat_tags.append("RCE")
+    if re.search(r'privilege escalation', summary, re.IGNORECASE):
+        threat_tags.append("Privilege Escalation")
+    
+    return {
+        "threat_tags": threat_tags,
+        "affected_components": affected_packages[:5],
+        "concise_summary": summary[:200] + "..." if len(summary) > 200 else summary,
+        "selection_reason": f"심각도 {severity}의 RHEL 관련 취약점으로, 자동 분석 시스템에 의해 선정되었습니다."
+    }
+
 def analyze_cve_with_llm_single(cve, total_count, current_index):
     """Sends a single CVE to the AIBox Server for analysis via API."""
     cve_id = cve.get('CVE', 'N/A')
@@ -251,17 +272,24 @@ def analyze_cve_with_llm_single(cve, total_count, current_index):
     # Use the existing make_request function to call our own API server
     # It's an internal call, so we disable proxy usage for this specific request.
     api_url = f'{AIBOX_SERVER_URL.rstrip("/")}/api/cve/analyze'
-    response = make_request('post', api_url, use_proxy=False, json=payload, timeout=120)
-
-    if not response:
-        print(f"  -> Failed to get analysis for {cve_id} from AIBox server.")
-        return {}
-        
+    
     try:
-        return response.json()
-    except json.JSONDecodeError as e:
-        print(f"  -> Failed to parse analysis for {cve_id} from AIBox server. Reason: {e}.")
-        return {}
+        response = make_request('post', api_url, use_proxy=False, json=payload, timeout=120)
+        
+        if not response:
+            print(f"  -> Failed to get analysis for {cve_id} from AIBox server. Using fallback analysis.")
+            # 서버 응답 실패 시 기본 분석 결과 생성
+            return generate_fallback_analysis(cve, affected_packages)
+            
+        try:
+            return response.json()
+        except json.JSONDecodeError as e:
+            print(f"  -> Failed to parse analysis for {cve_id} from AIBox server. Reason: {e}. Using fallback analysis.")
+            return generate_fallback_analysis(cve, affected_packages)
+            
+    except Exception as e:
+        print(f"  -> Exception during analysis for {cve_id}: {e}. Using fallback analysis.")
+        return generate_fallback_analysis(cve, affected_packages)
 
 def analyze_and_prioritize_with_llm(cves):
     """Step 4: 각 필터링된 CVE를 개별적으로 분석합니다."""
@@ -271,11 +299,13 @@ def analyze_and_prioritize_with_llm(cves):
     for i, cve in enumerate(cves):
         if not isinstance(cve, dict): continue
         analysis_result = analyze_cve_with_llm_single(cve, len(cves), i + 1)
+        # Check if the analysis result is not empty, even with fallback it might be under some conditions
         if analysis_result:
             cve.update(analysis_result)
             analyzed_cves.append(cve)
         else:
-            print(f"  -> Warning: LLM analysis failed for {cve.get('CVE')}. It will be excluded from the final report.")
+            # This path should be less likely with the fallback, but kept for safety
+            print(f"  -> Warning: Analysis failed for {cve.get('CVE')} and no fallback was generated. It will be excluded from the final report.")
         time.sleep(1)
     
     print("\n--- LLM analysis for all CVEs is complete ---")
@@ -694,4 +724,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
