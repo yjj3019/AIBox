@@ -1,5 +1,6 @@
 #pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org 
 #/usr/bin/python3.6 -m pip install -r requirements.txt
+#yum install gcc-c++ libjpeg-turbo-devel zlib-devel python3-numpy python3-pip python3-devel  
 Flask
 Flask-Cors
 requests
@@ -7,3 +8,9 @@ waitress
 gunicorn
 matplotlib
 schedule
+APScheduler 
+SQLAlchemy
+aiohttp
+pyyaml
+cryptography
+pandas
