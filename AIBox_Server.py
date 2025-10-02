@@ -2,22 +2,16 @@
 
 # -*- coding: utf-8 -*-
 # ==============================================================================
-# Unified AI Server (v5.0 - Stable Release)
+# Unified AI Server (v8.1 - Advanced Status Tracking)
 # ------------------------------------------------------------------------------
 # 기능:
-# 1. AI 채팅 분석 (스트리밍)
-# 2. LLM 서버의 사용 가능 모델 목록 조회 기능 (--list-models)
-# 3. sosreport 분석 (파일 업로드, 상태 관리)
-# 4. 스케줄러 (Python 하위 버전 호환성 문제 해결)
-# 5. security.py 연동 API (개별 CVE 분석, 요약 생성)
-# 6. cve_report.html 연동 API (종합 CVE 리포트 생성)
-# 7. 관리자 페이지 (프롬프트, 스케줄 관리)
-# 8. LLM 채팅 엔드포인트 자동 확인 기능 추가
-# 9. [수정] CVE 리포트 API를 POST 방식으로 변경하여 404 오류 근본 해결
-#
-# 실행:
-#   - 서버 시작: python AIBox_Server.py --llm-url [LLM_CHAT_API_URL] --model [MODEL_NAME]
-#   - 모델 목록 조회: python AIBox_Server.py --llm-url [LLM_BASE_URL] --list-models
+# 1. [CRITICAL FIX] sosreport 분석 상태를 체계적으로 추적하는 기능 추가.
+#    - 백그라운드 스레드에서 분석 프로세스를 실행하고 stdout/stderr를 실시간으로 캡처.
+#    - 분석 상태를 'queued', 'extracting', 'parsing', 'analyzing', 'complete', 'failed' 등으로 세분화하여 관리.
+# 2. [API ENHANCEMENT] '/api/status/<analysis_id>' 엔드포인트를 개선하여
+#    단순 완료 여부가 아닌, 상세한 진행 로그와 현재 상태를 반환하도록 수정.
+# 3. [STABILITY] 리포트 파일 이름 생성 규칙을 클라이언트(sos_analyzer.py)와 통일하여,
+#    리포트 목록 조회 및 삭제 기능의 안정성을 확보.
 # ==============================================================================
 
 # --- 1. 라이브러리 임포트 ---
@@ -28,6 +22,7 @@ import sys
 import uuid
 import time
 import threading
+from threading import Lock
 import subprocess
 import logging
 import logging.handlers
@@ -35,6 +30,7 @@ from collections import OrderedDict
 import traceback
 import atexit
 import re
+import copy
 
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
@@ -43,37 +39,40 @@ from werkzeug.utils import secure_filename
 from waitress import serve
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # --- 2. 로깅 및 Flask 앱 설정 ---
 class HealthCheckFilter(logging.Filter):
     def filter(self, record):
-        is_health_check = 'GET /api/health' in record.getMessage()
-        return not is_health_check
+        return 'GET /api/health' not in record.getMessage()
 
 log = logging.getLogger('werkzeug')
 log.addFilter(HealthCheckFilter())
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+CORS(app, resources={r"/AIBox/api/*": {"origins": "*"}})
 
 # --- 3. 전역 변수 및 설정 ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG = {}
 PROMPTS = {}
 PROMPTS_FILE = os.path.join(SCRIPT_DIR, 'prompts.json')
-LEARNING_DATA_FILE = os.path.join(SCRIPT_DIR, 'learning_data.json')
 SERVER_INSTANCE_ID = str(uuid.uuid4())
 PROMPT_SEPARATOR = "\n---USER_TEMPLATE---\n"
 PROMPT_FILE_MTIME = 0
 PROMPT_LOCK = threading.Lock()
-# Note: These paths are hardcoded for a specific environment.
 UPLOAD_FOLDER = '/data/iso/AIBox/upload'
 OUTPUT_FOLDER = '/data/iso/AIBox/output'
 SOS_ANALYZER_SCRIPT = "/data/iso/AIBox/sos_analyzer.py"
 scheduler = None
 
-# 보이지 않는 제어 문자를 제거하기 위한 정규식
+# --- [NEW] Advanced Status Tracking ---
+ANALYSIS_STATUS = {}
+ANALYSIS_LOCK = Lock()
+# ------------------------------------
+
 CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -85,99 +84,122 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 * 1024 # 100 GB
 # --- 4. 핵심 헬퍼 함수 ---
 
 def sanitize_value(value):
-    """문자열에서 잠재적으로 문제를 일으킬 수 있는 제어 문자를 제거합니다."""
-    if isinstance(value, str):
-        return CONTROL_CHAR_REGEX.sub('', value)
+    if isinstance(value, str): return CONTROL_CHAR_REGEX.sub('', value)
     return value
 
 def sanitize_loaded_json(data):
-    """JSON 객체를 재귀적으로 탐색하며 모든 문자열 값을 정제합니다."""
-    if isinstance(data, dict):
-        return OrderedDict((k, sanitize_loaded_json(v)) for k, v in data.items())
-    elif isinstance(data, list):
-        return [sanitize_loaded_json(item) for item in data]
-    else:
-        return sanitize_value(data)
+    if isinstance(data, dict): return OrderedDict((k, sanitize_loaded_json(v)) for k, v in data.items())
+    if isinstance(data, list): return [sanitize_loaded_json(item) for item in data]
+    return sanitize_value(data)
+
+# --- [NEW] Background Analysis Task ---
+def run_analysis_in_background(file_path, analysis_id):
+    """sos_analyzer.py를 백그라운드 스레드에서 실행하고 출력을 캡처합니다."""
+    log_key = analysis_id
+    
+    with ANALYSIS_LOCK:
+        ANALYSIS_STATUS[log_key] = {
+            "status": "queued",
+            "log": ["분석 대기 중..."],
+            "report_file": None,
+            "start_time": time.time()
+        }
+
+    try:
+        python_interpreter = "/usr/bin/python3.11"
+        server_url = "http://127.0.0.1:5000/AIBox/api/sos/analyze_system"
+        output_dir = app.config['OUTPUT_FOLDER']
+        report_file_name = f"analysis-report-{analysis_id}.html"
+
+        command = [
+            python_interpreter,
+            SOS_ANALYZER_SCRIPT,
+            "--server-url", server_url,
+            "--output", output_dir,
+            file_path
+        ]
+        
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+
+        with ANALYSIS_LOCK:
+            ANALYSIS_STATUS[log_key]["status"] = "running"
+            ANALYSIS_STATUS[log_key]["log"].append("분석 프로세스 시작됨...")
+
+        # 실시간 stdout 처리
+        for line in iter(process.stdout.readline, ''):
+            line = line.strip()
+            if not line: continue
+            
+            with ANALYSIS_LOCK:
+                # 로그 메시지 기반 상태 업데이트
+                if "Extracting" in line:
+                    ANALYSIS_STATUS[log_key]["status"] = "extracting"
+                elif "parsing" in line:
+                    ANALYSIS_STATUS[log_key]["status"] = "parsing"
+                elif "Requesting comprehensive analysis" in line:
+                    ANALYSIS_STATUS[log_key]["status"] = "analyzing"
+                elif "Generating professional HTML report" in line:
+                    ANALYSIS_STATUS[log_key]["status"] = "generating_report"
+                
+                ANALYSIS_STATUS[log_key]["log"].append(line)
+        
+        process.wait() # 프로세스 종료 대기
+        
+        stderr_output = process.stderr.read().strip()
+
+        with ANALYSIS_LOCK:
+            if process.returncode == 0:
+                ANALYSIS_STATUS[log_key]["status"] = "complete"
+                ANALYSIS_STATUS[log_key]["log"].append("분석 성공적으로 완료.")
+                ANALYSIS_STATUS[log_key]["report_file"] = report_file_name
+            else:
+                ANALYSIS_STATUS[log_key]["status"] = "failed"
+                ANALYSIS_STATUS[log_key]["log"].append("분석 실패.")
+                if stderr_output:
+                    ANALYSIS_STATUS[log_key]["log"].append("--- ERROR LOG ---")
+                    ANALYSIS_STATUS[log_key]["log"].extend(stderr_output.split('\n'))
+
+    except Exception as e:
+        with ANALYSIS_LOCK:
+            ANALYSIS_STATUS[log_key]["status"] = "failed"
+            ANALYSIS_STATUS[log_key]["log"].append(f"서버 내부 오류 발생: {e}")
+            traceback.print_exc()
 
 def resolve_chat_endpoint(llm_url, token):
-    if llm_url.endswith(('/v1/chat/completions', '/api/chat')):
-        logging.info(f"Provided LLM URL '{llm_url}' is already a full endpoint.")
-        return llm_url
-
+    if llm_url.endswith(('/v1/chat/completions', '/api/chat')): return llm_url
     headers = {'Content-Type': 'application/json'}
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-    
+    if token: headers['Authorization'] = f'Bearer {token}'
     base_url = llm_url.rstrip('/')
-    logging.info(f"Probing for LLM API type at base URL: {base_url}")
-
     try:
-        openai_test_url = f"{base_url}/v1/models"
-        response = requests.head(openai_test_url, headers=headers, timeout=3)
-        if response.status_code < 500:
-            resolved_url = f"{base_url}/v1/chat/completions"
-            logging.info(f"OpenAI-compatible API detected. Using endpoint: {resolved_url}")
-            return resolved_url
-    except requests.exceptions.RequestException:
-        logging.info("OpenAI-compatible probe failed. Trying next type.")
-
+        if requests.head(f"{base_url}/v1/models", headers=headers, timeout=3).status_code < 500: return f"{base_url}/v1/chat/completions"
+    except requests.exceptions.RequestException: pass
     try:
-        ollama_test_url = f"{base_url}/api/tags"
-        response = requests.head(ollama_test_url, headers=headers, timeout=3)
-        if response.status_code < 500:
-            resolved_url = f"{base_url}/api/chat"
-            logging.info(f"Ollama API detected. Using endpoint: {resolved_url}")
-            return resolved_url
-    except requests.exceptions.RequestException:
-        logging.info("Ollama probe failed.")
-
+        if requests.head(f"{base_url}/api/tags", headers=headers, timeout=3).status_code < 500: return f"{base_url}/api/chat"
+    except requests.exceptions.RequestException: pass
     return None
 
-def list_available_models(llm_url, token):
-    print(f"Fetching available models from the server at {llm_url}...")
+def get_available_models(llm_url, token):
     headers = {'Content-Type': 'application/json'}
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-
+    if token: headers['Authorization'] = f'Bearer {token}'
     try:
         base_url = llm_url.split('/v1/')[0].split('/api/')[0]
-        models_endpoint = f"{base_url.rstrip('/')}/v1/models"
-        
-        print(f"--> Trying OpenAI-compatible endpoint: {models_endpoint}")
-        response = requests.get(models_endpoint, headers=headers, timeout=10)
+        response = requests.get(f"{base_url.rstrip('/')}/v1/models", headers=headers, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        models = sorted([m.get('id') for m in data.get('data', []) if m.get('id')])
-        if models:
-            print("\n--- Available Models (OpenAI format) ---")
-            for model_id in models:
-                print(f"  - {model_id}")
-            return
-    except requests.exceptions.RequestException as e:
-        print(f"    [INFO] Could not connect to OpenAI-compatible endpoint: {e}")
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"    [INFO] Failed to parse response from OpenAI-compatible endpoint: {e}")
-
+        return sorted([m.get('id') for m in response.json().get('data', []) if m.get('id')])
+    except Exception: pass
     try:
         base_url = llm_url.split('/api/')[0]
-        models_endpoint = f"{base_url.rstrip('/')}/api/tags"
-
-        print(f"--> Trying Ollama-compatible endpoint: {models_endpoint}")
-        response = requests.get(models_endpoint, headers=headers, timeout=10)
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", headers=headers, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        models = sorted([m.get('name') for m in data.get('models', []) if m.get('name')])
-        if models:
-            print("\n--- Available Models (Ollama format) ---")
-            for model_name in models:
-                print(f"  - {model_name}")
-            return
-    except requests.exceptions.RequestException as e:
-        print(f"    [INFO] Could not connect to Ollama-compatible endpoint: {e}")
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"    [INFO] Failed to parse response from Ollama-compatible endpoint: {e}")
-
-    print("\n[ERROR] Could not retrieve any models. Please verify your --llm-url and ensure the server is running.")
+        return sorted([m.get('name') for m in response.json().get('models', []) if m.get('name')])
+    except Exception: return []
 
 def make_request_generic(method, url, **kwargs):
     try:
@@ -189,439 +211,389 @@ def make_request_generic(method, url, **kwargs):
         logging.error(f"Generic request failed for {url}: {e}")
         return None
 
-def call_llm_blocking(system_message, user_message):
+def _parse_llm_json_response(llm_response_str: str):
+    if not llm_response_str or not llm_response_str.strip(): raise ValueError("LLM 응답이 비어 있습니다.")
+    try:
+        return json.loads(re.sub(r'^```(json)?\s*|\s*```$', '', llm_response_str.strip()))
+    except json.JSONDecodeError as e: raise ValueError(f"LLM 응답 JSON 파싱 실패: {e}")
+
+def call_llm_blocking(system_message, user_message, max_tokens=16384):
     headers = {'Content-Type': 'application/json'}
     if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
+    payload = {"model": CONFIG["model"], "messages": [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}], "max_tokens": max_tokens, "temperature": 0.1, "stream": False}
     
-    llm_endpoint_url = CONFIG["llm_url"]
-    payload = {"model": CONFIG["model"], "messages": [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}], "max_tokens": 4096, "temperature": 0.1, "stream": False}
+    logging.info(f"[LLM REQ] POST {CONFIG['llm_url']}")
+
     try:
-        response = requests.post(llm_endpoint_url, headers=headers, json=payload, timeout=180)
+        response = requests.post(CONFIG["llm_url"], headers=headers, json=payload, timeout=300)
+        logging.info(f"[LLM RESP] Status Code: {response.status_code}")
         response.raise_for_status()
         result = response.json()
-        
-        content = result.get('choices', [{}])[0].get('message', {}).get('content')
-        if content is None: content = result.get('message', {}).get('content')
+        content = result.get('choices', [{}])[0].get('message', {}).get('content') or result.get('message', {}).get('content')
+        if not content or not content.strip(): 
+            return json.dumps({"error": "LLM returned an empty response."})
         return content
+    except requests.exceptions.HTTPError as e:
+        error_details = f"LLM Server Error: {e}"
+        try:
+            error_details += f"\nLLM Response Body:\n{e.response.text}"
+        except Exception:
+            pass
+        logging.error(error_details, exc_info=True)
+        return json.dumps({"error": "LLM server returned an error.", "details": str(e)})
+    except Exception as e:
+        logging.error(f"LLM server connection or processing failed: {e}", exc_info=True)
+        return json.dumps({"error": "LLM server connection failed.", "details": str(e)})
 
-    except requests.exceptions.RequestException as e:
-        return f"Error: LLM 서버 연결 실패. (Endpoint: {llm_endpoint_url}, Details: {e})"
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        return f"Error: LLM 응답을 파싱할 수 없습니다. (Details: {e})"
 
 def call_llm_stream(system_message, user_message):
     headers = {'Content-Type': 'application/json'}
     if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
-    
-    llm_endpoint_url = CONFIG["llm_url"]
     payload = {"model": CONFIG["model"], "messages": [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}], "max_tokens": 8192, "temperature": 0.2, "stream": True}
+
+    logging.info(f"[LLM STREAM REQ] POST {CONFIG['llm_url']}")
+
     try:
-        response = requests.post(llm_endpoint_url, headers=headers, json=payload, timeout=180, stream=True)
+        response = requests.post(CONFIG["llm_url"], headers=headers, json=payload, timeout=180, stream=True)
+        logging.info(f"[LLM STREAM RESP] Status Code: {response.status_code}. Starting stream.")
         response.raise_for_status()
-        
+
         for line in response.iter_lines():
             if not line: continue
             decoded_line = line.decode('utf-8')
-            json_str = decoded_line
-            if decoded_line.startswith('data: '):
-                json_str = decoded_line[len('data: '):].strip()
-            if json_str == '[DONE]': break
-
+            json_str = decoded_line[len('data: '):].strip() if decoded_line.startswith('data: ') else decoded_line
+            if json_str == '[DONE]': 
+                logging.info("[LLM STREAM RESP] Stream finished with [DONE].")
+                break
             if json_str:
                 try:
                     data = json.loads(json_str)
-                    content = data.get('choices', [{}])[0].get('delta', {}).get('content')
-                    if content is None: content = data.get('message', {}).get('content')
+                    content = data.get('choices', [{}])[0].get('delta', {}).get('content') or data.get('message', {}).get('content')
                     if content: yield content
-                except (json.JSONDecodeError, KeyError, IndexError):
+                except (json.JSONDecodeError, KeyError, IndexError) as e:
+                    logging.warning(f"[LLM STREAM PARSE WARNING] Skipping line: {e} - Line: '{decoded_line}'")
                     pass
-                    
-    except requests.exceptions.RequestException as e:
-        yield (f"\n\n**Error:** LLM 서버 연결 실패.\n- Endpoint: {llm_endpoint_url}\n- Details: {e}")
-    except Exception as e:
-        yield f"\n\n**Error:** 스트리밍 중 알 수 없는 오류 발생: {e}"
+    except Exception as e: 
+        logging.error(f"[LLM STREAM ERROR] LLM server communication error: {e}", exc_info=True)
+        yield f"\n\n**Error:** LLM server communication error: {e}"
 
 def initialize_and_monitor_prompts():
     def load_prompts(force_reload=False):
         global PROMPTS, PROMPT_FILE_MTIME
         try:
             current_mtime = os.path.getmtime(PROMPTS_FILE)
-            if not force_reload and current_mtime == PROMPT_FILE_MTIME:
-                return
-
+            if not force_reload and current_mtime == PROMPT_FILE_MTIME: return
             with PROMPT_LOCK:
-                if not force_reload and current_mtime == PROMPT_FILE_MTIME:
-                    return
-                
-                logging.info(f"Attempting to reload prompts from '{PROMPTS_FILE}'.")
-                
-                with open(PROMPTS_FILE, 'rb') as f:
-                    raw_data = f.read()
-                
-                try:
-                    content = raw_data.decode('utf-8-sig')
-                except UnicodeDecodeError:
-                    content = raw_data.decode('utf-8', errors='ignore')
-
-                start_brace_index = content.find('{')
-                end_brace_index = content.rfind('}')
-
-                if start_brace_index == -1 or end_brace_index == -1 or end_brace_index < start_brace_index:
-                    raise json.JSONDecodeError("Could not find valid JSON object boundaries '{{...}}'.", content, 0)
-
-                json_content = content[start_brace_index : end_brace_index + 1]
-
-                loaded_json = json.loads(json_content, object_pairs_hook=OrderedDict)
-                PROMPTS = sanitize_loaded_json(loaded_json)
-                
+                if not force_reload and current_mtime == PROMPT_FILE_MTIME: return
+                with open(PROMPTS_FILE, 'rb') as f: content = f.read().decode('utf-8-sig')
+                start, end = content.find('{'), content.rfind('}')
+                if start == -1 or end == -1: raise json.JSONDecodeError("Could not find a valid JSON object", content, 0)
+                PROMPTS = sanitize_loaded_json(json.loads(content[start:end+1], object_pairs_hook=OrderedDict))
                 PROMPT_FILE_MTIME = current_mtime
-                logging.info(f"Successfully sanitized and reloaded prompts from '{PROMPTS_FILE}'.")
-
-        except FileNotFoundError:
-            logging.warning(f"Prompt file not found at '{PROMPTS_FILE}'. A default will be created.")
-            pass
-        except json.JSONDecodeError as e:
-            logging.critical(f"CRITICAL: Failed to parse JSON from '{PROMPTS_FILE}'. The file is likely corrupted. Error: {e}")
-        except Exception as e:
-            logging.error(f"An unexpected error occurred while loading prompts: {e}", exc_info=True)
-
-    default_prompts = OrderedDict([("시스템 문제 해결 전문가", {"system_message": "당신은 20년 경력의 RHCA입니다...", "user_template": "질문: {user_query}"})])
+        except Exception as e: logging.error(f"Failed to load prompts: {e}", exc_info=True)
     if not os.path.exists(PROMPTS_FILE) or os.path.getsize(PROMPTS_FILE) == 0:
-        with open(PROMPTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(default_prompts, f, ensure_ascii=False, indent=4)
-    
+        with open(PROMPTS_FILE, 'w', encoding='utf-8') as f: json.dump(OrderedDict(), f)
     load_prompts(force_reload=True)
-    
-    def monitor_loop():
-        while True:
-            time.sleep(5)
-            load_prompts()
-
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
+    threading.Thread(target=lambda: [time.sleep(5) for _ in iter(int, 1) if not load_prompts()], daemon=True).start()
 
 def setup_scheduler():
     global scheduler
     jobstores = {'default': SQLAlchemyJobStore(url=f'sqlite:///{os.path.join(SCRIPT_DIR, "jobs.sqlite")}')}
     scheduler = BackgroundScheduler(jobstores=jobstores, timezone='Asia/Seoul')
-    
     logger = logging.getLogger('scheduler')
     logger.setLevel(logging.INFO)
     handler = logging.handlers.RotatingFileHandler(CONFIG["scheduler_log_file"], maxBytes=1024*1024, backupCount=5)
     logger.addHandler(handler)
-
     try:
         scheduler.start()
-        logging.info("APScheduler 시작 완료.")
-        jobs_loaded = sync_jobs_from_file()
-        logging.info(f"파일에서 {jobs_loaded}개의 스케줄 작업을 로드했습니다.")
-    except Exception as e:
-        logging.error(f"APScheduler 시작 실패: {e}", exc_info=True)
+        logging.info(f"Loaded {sync_jobs_from_file()} scheduled jobs from file.")
+    except Exception as e: logging.error(f"Failed to start APScheduler: {e}", exc_info=True)
     atexit.register(lambda: scheduler.shutdown())
 
 def run_scheduled_script(script_path):
-    """
-    Executes a shell script and logs its output.
-    This function is now compatible with older Python versions (3.6+).
-    """
     log = logging.getLogger('scheduler')
-    log.info(f"Attempting to execute script: {script_path}")
-    
     if not os.path.isfile(script_path):
-        log.error(f"Script execution failed: File not found at '{script_path}'")
+        log.error(f"Script execution failed: File not found '{script_path}'")
         return
-
     try:
-        process = subprocess.Popen(
-            ['/bin/bash', script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True, # For Python < 3.7 compatibility
-            encoding='utf-8'
-        )
-        
+        process = subprocess.Popen(['/bin/bash', script_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         stdout, stderr = process.communicate()
-        
-        log.info(f"Script '{script_path}' finished with exit code {process.returncode}.")
-        if stdout:
-            log.info(f"[stdout] for {script_path}:\n{stdout.strip()}")
-        if stderr:
-            log.warning(f"[stderr] for {script_path}:\n{stderr.strip()}")
-            
-    except Exception as e:
-        log.error(f"An exception occurred while trying to run script '{script_path}': {e}", exc_info=True)
-
+        log.info(f"Script '{script_path}' executed (Exit Code: {process.returncode}).")
+        if stdout: log.info(f"[stdout]:\n{stdout.strip()}")
+        if stderr: log.warning(f"[stderr]:\n{stderr.strip()}")
+    except Exception as e: log.error(f"Exception during script execution '{script_path}': {e}", exc_info=True)
 
 def sync_jobs_from_file():
     schedule_file = CONFIG.get("schedule_file")
     if not os.path.isfile(schedule_file): return 0
     try:
         with open(schedule_file, 'r', encoding='utf-8') as f: schedules = json.load(f)
+        current_job_ids = {job.id for job in scheduler.get_jobs()}
+        desired_job_ids = {s['script'] for s in schedules}
+        for job_id in current_job_ids - desired_job_ids: scheduler.remove_job(job_id)
+        for schedule in schedules:
+            hour, minute = schedule['time'].split(':')
+            scheduler.add_job(run_scheduled_script, 'cron', args=[schedule['script']], id=schedule['script'], hour=hour, minute=minute, replace_existing=True)
+        return len(schedules)
     except Exception: return 0
-    
-    current_job_ids = {job.id for job in scheduler.get_jobs()}
-    desired_job_ids = {s['script'] for s in schedules}
-    
-    for job_id in current_job_ids - desired_job_ids:
-        scheduler.remove_job(job_id)
-        
-    for schedule in schedules:
-        hour, minute = schedule['time'].split(':')
-        scheduler.add_job(run_scheduled_script, 'cron', args=[schedule['script']], id=schedule['script'], hour=hour, minute=minute, replace_existing=True)
-    return len(schedules)
 
 # --- 5. 웹 페이지 및 API 라우팅 ---
-@app.before_request
-def log_request_info():
-    if '/api/health' not in request.path:
-        logging.info(f"Request ===> Path: {request.path}, Method: {request.method}, From: {request.remote_addr}")
-
-@app.route('/')
-def route_index_user(): return send_from_directory(SCRIPT_DIR, 'user.html')
-@app.route('/admin')
+@app.route('/AIBox/')
+def route_index(): return send_from_directory(SCRIPT_DIR, 'upload.html')
+@app.route('/AIBox/upload.html')
+def route_upload_html(): return send_from_directory(SCRIPT_DIR, 'upload.html')
+@app.route('/AIBox/user.html')
+def route_user(): return send_from_directory(SCRIPT_DIR, 'user.html')
+@app.route('/AIBox/admin.html')
 def route_admin(): return send_from_directory(SCRIPT_DIR, 'admin.html')
-@app.route('/cve')
+@app.route('/AIBox/cve_report.html')
 def route_cve(): return send_from_directory(SCRIPT_DIR, 'cve_report.html')
-@app.route('/cron')
+@app.route('/AIBox/cron.html')
 def route_cron(): return send_from_directory(SCRIPT_DIR, 'cron.html')
-@app.route('/output/<path:filename>')
+@app.route('/AIBox/output/<path:filename>')
 def route_output(filename): return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
 
-@app.route('/api/health', methods=['GET'])
+@app.route('/AIBox/api/health', methods=['GET'])
 def api_health(): return jsonify({"status": "ok", "instance_id": SERVER_INSTANCE_ID})
-
-@app.route('/api/config', methods=['GET'])
+@app.route('/AIBox/api/config', methods=['GET'])
 def api_config(): return jsonify({"model": CONFIG.get("model", "N/A")})
+@app.route('/AIBox/api/models', methods=['GET'])
+def api_get_models():
+    models = get_available_models(CONFIG["llm_url"], CONFIG.get("token"))
+    return jsonify(models) if models else (jsonify({"error": "Could not retrieve models."}), 502)
 
-@app.route('/api/verify-password', methods=['POST'])
+@app.route('/AIBox/api/verify-password', methods=['POST'])
 def api_verify_password():
-    if request.json.get('password') == CONFIG.get("password"):
-        return jsonify({"success": True})
-    return jsonify({"success": False}), 401
+    return jsonify({"success": request.json.get('password') == CONFIG.get("password")})
 
-@app.route('/api/prompts', methods=['GET'])
-def api_get_prompts():
-    with PROMPT_LOCK:
+@app.route('/AIBox/api/prompts', methods=['GET', 'POST'])
+def api_prompts():
+    if request.method == 'POST':
+        data = request.json
+        if data.get('password') != CONFIG.get("password"): return jsonify({"error": "Unauthorized"}), 401
         try:
-            data_to_send = [
-                {"key": k, "value": f"{v.get('system_message', '')}{PROMPT_SEPARATOR}{v.get('user_template', '')}"}
-                for k, v in PROMPTS.items()
-            ]
-            json_string = json.dumps(data_to_send, ensure_ascii=False)
-            return Response(json_string, mimetype='application/json; charset=utf-8')
-        except Exception as e:
-            logging.error(f"Error while creating prompts response: {e}")
-            return jsonify({"error": "Failed to serialize prompts"}), 500
-
-@app.route('/api/update-prompts', methods=['POST'])
-def api_update_prompts():
-    data = request.json
-    if data.get('password') != CONFIG.get("password"): return jsonify({"error": "Unauthorized"}), 401
-    try:
-        prompts_to_save = OrderedDict()
-        for key, value in data.get('prompts', {}).items():
-            parts = value.split(PROMPT_SEPARATOR, 1)
-            prompts_to_save[key] = {"system_message": parts[0], "user_template": parts[1] if len(parts) > 1 else ""}
+            prompts = OrderedDict([(item['key'], {"system_message": item['value'].split(PROMPT_SEPARATOR, 1)[0], "user_template": item['value'].split(PROMPT_SEPARATOR, 1)[1] if PROMPT_SEPARATOR in item['value'] else ""}) for item in data.get('prompts', [])])
+            with PROMPT_LOCK:
+                with open(PROMPTS_FILE, 'w', encoding='utf-8') as f: json.dump(prompts, f, ensure_ascii=False, indent=4)
+            return jsonify({"success": True})
+        except Exception as e: return jsonify({"error": str(e)}), 500
+    else: # GET
         with PROMPT_LOCK:
-            with open(PROMPTS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(prompts_to_save, f, ensure_ascii=False, indent=4)
-        return jsonify({"success": True})
-    except Exception as e:
-        logging.error(f"Error while updating prompts: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+            prompts = [{"key": k, "value": f"{v.get('system_message', '')}{PROMPT_SEPARATOR}{v.get('user_template', '')}"} for k, v in PROMPTS.items()]
+            return Response(json.dumps(prompts, ensure_ascii=False), mimetype='application/json; charset=utf-8')
 
-@app.route('/api/analyze', methods=['POST'])
+@app.route('/AIBox/api/analyze', methods=['POST'])
 def api_analyze():
     data = request.json
-    prompt_key, user_query = data.get('prompt_key'), data.get('user_query')
-    with PROMPT_LOCK:
-        prompt_config = PROMPTS.get(prompt_key, {})
-    
-    system_msg = prompt_config.get('system_message', '').replace('{user_query}', user_query)
-    user_msg = prompt_config.get('user_template', '{user_query}').replace('{user_query}', user_query)
-    
+    with PROMPT_LOCK: prompt_config = PROMPTS.get(data.get('prompt_key'), {})
+    system_msg = prompt_config.get('system_message', '').replace('{user_query}', data.get('user_query'))
+    user_msg = prompt_config.get('user_template', '{user_query}').replace('{user_query}', data.get('user_query'))
     return Response(call_llm_stream(system_msg, user_msg), mimetype='text/plain; charset=utf-8')
 
-@app.route('/api/learn', methods=['POST'])
-def api_learn():
-    data = request.json
+@app.route('/AIBox/api/cve/analyze', methods=['POST'])
+def api_cve_analyze_for_script():
     try:
-        current_data = []
-        if os.path.exists(LEARNING_DATA_FILE):
-            with open(LEARNING_DATA_FILE, 'r', encoding='utf-8') as f: current_data = json.load(f)
-        current_data.append(data)
-        with open(LEARNING_DATA_FILE, 'w', encoding='utf-8') as f: json.dump(current_data, f, ensure_ascii=False, indent=4)
-        return jsonify({"success": True})
+        cve_data = request.json
+        prompt = f"[CVE Data]\n{json.dumps(cve_data, indent=2, ensure_ascii=False)}\n\n[Task]\nAnalyze and return JSON with keys: 'threat_tags', 'affected_components', 'concise_summary', 'selection_reason'."
+        response_str = call_llm_blocking("You are an RHEL security analyst. Return only a single, valid JSON object.", prompt)
+        return jsonify(_parse_llm_json_response(response_str))
     except Exception as e:
+        logging.error(f"CVE analysis error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/cve/analyze', methods=['POST'])
-def api_cve_analyze_for_script():
-    cve_data = request.json
-    prompt = f"[CVE Data]\n{json.dumps(cve_data, indent=2, ensure_ascii=False)}\n\n[Task]\nAnalyze and return JSON with keys: 'threat_tags', 'affected_components', 'concise_summary', 'selection_reason'."
-    system_prompt = "You are an RHEL security analyst. Return only a single, valid JSON object."
-    response_str = call_llm_blocking(system_prompt, prompt)
-    try:
-        match = re.search(r'\{.*\}', response_str, re.DOTALL)
-        if match:
-            return jsonify(json.loads(match.group(0)))
-        else:
-            raise ValueError("No JSON object found in LLM response")
-    except (json.JSONDecodeError, AttributeError, ValueError) as e:
-        logging.error(f"Failed to parse LLM JSON response for CVE analyze: {e}\nResponse was: {response_str}")
-        return jsonify({"error": "LLM response parsing failed"}), 500
-
-@app.route('/api/cve/executive_summary', methods=['POST'])
+@app.route('/AIBox/api/cve/executive_summary', methods=['POST'])
 def api_cve_summary_for_script():
-    top_cves = request.json.get('top_cves', [])
-    prompt = f"[Vulnerabilities]\n{json.dumps(top_cves, indent=2, ensure_ascii=False)}\n\n[Task]\nWrite a professional Executive Summary in Korean."
+    prompt = f"[Vulnerabilities]\n{json.dumps(request.json.get('top_cves', []), indent=2, ensure_ascii=False)}\n\n[Task]\nWrite a professional Executive Summary in Korean."
     summary = call_llm_blocking("You are a cybersecurity expert.", prompt)
     return Response(summary.replace("\n", "<br>") if summary else "", mimetype='text/html')
 
-# [수정] 404 오류의 근본적 해결을 위해 API 통신 방식을 POST로 변경
-@app.route('/api/cve/report', methods=['POST'])
+@app.route('/AIBox/api/cve/report', methods=['POST'])
 def api_cve_report_for_html():
-    """
-    Handles CVE report generation.
-    Receives CVE ID in the JSON body of a POST request.
-    This method is more robust than using dynamic URL paths.
-    """
-    data = request.get_json()
-    if not data or 'cve_id' not in data:
-        return jsonify({"error": "cve_id must be provided in the request body"}), 400
-    
-    cve_id = data['cve_id']
-    logging.info(f"Received report request for CVE: {cve_id}")
-
+    cve_id = request.json.get('cve_id')
     rh_data = {}
     response = make_request_generic('get', f"https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json")
     if response: rh_data = response.json()
-    
-    prompt = f"Generate a comprehensive security report for {cve_id}.\n[Baseline Data]\n{json.dumps(rh_data, indent=2) if rh_data else 'N/A'}\n\n[Instructions]\nAnalyze, web search for recent info/PoCs, and generate a Korean Markdown report with sections: '### 1. 위협 개요', '### 2. 주요 위협 및 영향도', '### 3. 권고 조치 및 완화 방안'."
+    prompt = f"Generate a comprehensive Korean Markdown security report for {cve_id} based on this data and web search for recent info/PoCs.\n[Data]\n{json.dumps(rh_data, indent=2)}"
     summary = call_llm_blocking("You are an elite cybersecurity analyst.", prompt)
-    
-    # 병합 후 반환
     final_data = rh_data.copy()
     final_data["comprehensive_summary"] = summary
     return jsonify(final_data)
 
+@app.route('/AIBox/api/schedules', methods=['GET', 'POST'])
+def api_schedules():
+    schedule_file = CONFIG.get("schedule_file")
+    if request.method == 'POST':
+        data = request.json
+        if data.get('password') != CONFIG.get("password"): return jsonify({"error": "Unauthorized"}), 401
+        with open(schedule_file, 'w', encoding='utf-8') as f: json.dump(data.get('schedules', []), f, indent=4)
+        sync_jobs_from_file()
+        return jsonify({"success": True})
+    else: # GET
+        if not os.path.isfile(schedule_file): return jsonify([])
+        with open(schedule_file, 'r', encoding='utf-8') as f: return jsonify(json.load(f))
 
-@app.route('/api/upload', methods=['POST'])
+@app.route('/AIBox/api/schedules/execute', methods=['POST'])
+def api_execute_schedule():
+    data = request.json
+    if data.get('password') != CONFIG.get("password"): return jsonify({"error": "Unauthorized"}), 401
+    threading.Thread(target=run_scheduled_script, args=(data.get('script'),)).start()
+    return jsonify({"success": True, "message": f"Execution started for {data.get('script')}"})
+
+@app.route('/AIBox/api/logs/scheduler', methods=['GET', 'DELETE'])
+def api_scheduler_logs():
+    log_file = CONFIG.get("scheduler_log_file")
+    if request.method == 'DELETE':
+        if not request.json or request.json.get('password') != CONFIG.get("password"): return jsonify({"error": "Unauthorized"}), 401
+        if os.path.isfile(log_file): open(log_file, 'w').close()
+        return jsonify({"success": True})
+    else: # GET
+        if not os.path.isfile(log_file): return jsonify([])
+        with open(log_file, 'r', encoding='utf-8') as f: return jsonify(f.readlines()[-100:])
+
+@app.route('/AIBox/api/upload', methods=['POST'])
 def api_upload():
     file = request.files.get('sosreportFile')
     if not file: return jsonify({"error": "No file part."}), 400
     filename = secure_filename(file.filename)
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
-    analysis_id = filename.replace('.tar.xz', '')
-    command = ["python3", SOS_ANALYZER_SCRIPT, "--llm-url", CONFIG["llm_url"], "--model", CONFIG["model"], file_path]
-    if CONFIG.get("token"): command.extend(["--api-token", CONFIG["token"]])
-    subprocess.Popen(command)
+    
+    base_name = filename
+    for ext in ['.tar.gz', '.tgz', '.tar.xz', '.txz', '.tar.bz2', '.tbz2']:
+        if base_name.endswith(ext):
+            base_name = base_name[:-len(ext)]
+            break
+    
+    analysis_id = base_name
+
+    thread = threading.Thread(target=run_analysis_in_background, args=(file_path, analysis_id))
+    thread.daemon = True
+    thread.start()
+
     return jsonify({"message": "Analysis started.", "analysis_id": analysis_id})
 
-@app.route('/api/status/<analysis_id>', methods=['GET'])
+@app.route('/AIBox/api/status/<analysis_id>', methods=['GET'])
 def api_status(analysis_id):
-    if os.path.exists(os.path.join(app.config['OUTPUT_FOLDER'], f"{analysis_id}_report.html")):
-        return jsonify({"status": "complete"})
-    return jsonify({"status": "running"})
+    with ANALYSIS_LOCK:
+        status_data = ANALYSIS_STATUS.get(analysis_id)
+    
+    if status_data:
+        return jsonify(copy.deepcopy(status_data))
+    else:
+        report_path = os.path.join(app.config['OUTPUT_FOLDER'], f"analysis-report-{secure_filename(analysis_id)}.html")
+        if os.path.exists(report_path):
+            return jsonify({"status": "complete", "report_file": f"analysis-report-{secure_filename(analysis_id)}.html"})
+        return jsonify({"status": "not_found"}), 404
 
-@app.route('/api/reports', methods=['GET'])
-def api_list_reports():
-    files = [f for f in os.listdir(OUTPUT_FOLDER) if f.endswith('_report.html')]
-    return jsonify(sorted(files, key=lambda f: os.path.getmtime(os.path.join(OUTPUT_FOLDER, f)), reverse=True))
-
-@app.route('/api/schedules', methods=['GET'])
-def api_get_schedules():
-    schedule_file = CONFIG.get("schedule_file")
-    if not os.path.isfile(schedule_file): return jsonify([])
-    with open(schedule_file, 'r', encoding='utf-8') as f: return jsonify(json.load(f))
-
-@app.route('/api/schedules', methods=['POST'])
-def api_update_schedules():
-    data = request.json
-    if data.get('password') != CONFIG.get("password"): return jsonify({"error": "Unauthorized"}), 401
-    with open(CONFIG.get("schedule_file"), 'w', encoding='utf-8') as f: json.dump(data.get('schedules', []), f, indent=4)
-    sync_jobs_from_file()
-    return jsonify({"success": True})
-
-@app.route('/api/schedules/execute', methods=['POST'])
-def api_execute_schedule():
-    data = request.json
-    if data.get('password') != CONFIG.get("password"): return jsonify({"error": "Unauthorized"}), 401
-    script_path = data.get('script')
-    threading.Thread(target=run_scheduled_script, args=(script_path,)).start()
-    return jsonify({"success": True, "message": f"Execution started for {script_path}"})
-
-@app.route('/api/logs/scheduler', methods=['GET', 'DELETE'])
-def api_scheduler_logs():
-    """
-    Handles scheduler logs:
-    - GET: Returns the last 100 lines of the log.
-    - DELETE: Clears the entire log file.
-    """
-    log_file = CONFIG.get("scheduler_log_file")
-
+@app.route('/AIBox/api/reports', methods=['GET', 'DELETE'])
+def api_reports():
     if request.method == 'DELETE':
-        if not request.json or request.json.get('password') != CONFIG.get("password"):
-            return jsonify({"error": "Unauthorized"}), 401
+        filename = request.args.get('file')
+        if not filename: return jsonify({"error": "File parameter is missing"}), 400
+        file_path = os.path.join(app.config['OUTPUT_FOLDER'], secure_filename(filename))
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            return jsonify({"success": True})
+        return jsonify({"error": "File not found"}), 404
+    else: # GET
+        try:
+            reports = sorted([
+                {"name": f, "mtime": os.path.getmtime(os.path.join(OUTPUT_FOLDER, f))}
+                for f in os.listdir(OUTPUT_FOLDER)
+                if f.startswith('analysis-report-') and f.endswith('.html')
+            ], key=lambda r: r['mtime'], reverse=True)
+            return jsonify(reports)
+        except Exception:
+            return jsonify({"error": "리포트 목록을 가져오는 데 실패했습니다."}), 500
+
+@app.route('/AIBox/api/reports/all', methods=['DELETE'])
+def api_delete_all_reports():
+    try:
+        count = sum(1 for f in os.listdir(app.config['OUTPUT_FOLDER']) if f.startswith('analysis-report-') and f.endswith('.html') and os.remove(os.path.join(app.config['OUTPUT_FOLDER'], f)) is None)
+        logging.info(f"Deleted {count} report(s).")
+        return jsonify({"success": True, "message": f"{count} reports deleted."})
+    except Exception as e:
+        logging.error(f"Error deleting all reports: {e}", exc_info=True)
+        return jsonify({"error": "Failed to delete all reports."}), 500
+
+@app.route('/AIBox/api/sos/analyze_system', methods=['POST'])
+def api_sos_analyze_system():
+    try:
+        data_str = json.dumps(request.json, indent=2, ensure_ascii=False, default=str)
+        prompt = f"""You are a top-tier expert in troubleshooting Red Hat Enterprise Linux systems. Based on the detailed data extracted from this sosreport, provide an expert-level diagnosis and solution in Korean.
+
+## Analysis Data
+```json
+{data_str}
+```
+
+## Required JSON Output
+Please provide your analysis in a single, valid JSON object with the following structure. Do NOT add any text outside the JSON block.
+{{
+  "analysis_summary": "A 3-4 sentence comprehensive summary of the system's overall status.",
+  "key_issues": [
+    {{
+      "issue": "The core problem discovered (e.g., 'High memory usage by httpd process').",
+      "cause": "A technical analysis of the root cause of the issue.",
+      "solution": "Specific, actionable solutions or commands to resolve the issue."
+    }}
+  ]
+}}
+"""
+        response_str = call_llm_blocking("You are a helpful assistant designed to output only a single valid JSON object.", prompt)
         
         try:
-            if os.path.isfile(log_file):
-                with open(log_file, 'w') as f:
-                    f.truncate(0)
-                logging.info(f"Scheduler log file '{log_file}' was cleared by user request.")
-            return jsonify({"success": True, "message": "Logs cleared successfully."})
-        except Exception as e:
-            logging.error(f"Failed to clear log file '{log_file}': {e}", exc_info=True)
-            return jsonify({"error": "Failed to clear logs"}), 500
+            response_json = json.loads(response_str)
+            if 'error' in response_json:
+                logging.error(f"LLM analysis failed: {response_json.get('details', 'Unknown error')}")
+                return jsonify({"error": "Failed to get analysis from LLM", "details": response_json.get('details')}), 502
+        except json.JSONDecodeError:
+            pass
 
-    if not os.path.isfile(log_file):
-        return jsonify([])
-    try:
-        with open(log_file, 'r', encoding='utf-8') as f:
-            return jsonify(f.readlines()[-100:])
+        return jsonify(_parse_llm_json_response(response_str))
+        
     except Exception as e:
-        logging.error(f"Could not read scheduler log file '{log_file}': {e}")
-        return jsonify({"error": "Could not read log file"}), 500
+        logging.error(f"/api/sos/analyze_system error: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
-
-# --- 7. 서버 실행 ---
+# --- 6. 서버 실행 ---
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="Unified AI Server",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument('--llm-url', help='Full URL for LLM server API (e.g., http://host/api/chat or http://host/v1)')
-    parser.add_argument('--model', help='LLM model name (required unless --list-models is used)')
-    parser.add_argument('--list-models', action='store_true', help='List available models from the LLM server and exit')
-    
-    parser.add_argument('--token', default=None, help='API token for the LLM server, if required')
+    parser = argparse.ArgumentParser(description="Unified AI Server", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('--llm-url', required=True, help='Full URL for LLM server API')
+    parser.add_argument('--model', help='LLM model name')
+    parser.add_argument('--list-models', action='store_true', help='List available models and exit')
+    parser.add_argument('--token', default=os.getenv('LLM_API_TOKEN'), help='API token for LLM server')
     parser.add_argument('--password', default='s-core', help='Password for admin functions')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind the server to')
     parser.add_argument('--port', type=int, default=5000, help='Port to run the server on')
-    parser.add_argument('--schedule-file', default='./schedule.json', help='Path to the schedule JSON file')
-    parser.add_argument('--scheduler-log-file', default='./scheduler.log', help='Path to the scheduler log file')
+    parser.add_argument('--schedule-file', default='./schedule.json', help='Path to schedule JSON file')
+    parser.add_argument('--scheduler-log-file', default='./scheduler.log', help='Path to scheduler log file')
     args = parser.parse_args()
 
+    def list_available_models(llm_url, token):
+        print(f"Fetching models from {llm_url}...")
+        models = get_available_models(llm_url, token)
+        if models:
+            print("Available models:")
+            for model in models:
+                print(f"- {model}")
+        else:
+            print("Could not retrieve models.")
+
     if args.list_models:
-        if not args.llm_url:
-            print("[ERROR] The --llm-url argument is required to list models.", file=sys.stderr)
-            sys.exit(1)
         list_available_models(args.llm_url, args.token)
         sys.exit(0)
 
-    if not args.llm_url or not args.model:
-        parser.error("The --llm-url and --model arguments are required to start the server.")
-
     CONFIG.update(vars(args))
     
-    original_llm_url = CONFIG['llm_url']
-    resolved_llm_url = resolve_chat_endpoint(original_llm_url, CONFIG.get('token'))
-    
-    if resolved_llm_url:
-        CONFIG['llm_url'] = resolved_llm_url
-    else:
-        logging.warning(f"Could not automatically determine API type for '{original_llm_url}'. Using the URL as is. If you see connection errors, please provide the full chat completions endpoint (e.g., http://host:port/v1/chat/completions).")
+    resolved_llm_url = resolve_chat_endpoint(CONFIG['llm_url'], CONFIG.get('token'))
+    if resolved_llm_url: CONFIG['llm_url'] = resolved_llm_url
+    else: logging.warning(f"Could not automatically determine API type for '{CONFIG['llm_url']}'.")
+
+    if not args.model:
+        models = get_available_models(CONFIG['llm_url'], CONFIG.get('token'))
+        if models: CONFIG['model'] = models[0]
+        else: parser.error("--model is required as no models could be auto-detected.")
 
     CONFIG["schedule_file"] = os.path.abspath(args.schedule_file)
     CONFIG["scheduler_log_file"] = os.path.abspath(args.scheduler_log_file)
@@ -630,6 +602,5 @@ if __name__ == '__main__':
     setup_scheduler()
 
     logging.info(f"--- Unified AI Server starting on http://{args.host}:{args.port} ---")
-    logging.info(f"Using LLM model '{args.model}' via endpoint '{CONFIG['llm_url']}'")
-    serve(app, host=args.host, port=args.port)
+    serve(app, host=args.host, port=args.port, threads=16)
 
