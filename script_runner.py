@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 # 로그 디렉토리 설정
-LOG_DIR = "/data/iso/AIBox/logs"
+LOG_DIR = "/data/iso/AIBox/log"
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # 로깅 설정
