@@ -186,7 +186,11 @@
                 <div id="result-output"></div>
                 <div class="button-group" style="justify-content: flex-end;">
                      <button id="save-html-btn" class="button secondary">HTML로 저장</button>
-                     <button id="feedback-btn" class="button success">피드백 제공</button>
+                     <!--
+                        [기능 비활성화] /api/learn 엔드포인트가 현재 서버에 구현되어 있지 않으므로,
+                        404 오류를 방지하기 위해 피드백 버튼을 주석 처리합니다.
+                     -->
+                     <button id="feedback-btn" class="button success" style="display: none;">피드백 제공</button>
                 </div>
             </div>
         </div>
@@ -537,19 +541,22 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function savePrompts() {
-        const updatedPromptsData = {};
-        prompts.forEach(p => {
+        const updatedPrompts = [];
+        prompts.forEach((p, index) => {
             const textarea = document.getElementById(`edit-${p.key}`);
             if(textarea) {
-                updatedPromptsData[p.key] = textarea.value;
+                updatedPrompts.push({
+                    key: p.key,
+                    value: textarea.value
+                });
             }
         });
         
         try {
-            const response = await fetch(`${API_BASE_URL}/update-prompts`, {
+            const response = await fetch(`${API_BASE_URL}/prompts`, { // Corrected API endpoint
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ password: currentPassword, prompts: updatedPromptsData })
+                body: JSON.stringify({ password: currentPassword, prompts: updatedPrompts }) // Corrected data structure
             });
 
             if (response.ok) {
@@ -609,11 +616,12 @@ document.addEventListener('DOMContentLoaded', () => {
     clearBtn.addEventListener('click', () => { questionInput.value = ''; resultContainer.style.display = 'none'; });
     
     editPromptsBtn.addEventListener('click', openPromptModal);
-
     closePromptModalBtn.addEventListener('click', () => promptModal.style.display = 'none');
+    /*
     feedbackBtn.addEventListener('click', openFeedbackModal);
     closeFeedbackModalBtn.addEventListener('click', () => feedbackModal.style.display = 'none');
     submitFeedbackBtn.addEventListener('click', submitFeedback);
+    */
     saveHtmlBtn.addEventListener('click', saveAsHtml);
     window.addEventListener('click', (e) => {
         if (e.target === promptModal) promptModal.style.display = 'none';
@@ -632,4 +640,3 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 </body>
 </html>
-

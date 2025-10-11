@@ -61,9 +61,14 @@ def get_html_template(data):
 
     def render_graph(graph_key, title, graphs_data):
         graph_data = graphs_data.get(graph_key)
+        # [요청 반영] disk_detail 데이터가 있을 때만 팝업을 활성화합니다.
+        has_disk_detail = data.get('sar_data', {}).get('disk_detail')
         if isinstance(graph_data, str) and graph_data:
+            # [요청 반영] Disk I/O 그래프에 팝업을 여는 onclick 이벤트 추가
+            if graph_key == 'disk' and has_disk_detail:
+                return f'<div class="graph-container interactive" onclick="openDiskDetailPopup()"><h3>{title}</h3><img src="data:image/png;base64,{graph_data}" alt="{title} Graph"><div class="graph-overlay">상세 정보 보기</div></div>'
             return f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graph_data}" alt="{title} Graph"></div>'
-        return f'<div class="graph-container"><h3>{title}</h3><p class="no-data-message">그래프 데이터 없음</p></div>'
+        return f'<div class="graph-container"><h3 class="no-data-message">{title}</h3><p class="no-data-message">그래프 데이터 없음</p></div>'
 
     def create_ip4_details_rows(interfaces):
         if not interfaces: return "<tr><td colspan='4' style='text-align:center;'>데이터 없음</td></tr>"
@@ -156,6 +161,9 @@ def get_html_template(data):
             .graph-container h3 {{ text-align: center; border: none; }}
             .graph-container img {{ width: 100%; display: block; }}
             .no-data-message {{ text-align: center; color: #888; padding: 2rem; }}
+            .graph-container.interactive {{ cursor: pointer; position: relative; }}
+            .graph-container.interactive:hover .graph-overlay {{ opacity: 1; }}
+            .graph-overlay {{ position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); color: white; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; font-weight: bold; opacity: 0; transition: opacity 0.3s; }}
             .progress-bar-container {{ height: 12px; width: 100%; background-color: var(--light-gray); border-radius: 6px; overflow:hidden;}}
             .progress-bar {{ height: 100%; border-radius: 6px; }}
             .priority-badge {{ padding: 0.25em 0.6em; border-radius: 5px; font-size: 0.85em; color: white; font-weight: 600; }}
@@ -213,7 +221,7 @@ def get_html_template(data):
                     {render_graph('load', 'System Load Average', graphs)}
                     {render_graph('disk', 'Disk I/O', graphs)}
                     {render_graph('swap', 'Swap Usage (%)', graphs)}
-                    {''.join(render_graph(iface, f'Network Traffic ({iface})', graphs.get('network', {})) for iface in graphs.get('network', {}))}
+                    {''.join(render_graph(iface, f"Network Traffic ({iface})", {iface: graph_data}) for iface, graph_data in graphs.get('network', {}).items())}
                 </div>
             </div>
 
@@ -292,7 +300,12 @@ def get_html_template(data):
 
         </div>
         <footer>AI System Analyzer &bull; Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</footer>
+        <script>
+            function openDiskDetailPopup() {{
+                const hostname = "{h(data.get('hostname', ''))}";
+                window.open(`sar_gui_disk-${{hostname}}.html`, 'DiskIODetail', 'width=1200,height=800,scrollbars=yes,resizable=yes');
+            }}
+        </script>
     </body>
     </html>
     """
-

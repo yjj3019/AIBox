@@ -104,6 +104,7 @@ class SosreportParser:
         self.base_path = subdirs[0]
         self.report_date = datetime.datetime.now()
         self.cpu_cores_count = 0
+        self.device_map = self._create_device_map() # [개선] 장치명 매핑 정보 생성
         self.dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
         self._initialize_report_date()
         self._initialize_cpu_cores()
@@ -130,6 +131,31 @@ class SosreportParser:
         lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu'])
         if match := re.search(r'^CPU\(s\):\s+(\d+)', lscpu_output, re.MULTILINE): self.cpu_cores_count = int(match.group(1))
 
+    def _create_device_map(self) -> Dict[str, str]:
+        """
+        [신규] proc/partitions와 dmsetup 정보를 결합하여 (major, minor) -> device_name 매핑을 생성합니다.
+        """
+        device_map = {}
+        # 1. /proc/partitions 파싱
+        partitions_content = self._read_file(['proc/partitions'])
+        for line in partitions_content.split('\n')[2:]:
+            parts = line.split()
+            if len(parts) == 4:
+                major, minor, name = parts[0], parts[1], parts[3]
+                device_map[f"{major}:{minor}"] = name
+
+        # 2. dmsetup 정보 파싱
+        dmsetup_content = self._read_file(['sos_commands/devicemapper/dmsetup_info_-c'])
+        for line in dmsetup_content.split('\n')[1:]:
+            parts = line.split()
+            if len(parts) >= 3:
+                name, major, minor = parts[0], parts[1], parts[2]
+                # dmsetup 출력의 major/minor는 ':'로 구분되어 있을 수 있음
+                major = major.replace(':', '')
+                device_map[f"{major}:{minor}"] = name
+
+        return device_map
+
     def _safe_float(self, value: str) -> float:
         try: return float(value.replace(',', '.'))
         except (ValueError, TypeError): return 0.0
@@ -141,7 +167,16 @@ class SosreportParser:
         uptime_content = self._read_file(['uptime', 'sos_commands/general/uptime']); uptime_str = "N/A"
         if uptime_match := re.search(r'up\s+(.*?),\s*\d+\s+user', uptime_content): uptime_str = uptime_match.group(1).strip()
         uname_content = self._read_file(['uname', 'sos_commands/kernel/uname_-a']); kernel_str = uname_content.split()[2] if len(uname_content.split()) >= 3 else uname_content
-        return { 'hostname': self._read_file(['hostname']), 'os_release': self._read_file(['etc/redhat-release']), 'kernel': kernel_str, 'system_model': model_match.group(1).strip() if model_match else 'N/A', 'cpu': cpu_str, 'memory': f"{int(mem_total_match.group(1)) / 1024 / 1024:.1f} GiB" if mem_total_match else "N/A", 'uptime': uptime_str, 'last_boot': self._read_file(['sos_commands/boot/who_-b']).replace('system boot', '').strip() }
+        
+        # [개선] xsos를 참고하여 'uptime -s'를 사용하여 부팅 시간을 더 정확하게 파싱합니다.
+        uptime_s_content = self._read_file(['sos_commands/general/uptime_-s'])
+        last_boot_str = "N/A"
+        if uptime_s_content != 'N/A':
+            last_boot_str = uptime_s_content.strip()
+        else: # 폴백: 기존 방식 사용
+            last_boot_str = self._read_file(['sos_commands/boot/who_-b']).replace('system boot', '').strip()
+            
+        return { 'hostname': self._read_file(['hostname']), 'os_release': self._read_file(['etc/redhat-release']), 'kernel': kernel_str, 'system_model': model_match.group(1).strip() if model_match else 'N/A', 'cpu': cpu_str, 'memory': f"{int(mem_total_match.group(1)) / 1024 / 1024:.1f} GiB" if mem_total_match else "N/A", 'uptime': uptime_str, 'last_boot': last_boot_str }
 
     def _parse_storage(self) -> List[Dict[str, Any]]:
         df_output = self._read_file(['df', 'sos_commands/filesys/df_-alPh']); storage_list = []
@@ -246,12 +281,13 @@ class SosreportParser:
         if content == 'N/A' or not content.strip(): return {}
         data: Dict[str, List[Dict]] = {}; header_map, current_section = {}, None
         section_keys = {
+            'disk_detail': {'avgrq-sz', 'avgqu-sz', 'await', 'svctm', '%util'},
             'cpu': {'%user', '%usr', '%system', '%iowait', '%idle'},
             'memory': {'kbmemfree', 'kbmemused', '%memused'},
-            'disk': {'tps', 'rtps', 'wtps', 'rkB/s', 'wkB/s'},
+            'disk': {'tps', 'rtps', 'wtps', 'rkB/s', 'wkB/s', 'rd_sec/s', 'wr_sec/s', 'bread/s', 'bwrtn/s'},
             'load': {'runq-sz', 'ldavg-1', 'ldavg-5'},
             'swap': {'kbswpfree', 'kbswpused', '%swpused'},
-            'network': {'IFACE', 'rxpck/s', 'txpck/s'}
+            'network': {'IFACE', 'rxpck/s', 'txpck/s', 'rxkB/s', 'txkB/s'}
         }
         for line in content.strip().replace('\r\n', '\n').split('\n'):
             line = line.strip()
@@ -260,25 +296,58 @@ class SosreportParser:
             if is_header:
                 parts = re.split(r'\s+', line); metric_start_idx = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
                 header_cols_raw = parts[metric_start_idx:]
-                header_cols = [p.replace('%', 'pct_').replace('/', '_s').replace('%usr', 'pct_user') for p in header_cols_raw]
+                header_cols = [p.replace('%', 'pct_').replace('/', '_').replace('%usr', 'pct_user') for p in header_cols_raw]
                 header_map = {col: i for i, col in enumerate(header_cols)}
-                current_section = None
-                for sec, keys in section_keys.items():
-                    if any(key in header_cols_raw for key in keys):
-                        current_section = sec
-                        break
-                if current_section:
-                    logging.info(f"SAR 데이터 파싱: '{current_section}' 섹션 식별됨 (헤더: {header_cols_raw})")
+                current_section = None # 섹션 재탐색을 위해 초기화
+                
+                # [BUG FIX] `sar -d`와 `sar -b`를 명확히 구분합니다.
+                # `sar -d`는 'DEV'와 '%util' 또는 'avgqu-sz'를 포함합니다.
+                # `sar -b`는 'bread/s' 또는 'bwrtn/s'를 포함하지만 'DEV'는 없습니다.
+                is_disk_detail = 'DEV' in header_cols_raw and ('%util' in header_cols_raw or 'avgqu-sz' in header_cols_raw)
+                is_disk_io = ('bread/s' in header_cols_raw or 'bwrtn/s' in header_cols_raw) and 'DEV' not in header_cols_raw
+
+                if is_disk_detail:
+                    current_section = 'disk_detail'
+                elif is_disk_io:
+                    current_section = 'disk'
+                else:
+                    for sec, keys in section_keys.items():
+                        if sec not in ['disk', 'disk_detail'] and any(key in header_cols_raw for key in keys):
+                            current_section = sec; break
                 continue
-            if current_section and header_map:
-                parts = re.split(r'\s+', line); ts_end_idx = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
-                timestamp = " ".join(parts[:ts_end_idx]); values = parts[ts_end_idx:]; entry = {'timestamp': timestamp}
+            if current_section and header_map and (parts := re.split(r'\s+', line)) and re.match(r'^\d{2}:\d{2}:\d{2}', parts[0]):
+                ts_end_idx = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
+                ts_str = " ".join(parts[:ts_end_idx])
+                
+                # [핵심 개선] 파싱 단계에서 timestamp를 완전한 datetime 객체로 변환 후 ISO 형식 문자열로 저장합니다.
+                try:
+                    format_str = '%I:%M:%S %p' if 'M' in ts_str else '%H:%M:%S'
+                    dt_obj = datetime.datetime.strptime(ts_str, format_str)
+                    full_dt = self.report_date.replace(hour=dt_obj.hour, minute=dt_obj.minute, second=dt_obj.second)
+                    timestamp_iso = full_dt.isoformat()
+                except ValueError:
+                    continue # 시간 파싱 실패 시 해당 라인 건너뛰기
+
+                values = parts[ts_end_idx:]
+                entry = {'timestamp': timestamp_iso}
                 for h, i in header_map.items():
-                    if i < len(values): entry[h] = self._safe_float(values[i]) if h not in ['IFACE', 'DEV', 'CPU'] else values[i]
+                    if i < len(values):
+                        entry[h] = self._safe_float(values[i]) if h not in ['IFACE', 'DEV', 'CPU'] else values[i]
+                
+                # [개선] DEV 컬럼이 있으면 실제 장치명으로 변환
+                if 'DEV' in entry and entry['DEV'].startswith('dev'):
+                    major, minor = entry['DEV'][3:].split('-') # type: ignore
+                    device_name = self.device_map.get(f"{major}:{minor}")
+                    if device_name:
+                        entry['device_name'] = device_name
+
                 if current_section == 'cpu' and entry.get('CPU') != 'all': continue
                 if current_section == 'network' and entry.get('IFACE') == 'lo': continue
                 data.setdefault(current_section, []).append(entry)
-        logging.info(f"SAR 데이터 파싱 완료. 추출된 섹션: {list(data.keys())}")
+        
+        # [개선] 파싱된 데이터 개수를 요약하여 출력
+        summary = ", ".join([f"{key}: {len(value)}" for key, value in data.items()])
+        logging.info(f"SAR 데이터 파싱 완료. [{summary}]")
         return data
 
     def _find_sar_data_around_time(self, sar_section_data: List[Dict], target_dt: datetime.datetime, window_minutes: int = 2) -> Optional[Dict]:
@@ -395,8 +464,20 @@ class AIAnalyzer:
             logging.info(f"AI 분석 서버로 요청 전송: {self.api_url}")
             response = self.session.post(self.api_url, json=payload, timeout=300)
             response.raise_for_status()
-            
-            analysis_result = response.json()
+
+            # [개선] 서버 응답이 JSON이 아닐 경우를 대비한 예외 처리 강화
+            try:
+                analysis_result = response.json()
+            except json.JSONDecodeError:
+                logging.error("서버로부터 유효한 JSON 응답을 받지 못했습니다. HTML 오류 페이지일 수 있습니다.")
+                logging.error(f"서버 응답 내용 (첫 500자): {response.text[:500]}")
+                # JSON 파싱 실패 시, 오류를 포함한 기본 구조를 반환하여 프로그램 중단을 방지합니다.
+                return {
+                    "summary": "AI 분석 서버로부터 유효한 응답을 받지 못했습니다.",
+                    "critical_issues": ["서버가 JSON이 아닌 응답을 반환했습니다. 서버 로그를 확인하세요."],
+                    "warnings": [], "recommendations": []
+                }
+
             logging.info(Color.success("서버로부터 AI 분석 결과 수신 완료."))
             return analysis_result
 
@@ -484,9 +565,10 @@ class AIAnalyzer:
 
 
 class HTMLReportGenerator:
-    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str):
+    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str, report_date: datetime.datetime):
         self.metadata, self.sar_data, self.ai_analysis, self.hostname = metadata, sar_data, ai_analysis, hostname
         self._setup_korean_font()
+        self.report_date = report_date # [BUG FIX] report_date 속성을 초기화합니다.
 
     def _setup_korean_font(self):
         if not IS_GRAPHING_ENABLED: return
@@ -502,45 +584,154 @@ class HTMLReportGenerator:
 
     def _generate_graphs(self) -> Dict[str, Any]:
         if not IS_GRAPHING_ENABLED: return {}
+        log_step("그래프 생성 시작")
         graphs, sar = {}, self.sar_data
+        
+        logging.info("  - 그래프 생성 중: CPU Usage")
         graphs['cpu'] = self._create_plot(sar.get('cpu'), 'CPU Usage (%)', {'pct_user': 'User', 'pct_system': 'System', 'pct_iowait': 'I/O Wait'}, True)
+        logging.info("  - 그래프 생성 중: Memory Usage")
         graphs['memory'] = self._create_plot(sar.get('memory'), 'Memory Usage (KB)', {'kbmemused': 'Used', 'kbcached': 'Cached'})
+        logging.info("  - 그래프 생성 중: System Load Average")
         graphs['load'] = self._create_plot(sar.get('load'), 'System Load Average', {'ldavg-1': '1-min', 'ldavg-5': '5-min', 'ldavg-15': '15-min'})
+
+        # [요청 반영] Disk I/O 그래프 생성 로직 수정
+        if sar.get('disk'):
+            logging.info("  - 그래프 생성 중: Disk I/O")
+
         disk_data = sar.get('disk')
         if disk_data and disk_data[0]:
-            if 'bread_s' in disk_data[0]: graphs['disk'] = self._create_plot(disk_data, 'Disk I/O (blocks/s)', {'bread_s': 'Read', 'bwrtn_s': 'Write'})
-            elif 'rkB_s' in disk_data[0]: graphs['disk'] = self._create_plot(disk_data, 'Disk I/O (kB/s)', {'rkB_s': 'Read', 'wkB_s': 'Write'})
+            aggregated_disk_data = {}
+            for entry in disk_data:
+                ts = entry['timestamp']
+                if ts not in aggregated_disk_data:
+                    # 복사 시 숫자형 데이터만 초기화
+                    aggregated_disk_data[ts] = {k: v for k, v in entry.items() if not isinstance(v, (int, float))}
+                    aggregated_disk_data[ts].update({k: 0 for k, v in entry.items() if isinstance(v, (int, float))})
+                else:
+                    for key, value in entry.items():
+                        if isinstance(value, (int, float)):
+                            aggregated_disk_data[ts][key] = aggregated_disk_data[ts].get(key, 0) + value
+
+            aggregated_list = list(aggregated_disk_data.values())
+
+            # [요청 반영] bread/s, bwrtn/s 우선 처리
+            # [BUG FIX] 파싱 시 '/'가 '_'로 변환되므로, 변환된 키('bread_s', 'bwrtn_s')를 사용해야 합니다.
+            #           기존 코드에서 'bread/s'를 찾으려고 해서 그래프가 생성되지 않았습니다.
+            if 'bread_s' in aggregated_list[0] and 'bwrtn_s' in aggregated_list[0]:
+                graphs['disk'] = self._create_plot(aggregated_list, 'Disk I/O (blocks/s)', {'bread_s': 'Read Blocks/s', 'bwrtn_s': 'Write Blocks/s'})
+            elif 'rd_sec_s' in aggregated_list[0]: graphs['disk'] = self._create_plot(aggregated_list, 'Disk I/O (sectors/s)', {'rd_sec_s': 'Read', 'wr_sec_s': 'Write'})
+            elif 'rkB_s' in aggregated_list[0]: graphs['disk'] = self._create_plot(aggregated_list, 'Disk I/O (kB/s)', {'rkB_s': 'Read', 'wkB_s': 'Write'})
+
+        if sar.get('swap'):
+            logging.info("  - 그래프 생성 중: Swap Usage")
         graphs['swap'] = self._create_plot(sar.get('swap'), 'Swap Usage (%)', {'pct_swpused': 'Used %'})
+        
+        # [요청 반영] Network Traffic 그래프를 rxkB/s, txkB/s 기준으로 생성
         if sar.get('network'):
+            logging.info("  - 그래프 생성 중: Network Traffic")
             graphs['network'] = {}
             net_by_iface = {}; [net_by_iface.setdefault(d.get('IFACE'), []).append(d) for d in sar['network'] if d.get('IFACE')]
             up_interfaces = {iface['iface'] for iface in self.metadata.get('network', {}).get('interfaces', []) if iface.get('state') == 'up'}
             for iface, data in net_by_iface.items():
-                if iface in up_interfaces and len(data) > 1 and sum(d.get('rxkB_s', 0) + d.get('txkB_s', 0) for d in data) > 0:
-                    graphs['network'][iface] = self._create_plot_dual_axis(data, f'Network Traffic: {iface}', {'rxpck_s': 'RX pck/s', 'txpck_s': 'TX pck/s'}, {'rxkB_s': 'RX kB/s', 'txkB_s': 'TX kB/s'})
+                # rxkB_s 또는 txkB_s 데이터가 있는지 확인
+                if iface in up_interfaces and len(data) > 1 and any('rxkB_s' in d or 'txkB_s' in d for d in data):
+                    logging.info(f"    - 생성: Network Traffic ({iface})")
+                    graphs['network'][iface] = self._create_plot(data, f'Network Traffic: {iface} (kB/s)', {'rxkB_s': 'RX kB/s', 'txkB_s': 'TX kB/s'})
         return graphs
+
+    def _generate_individual_disk_graphs_page(self, sar_data: Dict) -> Optional[str]:
+        """[신규] 개별 디스크 장치에 대한 상세 I/O 그래프 HTML 페이지를 생성합니다."""
+        if not IS_GRAPHING_ENABLED or 'disk_detail' not in sar_data:
+            return None
+
+        disk_detail_data = sar_data['disk_detail']
+        graphs_by_dev = {}
+        
+        # 장치별로 데이터 그룹화
+        dev_data = {}
+        for entry in disk_detail_data:
+            dev_name = entry.get('device_name') or entry.get('DEV')
+            if dev_name:
+                dev_data.setdefault(dev_name, []).append(entry)
+
+        # 각 장치에 대해 그래프 생성
+        for dev_name, data in dev_data.items():
+            if len(data) < 2: continue # 데이터가 너무 적으면 건너뛰기
+
+            # 각 장치에 대해 3개의 그래프 생성
+            graphs_by_dev[dev_name] = {
+                'tps': self._create_plot(data, f'Transactions per second ({dev_name})', {'tps': 'TPS'}),
+                'io': self._create_plot(data, f'I/O Sectors/s ({dev_name})', {'rd_sec_s': 'Read', 'wr_sec_s': 'Write'}),
+                'util': self._create_plot(data, f'Queue and Utilization ({dev_name})', {'avgqu-sz': 'Queue Size', 'pct_util': '%Util'})
+            }
+
+        # HTML 페이지 생성
+        graph_html_parts = []
+        for dev_name, graphs in graphs_by_dev.items():
+            graph_html_parts.append(f'<div class="device-section"><h2>Device: {dev_name}</h2><div class="graph-grid">')
+            for title, b64_img in graphs.items():
+                if b64_img:
+                    graph_html_parts.append(f'<div class="graph-container"><img src="data:image/png;base64,{b64_img}" alt="{title} graph"></div>')
+            graph_html_parts.append('</div></div>')
+
+        return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><title>Block Device I/O Details</title><style>
+            body {{ font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 2rem; }}
+            h1 {{ text-align: center; color: #333; }}
+            .device-section {{ background: #fff; border-radius: 8px; margin-bottom: 2rem; padding: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+            .device-section h2 {{ margin-top: 0; border-bottom: 1px solid #eee; padding-bottom: 1rem; }}
+            .graph-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 1.5rem; }}
+            .graph-container img {{ max-width: 100%; height: auto; }}
+            </style></head><body><h1>Block Device I/O Details</h1>{''.join(graph_html_parts)}</body></html>"""
 
     def _create_plot(self, data, title, labels, is_stack=False):
         if not data: return None
-        fig, ax = plt.subplots(figsize=(12, 6)); timestamps = [d['timestamp'] for d in data]
-        if is_stack: ax.stackplot(timestamps, [[self._safe_float(d.get(k, 0)) for d in data] for k in labels.keys()], labels=list(labels.values()))
+
+        # [개선] ISO 형식의 timestamp 문자열을 datetime 객체로 변환합니다.
+        timestamps_str = [d['timestamp'] for d in data]
+        timestamps_dt = []
+        for ts_str in timestamps_str:
+            try:
+                timestamps_dt.append(datetime.datetime.fromisoformat(ts_str))
+            except ValueError:
+                timestamps_dt.append(ts_str) # 파싱 실패 시 원본 문자열 사용 (폴백)
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        if is_stack: ax.stackplot(timestamps_dt, [[self._safe_float(d.get(k, 0)) for d in data] for k in labels.keys()], labels=list(labels.values()))
         else:
-            for key, label in labels.items(): ax.plot(timestamps, [self._safe_float(d.get(key, 0)) for d in data], label=label)
-        ax.set_title(title, fontsize=14, weight='bold'); ax.legend(fontsize='small'); plt.tight_layout(); ax.grid(True, linestyle='--', alpha=0.6)
-        ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both')); plt.xticks(rotation=30, ha='right')
+            for key, label in labels.items(): ax.plot(timestamps_dt, [self._safe_float(d.get(key, 0)) for d in data], label=label)
+        ax.set_title(title, fontsize=14, weight='bold'); ax.legend(fontsize='small'); ax.grid(True, linestyle='--', alpha=0.6)
+        
+        # [요청 반영] x축 포맷을 'HH:MM' 형식으로 지정합니다.
+        ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%H:%M', tz=self.report_date.tzinfo))
+        ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+        plt.xticks(rotation=30, ha='right')
+        # [개선] 레이블이 잘리지 않도록 tight_layout()을 savefig 전에 호출합니다.
+        plt.tight_layout()
         buf = io.BytesIO(); plt.savefig(buf, format='png'); plt.close(fig)
         return base64.b64encode(buf.getvalue()).decode('utf-8')
 
     def _create_plot_dual_axis(self, data, title, labels1, labels2):
         if not data: return None
-        fig, ax1 = plt.subplots(figsize=(12,6)); ax2 = ax1.twinx(); timestamps = [d['timestamp'] for d in data]
+        fig, ax1 = plt.subplots(figsize=(12, 6)); ax2 = ax1.twinx()
+
+        # [개선] ISO 형식의 timestamp 문자열을 datetime 객체로 변환합니다.
+        timestamps_str = [d['timestamp'] for d in data]
+        timestamps_dt = []
+        for ts_str in timestamps_str:
+            try:
+                timestamps_dt.append(datetime.datetime.fromisoformat(ts_str))
+            except ValueError:
+                timestamps_dt.append(ts_str)
+
         colors1 = ['tab:blue', 'tab:cyan']; colors2 = ['tab:red', 'tab:orange']
-        for (key, label), color in zip(labels1.items(), colors1): ax1.plot(timestamps, [self._safe_float(d.get(key,0)) for d in data], label=label, color=color)
-        for (key, label), color in zip(labels2.items(), colors2): ax2.plot(timestamps, [self._safe_float(d.get(key,0)) for d in data], label=label, linestyle='--', color=color)
+        for (key, label), color in zip(labels1.items(), colors1): ax1.plot(timestamps_dt, [self._safe_float(d.get(key,0)) for d in data], label=label, color=color)
+        for (key, label), color in zip(labels2.items(), colors2): ax2.plot(timestamps_dt, [self._safe_float(d.get(key,0)) for d in data], label=label, linestyle='--', color=color)
         ax1.set_title(title, fontsize=14, weight='bold'); ax1.set_ylabel('Packets/s'); ax2.set_ylabel('kB/s')
         lines1, labels1 = ax1.get_legend_handles_labels(); lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize='small'); plt.tight_layout(); ax1.grid(True, linestyle='--', alpha=0.6)
-        ax1.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both')); plt.setp(ax1.get_xticklabels(), rotation=30, ha='right')
+        ax1.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%H:%M', tz=self.report_date.tzinfo))
+        ax1.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+        plt.setp(ax1.get_xticklabels(), rotation=30, ha='right')
         buf = io.BytesIO(); plt.savefig(buf, format='png'); plt.close(fig)
         return base64.b64encode(buf.getvalue()).decode('utf-8')
 
@@ -579,7 +770,7 @@ def main(args: argparse.Namespace):
             security_advisories = future_sec.result()
             metadata['security_advisories'] = security_advisories
             
-        reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname)
+        reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date)
         html_content = reporter.generate()
 
         output_dir = Path(args.output); output_dir.mkdir(exist_ok=True)
@@ -587,6 +778,13 @@ def main(args: argparse.Namespace):
         report_path = output_dir / f"report-{hostname}.html"
         report_path.write_text(html_content, encoding='utf-8')
         logging.info(Color.success(f"HTML 보고서 저장 완료: {report_path}"))
+
+        # [신규] 개별 디스크 I/O 그래프 페이지 생성
+        individual_disk_report_html = reporter._generate_individual_disk_graphs_page(sar_data)
+        if individual_disk_report_html:
+            disk_report_path = output_dir / f"sar_gui_disk-{hostname}.html"
+            disk_report_path.write_text(individual_disk_report_html, encoding='utf-8')
+            logging.info(Color.success(f"개별 디스크 I/O 보고서 저장 완료: {disk_report_path}"))
         
         (output_dir / f"metadata-{hostname}.json").write_text(json.dumps(metadata, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
         (output_dir / f"sar_data-{hostname}.json").write_text(json.dumps(sar_data, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
@@ -605,4 +803,3 @@ if __name__ == '__main__':
     parser.add_argument("--server-url", required=True, help="AI 분석을 위한 ABox_Server.py의 API 엔드포인트 URL (예: http://12.34.56.78/AIBox/api/sos/analyze_system)")
     parser.add_argument("--anonymize", action='store_true', help="서버 전송 전 민감 정보 익명화")
     main(parser.parse_args())
-

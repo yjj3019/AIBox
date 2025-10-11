@@ -15,7 +15,8 @@ PROXY_SERVER="http://30.30.30.27:8080"
 # [개선] Set an absolute path for the output file and a dedicated log file for this script
 OUTPUT_DIR="/data/iso/AIBox"
 OUTPUT_FILE="${OUTPUT_DIR}/cve_data.json"
-LOG_DIR="/data/iso/AIBox/logs"
+CVE_DETAIL_DIR="${OUTPUT_DIR}/cve"
+LOG_DIR="/data/iso/AIBox/log"
 # This script will now create its own detailed log
 LOG_FILE="${LOG_DIR}/collect_data_detailed.log"
 
@@ -60,7 +61,7 @@ log_info "Fetching data for CVEs published after: ${AFTER_DATE}"
 log_info "Executing curl command with a 60-second timeout..."
 
 # [수정] 프록시 설정이 있을 경우 curl 명령어에 추가
-CURL_COMMAND="/usr/bin/curl -s -w \"\n%{http_code}\" -G --connect-timeout 15 --max-time 60"
+CURL_COMMAND="/usr/bin/curl -s -w \"\n%{http_code}\" -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' -G --connect-timeout 15 --max-time 60"
 if [ -n "${PROXY_SERVER}" ]; then
     log_info "Using proxy server: ${PROXY_SERVER}"
     CURL_COMMAND="${CURL_COMMAND} --proxy ${PROXY_SERVER}"
@@ -124,6 +125,56 @@ else
     exit 1
 fi
 
-log_info "--- CVE data collection script finished successfully ---"
+log_info "Successfully fetched and saved ${COUNT} CVEs to ${OUTPUT_FILE}"
+log_info "--- Initial CVE list collection finished successfully ---"
 
 
+# --- [수정] CVE 상세 정보를 개별 파일로 저장하는 로직 ---
+log_info "\n--- Starting CVE detail collection based on ${OUTPUT_FILE} ---"
+
+# 1. CVE 상세 정보를 저장할 디렉토리 생성
+log_info "Ensuring CVE detail directory exists: ${CVE_DETAIL_DIR}"
+mkdir -p "${CVE_DETAIL_DIR}"
+
+# 1. cve_data.json 파일에서 CVE ID 목록 추출
+CVE_IDS=$(/usr/bin/jq -r '.[].CVE' "${OUTPUT_FILE}")
+if [ -z "${CVE_IDS}" ]; then
+    log_error "Could not extract any CVE IDs from ${OUTPUT_FILE}. Stopping detail collection."
+    exit 1
+fi
+
+TOTAL_CVES=$(echo "${CVE_IDS}" | wc -l)
+log_info "Found ${TOTAL_CVES} CVEs to process for detail collection."
+
+CURRENT_CVE_NUM=0
+SUCCESS_COUNT=0
+for CVE_ID in ${CVE_IDS}; do
+    CURRENT_CVE_NUM=$((CURRENT_CVE_NUM + 1))
+    log_info "(${CURRENT_CVE_NUM}/${TOTAL_CVES}) Fetching details for ${CVE_ID}..."
+    
+    DETAIL_API_URL="https://access.redhat.com/hydra/rest/securitydata/cve/${CVE_ID}.json"
+    
+    DETAIL_CURL_COMMAND="/usr/bin/curl -s -w \"\n%{http_code}\" -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' --connect-timeout 15 --max-time 60"
+    if [ -n "${PROXY_SERVER}" ]; then
+        DETAIL_CURL_COMMAND="${DETAIL_CURL_COMMAND} --proxy ${PROXY_SERVER}"
+    fi
+    DETAIL_CURL_COMMAND="${DETAIL_CURL_COMMAND} ${DETAIL_API_URL}"
+
+    DETAIL_HTTP_RESPONSE=$(eval ${DETAIL_CURL_COMMAND})
+    DETAIL_HTTP_BODY=$(echo "$DETAIL_HTTP_RESPONSE" | sed '$d')
+    DETAIL_HTTP_CODE=$(echo "$DETAIL_HTTP_RESPONSE" | tail -n1)
+
+    if [ "${DETAIL_HTTP_CODE}" -eq 200 ] && [ -n "${DETAIL_HTTP_BODY}" ]; then
+        # 2. 각 CVE 상세 정보를 개별 JSON 파일로 저장
+        DETAIL_FILE_PATH="${CVE_DETAIL_DIR}/${CVE_ID}.json"
+        echo "${DETAIL_HTTP_BODY}" | /usr/bin/jq '.' > "${DETAIL_FILE_PATH}"
+        log_info " -> Successfully saved details to ${DETAIL_FILE_PATH}"
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        log_error "Failed to fetch details for ${CVE_ID}. HTTP Code: ${DETAIL_HTTP_CODE}. Skipping."
+    fi
+    sleep 0.2 # API 서버 부하를 줄이기 위한 짧은 대기
+done
+
+log_info "\nSuccessfully saved details for ${SUCCESS_COUNT} out of ${TOTAL_CVES} CVEs into '${CVE_DETAIL_DIR}' directory."
+log_info "--- CVE detail collection script finished successfully ---"

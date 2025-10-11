@@ -173,7 +173,7 @@
 
                 try {
                     // [수정] 404 오류의 근본적 해결을 위해 API 통신 방식을 POST로 변경
-                    const apiUrl = `/api/cve/report`;
+                    const apiUrl = `/AIBox/api/cve/report`;
                     const response = await fetch(apiUrl, {
                         method: 'POST',
                         headers: {
@@ -292,4 +292,3 @@
 
 </body>
 </html>
-

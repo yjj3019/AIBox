@@ -404,7 +404,11 @@
                     const result = await response.json();
                     
                     const lastLog = result.log && result.log.length > 0 ? result.log[result.log.length - 1].replace(/<[^>]*>?/gm, '') : '...';
-                    progressText.textContent = lastLog;
+                    const statusTextMap = {
+                        'extracting': 'sosreport 압축 해제 중...', 'parsing': '시스템 데이터 파싱 중...',
+                        'analyzing': 'AI 종합 분석 중...', 'generating_report': '리포트 생성 중...'
+                    };
+                    progressText.textContent = statusTextMap[result.status] || lastLog;
                     
                     const statusMap = {
                         'queued': 1, 'running': 1, 'extracting': 2, 'parsing': 3,
@@ -487,10 +491,17 @@
         }
         
         async function deleteAllReports() {
-            if (!confirm(`모든 리포트를 정말 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.`)) return;
+            if (!confirm('모든 리포트를 정말 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.')) return;
+            const password = prompt("관리자 비밀번호를 입력하세요:");
+            if (password === null) return; // 사용자가 '취소'를 누른 경우
             try {
-                const response = await fetch(`${API_BASE_PATH}/api/reports/all`, { method: 'DELETE' });
-                if (!response.ok) { const result = await response.json(); throw new Error(result.error || 'Delete all failed'); }
+                const response = await fetch(`${API_BASE_PATH}/api/reports/all`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: password })
+                });
+                const result = await response.json();
+                if (!response.ok) { throw new Error(result.error || '전체 삭제 실패'); }
                 fetchReports();
             } catch (error) { alert(`전체 삭제 오류: ${error.message}`); }
         }

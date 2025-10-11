@@ -7,6 +7,8 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <!-- [추가] ANSI 색상 코드를 HTML로 변환하기 위한 라이브러리 -->
+    <script src="https://unpkg.com/ansi_up@5.1.0/ansi_up.js"></script>
     <style>
         :root {
             --primary-color: #0d6efd;
@@ -301,7 +303,7 @@
                     passwordModal.style.display = 'none';
                     mainContent.style.display = 'block';
                     await loadSchedules();
-                    await loadLogs();
+                    await loadLogs(); // 인증 성공 후 로그 즉시 로드
                     startScheduleRefresh();
                 } else {
                     throw new Error(result.error || "비밀번호가 올바르지 않습니다.");
@@ -430,19 +432,23 @@
         // --- 5. View Logs & Delete Logs ---
         async function loadLogs() {
             // ... (기존과 동일)
+            const ansi_up = new AnsiUp();
             logViewer.textContent = '로그를 새로고침하는 중...';
             try {
                 const result = await robustFetch(`${API_BASE_URL}/logs/scheduler?_=${new Date().getTime()}`);
-                let logContent = '표시할 로그가 없습니다.';
-                if (result.logs) {
-                    logContent = Array.isArray(result.logs) ? result.logs.join('\n') : String(result.logs);
-                } else if (Array.isArray(result)) {
-                    if (result.length > 0) logContent = result.join('\n');
-                } else if (typeof result === 'string' && result) {
-                    logContent = result;
+                logViewer.innerHTML = ''; // 기존 로그 삭제
+                // 서버는 로그 라인의 배열을 반환하므로, Array.isArray로 직접 확인합니다.
+                if (Array.isArray(result) && result.length > 0) {
+                    // [수정] 각 로그 라인을 ANSI -> HTML로 변환하여 추가
+                    result.forEach(line => {
+                        const lineDiv = document.createElement('div');
+                        lineDiv.innerHTML = ansi_up.ansi_to_html(line);
+                        logViewer.appendChild(lineDiv);
+                    });
+                } else {
+                    logViewer.textContent = '표시할 로그가 없습니다.';
                 }
-                logViewer.textContent = logContent;
-                logViewer.scrollTop = logViewer.scrollHeight;
+                logViewer.scrollTop = logViewer.scrollHeight; // 스크롤을 맨 아래로 이동
             } catch (error) {
                 logViewer.textContent = `로그 로딩 중 오류: ${error.message}`;
             }
@@ -480,4 +486,3 @@
 
 </body>
 </html>
-
