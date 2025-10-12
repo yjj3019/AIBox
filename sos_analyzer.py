@@ -116,6 +116,7 @@ class SosreportParser:
         self._sar_cache = {}  # [개선] SAR 출력 캐싱
         self._initialize_cpu_cores() # [BUG FIX] 생성자에서 CPU 코어 수를 먼저 초기화합니다.
         self.device_map = self._create_device_map() # [개선] 장치명 매핑 정보 생성
+        self.metadata = {'device_map': self.device_map} # [추가] 메타데이터에 장치 맵 추가
         self.dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
 
     def _read_file(self, possible_paths: List[str], default: str = 'N/A') -> str:
@@ -177,32 +178,30 @@ class SosreportParser:
         """
         [신규] proc/partitions와 dmsetup 정보를 결합하여 (major, minor) -> device_name 매핑을 생성합니다.
         """
-        device_map = {}
-        # 1. /proc/partitions 파싱
-        partitions_content = self._read_file(['proc/partitions'])
-        for line in partitions_content.split('\n')[2:]:
-            parts = line.split()
-            if len(parts) == 4:
-                major, minor, name = parts[0], parts[1], parts[3]
-                device_map[f"{major}:{minor}"] = name
+        device_map: Dict[str, str] = {}
 
-        # 2. dmsetup 정보 파싱
+        # 1. dmsetup 정보 파싱 (LVM 장치명 매핑)
         dmsetup_content = self._read_file(['sos_commands/devicemapper/dmsetup_info_-c'])
         for line in dmsetup_content.split('\n')[1:]:
-            parts = line.split(maxsplit=2) # Name, <ignored>, Major:Minor
-            if len(parts) >= 3 and ':' in parts[2]:
-                name = parts[0]
-                major, minor = parts[2].strip('()').split(':')
-                device_map[f"{major}:{minor}"] = name
+            # Name, Maj, Min, ... (공백으로 분리)
+            parts = line.split()
+            if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                name, major, minor = parts[0], parts[1], parts[2]
+                device_map[f"{major}:{minor}"] = name.strip()
 
-        # [개선] lsblk 대체 로직 추가
-        lsblk_content = self._read_file(['sos_commands/block/lsblk_-d_-o_NAME,MAJ:MIN'])
+        # 2. lsblk 정보 파싱 (일반 파티션 및 LVM 장치명 보강)
+        lsblk_content = self._read_file(['sos_commands/block/lsblk'])
         if lsblk_content != 'N/A':
             for line in lsblk_content.split('\n')[1:]:
-                parts = line.split()
-                if len(parts) >= 2 and ':' in parts[1]:
-                    name, maj_min = parts[0], parts[1]
-                    device_map[maj_min] = name
+                # [BUG FIX] 장치 이름에 하이픈(-)이 포함된 경우(예: rhel-root)를 처리하도록 정규식 수정
+                # NAME, MAJ:MIN, ... (장치 이름에 하이픈, 백틱, 파이프, 작은따옴표 포함 가능)
+                match = re.search(r'^([\w\-\`|\'\s]+)\s+(\d+:\d+)', line)
+                if match:
+                    name, maj_min = match.groups()
+                    # dmsetup에서 이미 매핑된 정보가 아니라면 추가
+                    if maj_min not in device_map:
+                        # lsblk 출력의 '|-`' 같은 트리 문자를 제거합니다.
+                        device_map[maj_min] = name.strip('|-`')
 
         return device_map
 
@@ -575,12 +574,12 @@ class SosreportParser:
                 logging.debug(f"    -> Identified as DATA line for section '{current_section}'.")
                 time_end_idx = time_end_idx_check
                 ts_str = " ".join(parts[:time_end_idx])
-                try:
-                    dt_obj = datetime.datetime.strptime(ts_str, '%I:%M:%S %p' if time_end_idx == 2 else '%H:%M:%S')
-                    timestamp_iso = self.report_date.replace(hour=dt_obj.hour, minute=dt_obj.minute, second=dt_obj.second).isoformat()
-                except ValueError: continue
+                try: dt_obj = datetime.datetime.strptime(ts_str, '%I:%M:%S %p' if time_end_idx == 2 else '%H:%M:%S'); timestamp_iso = self.report_date.replace(hour=dt_obj.hour, minute=dt_obj.minute, second=dt_obj.second).isoformat()
+                except ValueError: continue # yapf: disable
 
                 values = parts[time_end_idx:]
+                # [BUG FIX] 헤더에 'DEV'가 있지만 실제 데이터 라인에 장치명이 없는 경우를 처리
+                if 'DEV' in header_cols and len(values) == len(header_cols) -1: values.insert(0, 'N/A')
                 entry = {'timestamp': timestamp_iso}
                 for i in range(min(len(header_cols), len(values))):
                     header = header_cols[i]
@@ -589,9 +588,8 @@ class SosreportParser:
 
                 if current_section == 'disk_detail' and 'DEV' in entry and isinstance(entry['DEV'], str) and entry['DEV'].startswith('dev'):
                     major, minor = entry['DEV'][3:].split('-')
-                    # [사용자 요청] 장치명 매핑에 실패하면 원본 dev-x-y 이름을 device_name으로 사용합니다.
-                    device_name = self.device_map.get(f"{major}:{minor}", entry['DEV'])
-                    entry['device_name'] = device_name
+                    # [사용자 요청] 장치명 매핑에 실패하면 원본 dev-x-y 이름을 device_name으로 사용합니다. (self.device_map 사용)
+                    entry['device_name'] = self.device_map.get(f"{major}:{minor}", entry['DEV'])
                 
                 # [사용자 요청] CPU 데이터는 'all'만, 네트워크 데이터는 'lo' 제외
                 if current_section == 'cpu' and entry.get('CPU') != 'all':
@@ -774,9 +772,10 @@ class SosreportParser:
         logging.info(Color.success("모든 데이터 파싱 및 추가 분석 완료."))
         return metadata, sar_data
 class HTMLReportGenerator:
-    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str, report_date: datetime.datetime):
+    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str, report_date: datetime.datetime, device_map: Dict):
         self.metadata, self.sar_data, self.ai_analysis, self.hostname = metadata, sar_data, ai_analysis, hostname
         self.report_date = report_date
+        self.device_map = device_map # [BUG FIX] device_map을 클래스 속성으로 초기화합니다.
 
     def _generate_graphs(self) -> Dict[str, Any]:
         """[안정성 강화] 재시도 로직을 적용하여 각 그래프를 생성합니다."""
@@ -868,14 +867,13 @@ class HTMLReportGenerator:
 
         if maj_min_match:
             major, minor = maj_min_match.groups()
-            # 3. sar 장치명 형식으로 조합하여 반환
-            sar_device_name = f"dev{major}-{minor}" # type: ignore
-            logging.info(f"  - Found representative disk for root filesystem ('/'): {df_device_name} -> {sar_device_name}")
-            return sar_device_name
+            # 3. sar 장치명 형식으로 조합하여 반환 (예: dev253-0)
+            return f"dev{major}-{minor}"
         
         # LVM이 아닌 일반 파티션(예: /dev/sda1)의 경우, df_device_name을 그대로 사용
         # sar 데이터에 'sda1'과 같은 이름이 있는지 확인
-        all_sar_devices = {d.get('device_name') for d in self.sar_data.get('disk_detail', [])}
+        # [BUG FIX] 'device_name' 대신 'DEV' 필드를 사용해야 합니다.
+        all_sar_devices = {d.get('DEV') for d in self.sar_data.get('disk_detail', [])}
         if df_device_name in all_sar_devices:
             logging.info(f"  - Found representative disk for root filesystem ('/'): {df_device_name}")
             return df_device_name
@@ -891,13 +889,15 @@ class HTMLReportGenerator:
         # [사용자 요청 반영] 루트('/') 파일시스템의 sar 장치명을 찾는 로직 개선
         # [수정] _find_representative_disk 함수를 호출하여 대표 디바이스를 찾습니다.
         root_device_name = self._find_representative_disk()
-        # [수정] 'device_name' 대신 원본 'DEV' 필드를 사용하여 필터링합니다.
-        representative_disk_data = [d for d in disk_detail_data if d.get('DEV') == root_device_name] if root_device_name else []
+        representative_disk_data = [d for d in disk_detail_data if d.get('DEV') == root_device_name] if root_device_name else [] # yapf: disable
 
         if representative_disk_data:
-            logging.info(f"  - Generating I/O graph for representative block device: '{root_device_name}'")
-            title = f"Block Device I/O - {root_device_name} (Rep.)"
-            static_title = f"Block Device I/O - {root_device_name}"
+            # [사용자 요청] dev{major}-{minor}를 문자 장치명으로 변환
+            major, minor = root_device_name[3:].split('-')
+            display_name = self.device_map.get(f"{major}:{minor}", root_device_name)
+            logging.info(f"  - Generating I/O graph for representative block device: '{display_name}' (from {root_device_name})")
+            title = f"Block Device I/O - {display_name} (Rep.)"
+            static_title = f"Block Device I/O - {display_name}"
             return self._create_hybrid_plot(representative_disk_data, title, {'rd_sec_s': 'Read sectors/s', 'wr_sec_s': 'Write sectors/s'}, is_stack=False, y_axis_title='sectors/s', static_title=static_title, is_percentage=False)
         else:
             # [수정] 대표 장치를 찾지 못하면 모든 장치의 데이터를 합산하여 그래프를 생성합니다.
@@ -996,12 +996,11 @@ class HTMLReportGenerator:
             if not original_dev_name:
                 continue
 
-            # [사용자 요청] dev{major}-{minor} 형식의 장치명을 문자 형태의 장치명으로 변환합니다.
-            # 예: 'dev253-0' -> 'rhel-root'
+            # [사용자 요청] dev{major}-{minor} 형식의 장치명을 문자 형태의 장치명으로 변환
             display_name = original_dev_name
             if original_dev_name.startswith('dev') and '-' in original_dev_name:
                 major, minor = original_dev_name[3:].split('-')
-                display_name = self.metadata.get('device_map', {}).get(f"{major}:{minor}", original_dev_name)
+                display_name = self.device_map.get(f"{major}:{minor}", original_dev_name)
             
             dev_data.setdefault(display_name, []).append(entry)
 
@@ -1650,7 +1649,7 @@ def main(args: argparse.Namespace):
         structured_analysis['kb_findings'] = kb_findings
             
         log_step("HTML 보고서 생성 시작")
-        reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date)
+        reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date, parser.device_map)
         
         # [사용자 요청] 그래프 생성 시, 저장된 sar_data.json 파일을 다시 읽어 사용합니다.
         logging.info(f"  - 그래프 생성을 위해 '{sar_data_path.name}' 파일 로딩 중...")
