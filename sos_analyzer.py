@@ -1460,7 +1460,7 @@ class AIAnalyzer:
         """[신규] 개별 데이터 청크(묶음) 분석을 위한 프롬프트를 생성합니다."""
         return f"""
 [시스템 역할]
-당신은 RHEL 시스템의 특정 데이터 조각을 분석하고 핵심만 요약하는 전문가입니다.
+당신은 Red Hat Enterprise Linux(RHEL) 시스템의 특정 데이터 조각을 분석하고, 성능, 안정성, 보안 관점에서 가장 중요한 핵심만 요약하는 진단 전문가입니다.
 
 [분석 대상 데이터]
 - 데이터 섹션: {chunk_name}
@@ -1511,9 +1511,10 @@ class AIAnalyzer:
         2. 요약된 결과들을 모아 최종 종합 분석을 요청합니다.
         """
         # [개선] LLM 컨텍스트 크기를 '토큰' 기준으로 설정 (예: 128k 모델의 경우, 안전 마진 고려 120,000 토큰)
-        # self.tokenizer가 있을 경우 토큰 기반, 없을 경우 문자 길이 기반으로 동작합니다.
-        MAX_CHUNK_TOKENS = 120000
-        MAX_CHUNK_CHARS = MAX_CHUNK_TOKENS * 2 # 토큰을 계산할 수 없을 때의 폴백 (대략 1토큰=2자)
+        # 실제 청킹은 서버의 LLMChunker가 담당하지만, 클라이언트에서도 1차적으로 분할하여
+        # 단일 요청의 크기가 너무 커지는 것을 방지합니다.
+        MAX_TOKENS_PER_REQUEST = 120000
+        BASE_PROMPT_TOKENS = 2000  # 프롬프트 기본 구조가 차지하는 토큰 (보수적 추정)
 
         log_step("AI 시스템 분석 요청 (지능형 청크 분할)")
         try:
@@ -1558,21 +1559,15 @@ class AIAnalyzer:
 
                 chunk_str = json.dumps(chunk_data, ensure_ascii=False, default=str)
                 
-                # [개선] 토큰 기반 크기 측정 및 청크 분할
-                chunk_size = 0
-                if self.tokenizer:
-                    chunk_size = len(self.tokenizer.encode(chunk_str))
-                    max_size = MAX_CHUNK_TOKENS
-                else:
-                    chunk_size = len(chunk_str)
-                    max_size = MAX_CHUNK_CHARS
+                # 토큰 계산은 서버의 LLMChunker가 더 정확하게 수행하므로, 여기서는 문자 길이로 대략적인 크기만 확인합니다.
+                # 1 토큰을 약 2.5자로 가정하여, 매우 큰 청크만 분할합니다.
+                chunk_size_approx = len(chunk_str)
+                max_size_approx = (MAX_TOKENS_PER_REQUEST - BASE_PROMPT_TOKENS) * 2
 
-                if chunk_size <= max_size:
+                if chunk_size_approx <= max_size_approx:
                     tasks.append((chunk_name, chunk_data))
                 else:
-                    # 토큰 기반 크기를 로그에 명시
-                    size_str = f"{chunk_size} 토큰" if self.tokenizer else f"{chunk_size} 자"
-                    logging.warning(f"    - '{chunk_name}' 섹션이 너무 커서({size_str}) 하위 청크로 분할합니다.")
+                    logging.warning(f"    - '{chunk_name}' 섹션이 너무 커서({chunk_size_approx}자) 하위 청크로 분할합니다.")
                     
                     # [개선] 청크 분할 로직 고도화
                     if isinstance(chunk_data, list):
@@ -1604,6 +1599,10 @@ class AIAnalyzer:
 
             # 2단계: 요약본을 취합하여 최종 분석 요청
             logging.info("  - [2/2] 요약본 취합 및 최종 종합 분석 시작...")
+
+            # [핵심 개선] 최종 분석 요청 시, 모든 요약본을 하나의 프롬프트에 담아 전송합니다.
+            # 서버의 LLMChunker가 컨텍스트 크기에 맞춰 자동으로 분할 및 병합 처리를 수행합니다.
+            # 이 방식은 클라이언트 로직을 단순화하고, 서버에서 더 정확한 토큰 기반 청킹을 가능하게 합니다.
             final_prompt = self._create_final_analysis_prompt(chunk_summaries)
             final_analysis = self._make_request('sos/analyze_system', {"prompt": final_prompt})
 
@@ -1736,14 +1735,22 @@ class AIAnalyzer:
             # [BUG FIX] cve.get('package_state')가 None을 반환할 경우 TypeError가 발생하는 문제를 해결합니다.
             # 'or []'를 사용하여 None일 경우 빈 리스트로 처리하도록 합니다.
             for state in (cve.get('package_state') or []):
-                if state.get('fix_state') == 'Affected':
-                    # CVE의 'package_name'에서 버전 정보를 제외한 순수 패키지 이름만 추출하여
-                    # 시스템에 설치된 패키지 이름과 비교합니다.
-                    # 예: 'NetworkManager-1.18.8-1.el7' -> 'NetworkManager'                    
-                    pkg_name_from_cve_base = re.match(r'([^-\d\s][^-]*)', state.get('package_name', ''))
-                    if pkg_name_from_cve_base and pkg_name_from_cve_base.group(1) in installed_package_names_only:
+                # [핵심 개선] 'Affected' 상태인 패키지에 대해서만 연관성을 검사합니다.
+                if state.get('fix_state') == 'Affected':                    
+                    # CVE 데이터의 패키지 이름(예: 'httpd-tools-2.4.37-56.el8_8.3.x86_64')에서
+                    # 버전과 아키텍처를 제외한 순수 패키지 이름(예: 'httpd-tools')을 추출합니다.
+                    # 정규식은 이름 뒤에 오는 첫 번째 숫자 또는 하이픈+숫자 부분을 버전의 시작으로 간주합니다.
+                    cve_pkg_name_match = re.match(r'^[a-zA-Z0-9_.-]+(?=-\d)', state.get('package_name', ''))
+                    if cve_pkg_name_match:
+                        cve_pkg_name = cve_pkg_name_match.group(0)
+                    else:
+                        # 버전 정보가 없는 패키지 이름(예: 'kernel')의 경우, 전체 이름을 사용합니다.
+                        cve_pkg_name = state.get('package_name', '')
+
+                    # 추출된 CVE 패키지 이름이 시스템에 설치된 패키지 이름 목록과 정확히 일치하는지 확인합니다.
+                    if cve_pkg_name and cve_pkg_name in installed_package_names_only:
                         is_relevant = True
-                        relevant_package_for_debug = pkg_name_from_cve_base.group(1)
+                        relevant_package_for_debug = cve_pkg_name
                         break
             if is_relevant:
                 logging.info(f"    [DEBUG] CVE {cve.get('CVE')} is relevant due to package: {relevant_package_for_debug}")

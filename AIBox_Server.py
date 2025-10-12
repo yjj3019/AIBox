@@ -32,6 +32,7 @@ import copy
 import shutil
 import hashlib
 from diskcache import Cache
+from typing import List, Dict, Any, Generator
 
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
@@ -41,6 +42,13 @@ from waitress import serve
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+# [개선] 토큰 기반 청크 분할을 위한 tiktoken 라이브러리 추가
+try:
+    import tiktoken
+    IS_TIKTOKEN_AVAILABLE = True
+except ImportError:
+    IS_TIKTOKEN_AVAILABLE = False
 
 # --- 로깅 및 Flask 앱 설정 ---
 class HealthCheckFilter(logging.Filter):
@@ -117,6 +125,68 @@ def sanitize_loaded_json(data):
     if isinstance(data, dict): return OrderedDict((k, sanitize_loaded_json(v)) for k, v in data.items())
     if isinstance(data, list): return [sanitize_loaded_json(item) for item in data]
     return sanitize_value(data)
+
+class LLMChunker:
+    """
+    [신규] LLM 요청을 위한 데이터 청킹(chunking) 유틸리티 클래스.
+    tiktoken을 사용하여 토큰 수를 계산하고, 컨텍스트 창 크기에 맞춰 데이터를 분할합니다.
+    """
+    def __init__(self, max_tokens: int = 120000):
+        self.max_tokens = max_tokens
+        self.tokenizer = None
+        if IS_TIKTOKEN_AVAILABLE:
+            try:
+                self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            except Exception as e:
+                logging.warning(f"tiktoken 로딩 실패: {e}. 문자 길이 기반으로 폴백합니다.")
+
+    def get_token_count(self, text: str) -> int:
+        """주어진 텍스트의 토큰 수를 계산합니다."""
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text))
+        # 토크나이저가 없을 경우, 대략적으로 1토큰 = 2.5자로 계산하여 안전 마진을 둡니다.
+        return len(text) // 2
+
+    def split_data(self, data: Any, base_prompt_tokens: int) -> Generator[Any, None, None]:
+        """
+        주어진 데이터를 LLM의 컨텍스트 창에 맞게 여러 청크로 분할합니다.
+        리스트, 딕셔너리, 문자열 형태의 데이터를 지원합니다.
+        """
+        available_tokens = self.max_tokens - base_prompt_tokens - 500  # 500 토큰의 안전 마진
+
+        if isinstance(data, str):
+            if self.get_token_count(data) > available_tokens:
+                logging.warning(f"데이터(문자열)가 너무 커서 분할합니다. (토큰: {self.get_token_count(data)})")
+                # 문자열을 문단 단위로 분할 (간단한 예시)
+                paragraphs = data.split('\n\n')
+                current_chunk = ""
+                for p in paragraphs:
+                    if self.get_token_count(current_chunk + p) > available_tokens and current_chunk:
+                        yield current_chunk; current_chunk = ""
+                    current_chunk += p + "\n\n"
+                if current_chunk: yield current_chunk
+            else:
+                yield data
+        elif isinstance(data, list):
+            current_chunk, current_tokens = [], 0
+            for item in data:
+                item_str = json.dumps(item, ensure_ascii=False, default=str)
+                item_tokens = self.get_token_count(item_str)
+                if current_chunk and current_tokens + item_tokens > available_tokens:
+                    yield current_chunk; current_chunk, current_tokens = [], 0
+                current_chunk.append(item); current_tokens += item_tokens
+            if current_chunk: yield current_chunk
+        elif isinstance(data, dict):
+            current_chunk, current_tokens = {}, 0
+            for key, value in data.items():
+                item_str = json.dumps({key: value}, ensure_ascii=False, default=str)
+                item_tokens = self.get_token_count(item_str)
+                if current_chunk and current_tokens + item_tokens > available_tokens:
+                    yield current_chunk; current_chunk, current_tokens = [], 0
+                current_chunk[key] = value; current_tokens += item_tokens
+            if current_chunk: yield current_chunk
+        else:
+            yield data
 
 def run_analysis_in_background(file_path, analysis_id, server_url):
     log_key = analysis_id

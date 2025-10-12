@@ -678,10 +678,14 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
     analyzed_cves = []
     cve_map = {cve.get('CVE'): cve for cve in finalists if cve.get('CVE')}
 
-    # 최종 후보군이 많을 경우를 대비해 다시 묶음으로 나눕니다.
-    CHUNK_SIZE = 5
-    finalist_chunks = [finalists[i:i + CHUNK_SIZE] for i in range(0, len(finalists), CHUNK_SIZE)] if finalists else []
+    # [핵심 개선] LLM의 컨텍스트 크기를 초과하지 않도록 최종 후보군을 안전하게 분할합니다.
+    # 프롬프트의 기본 구조가 차지하는 토큰을 약 2000으로 가정합니다.
+    # LLMChunker 유틸리티가 서버에 있으므로, 여기서는 보수적인 청크 크기를 사용합니다.
+    # 일반적으로 CVE 객체 하나가 500~1000 토큰을 차지하므로, 5개씩 묶는 것이 안전합니다.
+    FINAL_CHUNK_SIZE = 5
+    finalist_chunks = [finalists[i:i + FINAL_CHUNK_SIZE] for i in range(0, len(finalists), FINAL_CHUNK_SIZE)] if finalists else []
 
+    logging.info(f"  - 최종 후보 {len(finalists)}개를 {len(finalist_chunks)}개의 묶음으로 나누어 분석합니다.")
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_chunk = {executor.submit(_call_llm_for_batch_analysis, _create_final_analysis_prompt(chunk)): chunk for chunk in finalist_chunks}
         for i, future in enumerate(as_completed(future_to_chunk)):
