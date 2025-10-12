@@ -83,6 +83,7 @@ PROMPT_LOCK = threading.Lock()
 UPLOAD_FOLDER = '/data/iso/AIBox/upload'
 OUTPUT_FOLDER = '/data/iso/AIBox/output'
 CACHE_FOLDER = '/data/iso/AIBox/cache'
+RULES_FOLDER = '/data/iso/AIBox/rules'
 SOS_ANALYZER_SCRIPT = "/data/iso/AIBox/sos_analyzer.py"
 CVE_FOLDER = '/data/iso/AIBox/cve'
 scheduler = None
@@ -96,6 +97,7 @@ CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 os.makedirs(CVE_FOLDER, exist_ok=True)
+os.makedirs(RULES_FOLDER, exist_ok=True)
 # [개선] diskcache는 디렉토리를 자동으로 생성하므로, 이 라인은 더 이상 필요하지 않습니다.
 os.makedirs(CACHE_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -476,6 +478,8 @@ def route_admin(): return send_from_directory(SCRIPT_DIR, 'admin.html')
 def route_cve(): return send_from_directory(SCRIPT_DIR, 'cve_report.html')
 @app.route('/AIBox/cron.html')
 def route_cron(): return send_from_directory(SCRIPT_DIR, 'cron.html')
+@app.route('/AIBox/rules.html')
+def route_rules_html(): return send_from_directory(SCRIPT_DIR, 'rules.html')
 @app.route('/AIBox/output/<path:filename>')
 def route_output(filename): return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
 @app.route('/AIBox/cve/<path:filename>')
@@ -533,8 +537,52 @@ def api_prompts():
         except Exception as e: return jsonify({"error": str(e)}), 500
     else: # GET
         with PROMPT_LOCK:
-            prompts = [{"key": k, "value": f"{v.get('system_message', '')}{PROMPT_SEPARATOR}{v.get('user_template', '')}"} for k, v in PROMPTS.items()]
-            return Response(json.dumps(prompts, ensure_ascii=False), mimetype='application/json; charset=utf-8')
+            prompts_list = [{"key": k, "value": f"{v.get('system_message', '')}{PROMPT_SEPARATOR}{v.get('user_template', '')}"} for k, v in PROMPTS.items()]
+        return Response(json.dumps(prompts_list, ensure_ascii=False), mimetype='application/json; charset=utf-8')
+
+@app.route('/AIBox/api/rules', methods=['GET', 'POST'])
+def api_rules():
+    """[신규] YAML 규칙 파일을 관리하기 위한 API 엔드포인트."""
+    import yaml
+    
+    if request.method == 'POST':
+        data = request.json
+        if data.get('password') != CONFIG.get("password"):
+            return jsonify({"error": "Unauthorized"}), 401
+        
+        try:
+            # 1. 모든 기존 .yaml 파일을 삭제 (또는 백업)
+            for f in os.listdir(RULES_FOLDER):
+                if f.endswith('.yaml'):
+                    os.remove(os.path.join(RULES_FOLDER, f))
+            
+            # 2. 프론트엔드에서 받은 데이터로 새 파일들을 작성
+            for file_data in data.get('data', []):
+                filename = secure_filename(file_data.get('filename'))
+                rules = file_data.get('rules', [])
+                if not filename.endswith('.yaml'): continue
+                
+                file_path = os.path.join(RULES_FOLDER, filename)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(rules, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            
+            return jsonify({"success": True, "message": "규칙이 성공적으로 저장되었습니다."})
+        except Exception as e:
+            logging.error(f"Error processing /api/rules POST request: {e}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+    
+    else: # GET
+        rule_files_data = []
+        for filename in sorted(os.listdir(RULES_FOLDER)):
+            if filename.endswith('.yaml'):
+                try:
+                    file_path = os.path.join(RULES_FOLDER, filename)
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        rules = yaml.safe_load(f) or []
+                    rule_files_data.append({"filename": filename, "rules": rules})
+                except Exception as e:
+                    logging.error(f"Error reading or parsing rule file {filename}: {e}")
+        return jsonify(rule_files_data)
 
 @app.route('/AIBox/api/analyze', methods=['POST'])
 def api_analyze():

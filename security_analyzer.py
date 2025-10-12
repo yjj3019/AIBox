@@ -10,6 +10,7 @@
 # ==============================================================================
 
 from typing import List, Dict, Any
+import re
 
 class SecurityAnalyzer:
     """
@@ -93,6 +94,25 @@ class SecurityAnalyzer:
             })
         return findings
 
+    def _audit_sudoers_configuration(self, sudoers_content: str) -> List[Dict[str, Any]]:
+        """
+        sudoers 파일 내용을 분석하여 NOPASSWD 설정과 같은 보안 위험을 감사합니다.
+        
+        :param sudoers_content: /etc/sudoers 파일의 내용
+        :return: 발견된 보안 권고 사항 리스트
+        """
+        findings = []
+        if not sudoers_content or sudoers_content == 'N/A':
+            return findings
+
+        print("  - sudoers 설정 감사 중...")
+        # NOPASSWD 키워드가 포함된 라인을 찾되, 주석 처리된 라인은 제외
+        if re.search(r'^\s*[^#].*\bNOPASSWD\b', sudoers_content, re.MULTILINE):
+            findings.append({
+                'id': 'SEC-SUDO-001', 'name': "sudo 사용 시 패스워드 불필요 (NOPASSWD)", 'severity': "High", 'description': "sudoers 파일에 'NOPASSWD' 설정이 있어, 특정 사용자나 그룹이 패스워드 없이 루트 권한을 획득할 수 있습니다. 이는 시스템 보안에 심각한 위협이 될 수 있습니다.", 'solution': "반드시 필요한 경우가 아니라면 sudoers 파일에서 'NOPASSWD' 설정을 제거하여 모든 권한 상승에 패스워드를 요구하도록 하십시오.", 'category': 'Security Audit (Config)'
+            })
+        return findings
+
     def analyze(self, sos_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         전체 보안 감사를 수행합니다.
@@ -113,7 +133,12 @@ class SecurityAnalyzer:
         ssh_findings = self._audit_ssh_configuration(sshd_config)
         all_findings.extend(ssh_findings)
         
-        # 3. 추가적인 감사 로직 (e.g., sudoers, firewall rules, log analysis)을 여기에 구현할 수 있습니다.
+        # 3. sudoers 설정 감사
+        # [개선] sos_analyzer가 etc/sudoers 파일을 읽어오도록 수정해야 합니다.
+        # 우선은 'configurations'에 sudoers_content가 있다고 가정하고 구현합니다.
+        sudoers_content = sos_data.get('configurations', {}).get('sudoers_content', '')
+        sudo_findings = self._audit_sudoers_configuration(sudoers_content)
+        all_findings.extend(sudo_findings)
 
         print(f"[*] 보안 감사 분석 완료. 총 {len(all_findings)}개의 잠재적 보안 이슈를 발견했습니다.")
         return all_findings

@@ -1,0 +1,35 @@
+- id: KB-SEC-001
+  name: "SSH 루트 로그인 허용"
+  severity: "High"
+  conditions:
+    - type: "config_value"
+      config_key: "sshd_config"
+      parameter: "PermitRootLogin"
+      value: "yes"
+  recommendation:
+    problem: "SSH 설정(sshd_config)에서 루트 계정의 직접 로그인을 허용하고 있습니다. 이는 무차별 대입 공격(brute-force attack)의 주된 표적이 될 수 있습니다."
+    solution: "sshd_config 파일에서 'PermitRootLogin' 값을 'no'로 변경하고 sshd 서비스를 재시작하십시오. 일반 사용자로 로그인 후 'su' 또는 'sudo'를 사용하는 것이 안전합니다."
+
+- id: KB-SEC-002
+  name: "SSH 패스워드 인증 사용"
+  severity: "Medium"
+  conditions:
+    - type: "config_value"
+      config_key: "sshd_config"
+      parameter: "PasswordAuthentication"
+      value: "yes"
+  recommendation:
+    problem: "SSH가 패스워드 기반 인증을 사용하도록 설정되어 있어 무차별 대입 공격에 취약할 수 있습니다."
+    solution: "보안 강화를 위해 공개 키 기반 인증(Public Key Authentication)을 사용하고, sshd_config 파일에서 'PasswordAuthentication' 값을 'no'로 설정하는 것을 권장합니다."
+
+- id: KB-SEC-003
+  name: "빈 패스워드 허용"
+  severity: "High"
+  conditions:
+    - type: "config_value"
+      config_key: "sshd_config"
+      parameter: "PermitEmptyPasswords"
+      value: "yes"
+  recommendation:
+    problem: "SSH 설정에서 빈 패스워드를 가진 계정의 로그인을 허용하고 있습니다. 이는 심각한 보안 위협입니다."
+    solution: "sshd_config 파일에서 'PermitEmptyPasswords' 값을 'no'로 즉시 변경하고 sshd 서비스를 재시작하십시오."

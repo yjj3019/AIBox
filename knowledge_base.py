@@ -56,11 +56,13 @@ class KnowledgeBase:
         log_key = condition.get('log_key')
         pattern = condition.get('pattern')
         
-        if not log_key or not pattern:
+        if not log_key or not pattern or not sos_data:
             return False
-            
-        log_content = sos_data.get('logs', {}).get(log_key, {}).get('content')
-        if not log_content:
+        
+        # [BUG FIX] dmesg 로그는 metadata의 최상위 키 'dmesg_content'에 직접 저장되어 있습니다.
+        # sos_data['logs'] 구조를 참조하던 것을 올바른 경로로 수정합니다.
+        log_content = sos_data.get('dmesg_content') if log_key == 'dmesg' else None
+        if not log_content or log_content == 'N/A':
             return False
 
         return re.search(pattern, log_content, re.IGNORECASE) is not None

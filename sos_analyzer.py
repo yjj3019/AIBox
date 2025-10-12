@@ -392,7 +392,10 @@ class SosreportParser:
         # [BUG FIX] dmsetup 정보를 파싱하여 메타데이터에 추가합니다. HTMLReportGenerator에서 직접 파일을 읽지 않도록 수정합니다.
         dmsetup_info = self._read_file(['sos_commands/devicemapper/dmsetup_info_-c'])
 
-        return { "kernel_parameters": all_sysctl_params, "boot_cmdline": boot_cmdline, "selinux_status": sestatus, "installed_packages": packages, "failed_services": failed_services, "configurations": {"sshd_config": sshd_config, "dmsetup_info": dmsetup_info} }
+        # [개선] sudoers 파일 내용을 읽어와서 configurations에 추가
+        sudoers_content = self._read_file(['etc/sudoers'])
+
+        return { "kernel_parameters": all_sysctl_params, "boot_cmdline": boot_cmdline, "selinux_status": sestatus, "installed_packages": packages, "failed_services": failed_services, "configurations": {"sshd_config": sshd_config, "dmsetup_info": dmsetup_info, "sudoers_content": sudoers_content} }
 
     # [사용자 요청] sar 데이터 형식의 비일관성을 해결하기 위해 스키마 기반 파싱을 도입합니다.
     # 각 sar 명령어 옵션에 대해 가능한 헤더 이름과 표준화된 키를 매핑합니다.

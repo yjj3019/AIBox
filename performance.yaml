@@ -1,0 +1,32 @@
+- id: KB-PERF-001
+  name: "I/O 오류 감지 (dmesg)"
+  severity: "High"
+  conditions:
+    - type: "log_contains"
+      log_key: "dmesg"
+      pattern: "I/O error"
+  recommendation:
+    problem: "dmesg 로그에서 I/O 오류가 감지되었습니다. 이는 디스크 하드웨어 문제, 파일 시스템 손상, 또는 드라이버 문제일 수 있습니다."
+    solution: "해당 디스크의 SMART 데이터를 확인하고, 파일 시스템 체크(fsck)를 수행하십시오. 문제가 지속되면 하드웨어 교체를 고려해야 합니다."
+
+- id: KB-PERF-002
+  name: "Out of Memory (OOM) Killer 감지"
+  severity: "High"
+  conditions:
+    - type: "log_contains"
+      log_key: "dmesg"
+      pattern: "Out of memory: Kill process"
+  recommendation:
+    problem: "시스템 메모리가 부족하여 OOM Killer가 프로세스를 강제 종료했습니다. 이는 메모리 누수 또는 시스템에 비해 과도한 메모리를 사용하는 애플리케이션이 원인일 수 있습니다."
+    solution: "메모리 사용량이 높은 프로세스를 확인하고, 애플리케이션의 메모리 사용량을 최적화하거나 시스템의 물리적 메모리를 증설하는 것을 고려하십시오."
+
+- id: KB-PERF-003
+  name: "CPU Soft Lockup 감지"
+  severity: "High"
+  conditions:
+    - type: "log_contains"
+      log_key: "dmesg"
+      pattern: "BUG: soft lockup - CPU"
+  recommendation:
+    problem: "CPU가 장시간 응답하지 않는 'Soft Lockup'이 감지되었습니다. 이는 커널 버그, 잘못된 드라이버 또는 하드웨어 문제일 수 있습니다."
+    solution: "커널을 최신 버전으로 업데이트하고, 관련 시스템 로그를 상세히 분석하여 원인이 되는 드라이버나 프로세스를 식별하십시오. 문제가 재발하면 커널 덤프를 분석해야 할 수 있습니다."

@@ -103,7 +103,7 @@
 
         .grid-container {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 2rem;
         }
 
@@ -257,8 +257,10 @@
 
         <!-- 상태 표시줄 추가 (스케줄 관리 버튼 추가됨) -->
         <div class="status-bar">
-            <div>
+            <div style="display: flex; gap: 0.75rem;">
                  <button id="open-cron-modal" class="schedule-btn">스케줄 관리</button>
+                 <!-- [사용자 요청] 규칙 관리 버튼을 팝업 형태로 변경 -->
+                 <button id="open-rules-modal" class="schedule-btn">규칙 관리</button>
             </div>
             <div style="display: flex; gap: 1.5rem;">
                 <div class="status-item">
@@ -331,6 +333,19 @@
         </div>
     </div>
 
+    <!-- [사용자 요청] rules.html을 표시할 팝업(Modal) 추가 -->
+    <div id="rules-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>규칙 관리</h2>
+                <span id="close-rules-modal" class="close-button">&times;</span>
+            </div>
+            <div class="modal-body">
+                <iframe src="rules.html" frameborder="0"></iframe>
+            </div>
+        </div>
+    </div>
+
 
 <script>
 // 페이지가 로드되면 시스템 상태를 가져오는 스크립트
@@ -394,10 +409,20 @@ document.addEventListener('DOMContentLoaded', function() {
     const cronModal = document.getElementById('cron-modal');
     const openModalBtn = document.getElementById('open-cron-modal');
     const closeModalSpan = document.getElementById('close-cron-modal');
+    
+    // [사용자 요청] 규칙 관리 팝업 관련 요소 추가
+    const rulesModal = document.getElementById('rules-modal');
+    const openRulesModalBtn = document.getElementById('open-rules-modal');
+    const closeRulesModalSpan = document.getElementById('close-rules-modal');
 
     // '스케줄 관리' 버튼 클릭 시 팝업 열기
     openModalBtn.addEventListener('click', () => {
         cronModal.style.display = 'flex';
+    });
+
+    // [사용자 요청] '규칙 관리' 버튼 클릭 시 팝업 열기
+    openRulesModalBtn.addEventListener('click', () => {
+        rulesModal.style.display = 'flex';
     });
 
     // 팝업의 'X' 버튼 클릭 시 팝업 닫기
@@ -405,10 +430,19 @@ document.addEventListener('DOMContentLoaded', function() {
         cronModal.style.display = 'none';
     });
 
+    // [사용자 요청] 규칙 관리 팝업의 'X' 버튼 클릭 시 팝업 닫기
+    closeRulesModalSpan.addEventListener('click', () => {
+        rulesModal.style.display = 'none';
+    });
+
     // 팝업 바깥 영역 클릭 시 팝업 닫기
     window.addEventListener('click', (event) => {
         if (event.target == cronModal) {
             cronModal.style.display = 'none';
+        }
+        // [사용자 요청] 규칙 관리 팝업 닫기 로직 추가
+        if (event.target == rulesModal) {
+            rulesModal.style.display = 'none';
         }
     });
 
@@ -416,6 +450,10 @@ document.addEventListener('DOMContentLoaded', function() {
     window.addEventListener('keydown', (event) => {
         if (event.key === 'Escape' && cronModal.style.display === 'flex') {
             cronModal.style.display = 'none';
+        }
+        // [사용자 요청] 규칙 관리 팝업 닫기 로직 추가
+        if (event.key === 'Escape' && rulesModal.style.display === 'flex') {
+            rulesModal.style.display = 'none';
         }
     });
 });
