@@ -424,7 +424,14 @@ def get_html_template(data):
                 <div class="card-header">{svg_icons['shield']} AI 선정 보안 위협</div>
                  <div class="card-body">
                     <table class="data-table">
-                        <thead><tr><th>CVE</th><th>Severity</th><th>영향받는 패키지</th><th>취약점 요약</th></tr></thead>
+                        <thead>
+                            <tr>
+                                <th style="width: 15%;">CVE</th>
+                                <th style="width: 10%; text-align: center;">Severity</th>
+                                <th style="width: 15%;">영향받는 패키지</th>
+                                <th>취약점 요약</th>
+                            </tr>
+                        </thead>
                         <tbody>{create_security_news_rows(security_news)}</tbody>
                     </table>
                 </div>
