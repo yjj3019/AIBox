@@ -11,6 +11,7 @@
 import yaml
 import re
 from pathlib import Path
+import logging
 from typing import List, Dict, Any, Optional
 
 class Color:
@@ -35,9 +36,9 @@ class KnowledgeBase:
 
     def _load_rules(self):
         """규칙 디렉터리에서 모든 .yaml 파일을 찾아 규칙을 로드합니다."""
-        print(f"[*] 지식 기반 규칙 로딩 시작... (디렉터리: '{self.rules_dir}')")
+        logging.info(f"지식 기반 규칙 로딩 시작... (디렉터리: '{self.rules_dir}')")
         if not self.rules_dir.is_dir():
-            print(f"{Color.YELLOW}[!] 규칙 디렉터리 '{self.rules_dir}'를 찾을 수 없습니다. 규칙 기반 분석을 건너뜁니다.{Color.ENDC}")
+            logging.warning(f"규칙 디렉터리 '{self.rules_dir}'를 찾을 수 없습니다. 규칙 기반 분석을 건너뜁니다.")
             return
 
         for rule_file in self.rules_dir.glob('*.yaml'):
@@ -46,10 +47,10 @@ class KnowledgeBase:
                     rules_from_file = yaml.safe_load(f)
                     if isinstance(rules_from_file, list):
                         self.rules.extend(rules_from_file)
-                        print(f"  - 성공: '{rule_file.name}'에서 {len(rules_from_file)}개 규칙 로드")
+                        logging.info(f"  - 성공: '{rule_file.name}'에서 {len(rules_from_file)}개 규칙 로드")
             except Exception as e:
-                print(f"[!] 오류: '{rule_file.name}' 파일 로딩 실패 - {e}")
-        print(f"[*] 총 {len(self.rules)}개의 규칙이 로드되었습니다.")
+                logging.error(f"오류: '{rule_file.name}' 파일 로딩 실패 - {e}")
+        logging.info(f"총 {len(self.rules)}개의 규칙이 로드되었습니다.")
 
     def _check_log_contains(self, condition: Dict[str, str], sos_data: Dict[str, Any]) -> bool:
         """'log_contains' 조건 유형을 확인합니다."""
@@ -96,7 +97,7 @@ class KnowledgeBase:
             return []
             
         findings = []
-        print("[*] 지식 기반 분석 시작...")
+        logging.info("지식 기반 분석 시작...")
         
         for rule in self.rules:
             all_conditions_met = True
@@ -124,7 +125,7 @@ class KnowledgeBase:
                     'category': 'Knowledge Base'
                 }
                 findings.append(finding)
-                print(f"  - 발견: [{rule.get('severity')}] {rule.get('name')}")
+                logging.info(f"  - 규칙 발견: [{rule.get('severity')}] {rule.get('name')}")
         
-        print(f"[*] 지식 기반 분석 완료. 총 {len(findings)}개의 문제점을 발견했습니다.")
+        logging.info(f"지식 기반 분석 완료. 총 {len(findings)}개의 문제점을 발견했습니다.")
         return findings

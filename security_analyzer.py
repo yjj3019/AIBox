@@ -11,6 +11,7 @@
 
 from typing import List, Dict, Any
 import re
+import logging
 
 class SecurityAnalyzer:
     """
@@ -29,7 +30,7 @@ class SecurityAnalyzer:
                 '5.4.0-80-generic': [{'cve': 'CVE-2023-5678', 'severity': 'Critical'}],
             }
         }
-        print("[*] 보안 분석 모듈이 초기화되었습니다.")
+        logging.info("보안 분석 모듈이 초기화되었습니다.")
 
     def _check_cve_vulnerabilities(self, packages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         """
@@ -42,7 +43,7 @@ class SecurityAnalyzer:
         if not packages:
             return findings
 
-        print("  - CVE 취약점 스캔 중...")
+        logging.info("  - CVE 취약점 스캔 중...")
         for pkg in packages:
             pkg_name = pkg.get('name')
             pkg_version = pkg.get('version')
@@ -70,7 +71,7 @@ class SecurityAnalyzer:
         if not sshd_config:
             return findings
 
-        print("  - SSH 설정 감사 중...")
+        logging.info("  - SSH 설정 감사 중...")
         # 루트 로그인 허용 여부 검사
         if sshd_config.get('PermitRootLogin', 'yes').lower() == 'yes':
             findings.append({
@@ -105,7 +106,7 @@ class SecurityAnalyzer:
         if not sudoers_content or sudoers_content == 'N/A':
             return findings
 
-        print("  - sudoers 설정 감사 중...")
+        logging.info("  - sudoers 설정 감사 중...")
         # NOPASSWD 키워드가 포함된 라인을 찾되, 주석 처리된 라인은 제외
         if re.search(r'^\s*[^#].*\bNOPASSWD\b', sudoers_content, re.MULTILINE):
             findings.append({
@@ -120,11 +121,12 @@ class SecurityAnalyzer:
         :param sos_data: sos_analyzer에 의해 파싱된 전체 데이터 딕셔너리
         :return: 발견된 모든 보안 관련 문제점 리스트
         """
-        print("[*] 보안 감사 분석 시작...")
+        logging.info("보안 감사 분석 시작...")
         all_findings = []
 
         # 1. CVE 취약점 분석
-        packages = sos_data.get('packages', [])
+        # [수정] 메타데이터의 최상위 키 'installed_packages'를 직접 참조하도록 변경합니다.
+        packages = sos_data.get('installed_packages', [])
         cve_findings = self._check_cve_vulnerabilities(packages)
         all_findings.extend(cve_findings)
 
@@ -140,5 +142,5 @@ class SecurityAnalyzer:
         sudo_findings = self._audit_sudoers_configuration(sudoers_content)
         all_findings.extend(sudo_findings)
 
-        print(f"[*] 보안 감사 분석 완료. 총 {len(all_findings)}개의 잠재적 보안 이슈를 발견했습니다.")
+        logging.info(f"보안 감사 분석 완료. 총 {len(all_findings)}개의 잠재적 보안 이슈를 발견했습니다.")
         return all_findings

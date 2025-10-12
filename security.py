@@ -659,8 +659,9 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
                 except Exception as e:
                     logging.error(f"CVE 예선 분석 묶음 처리 중 오류 발생: {e}")
                 
-                # [사용자 요청] 다음 묶음 처리 전 5초 대기하여 서버 부하를 조절합니다.
+                # [사용자 요청] 다음 묶음 처리 전 대기하여 서버 부하를 조절합니다.
                 if chunk_num < len(cve_chunks):
+                    logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
                     logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
                     time.sleep(2)
 
@@ -706,8 +707,9 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
             except Exception as e:
                 logging.error(f"CVE 결선 분석 묶음 처리 중 오류 발생: {e}")
 
-            # [사용자 요청] 다음 묶음 처리 전 5초 대기하여 서버 부하를 조절합니다.
+            # [사용자 요청] 다음 묶음 처리 전 대기하여 서버 부하를 조절합니다.
             if chunk_num < len(finalist_chunks):
+                logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
                 logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
                 time.sleep(2)
 

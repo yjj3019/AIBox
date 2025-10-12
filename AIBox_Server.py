@@ -92,6 +92,11 @@ ANALYSIS_STATUS = {}
 ANALYSIS_LOCK = Lock()
 ANALYSIS_CLEANUP_INTERVAL_SECONDS = 3600 # 1시간마다 오래된 상태 정리
 
+# [사용자 요청] LLM 동시 요청 수를 제한하여 서버 과부하를 방지합니다.
+# os.cpu_count()를 기반으로 설정하되, 최소 1개, 최대 4개로 제한합니다.
+MAX_CONCURRENT_LLM_REQUESTS = max(1, min((os.cpu_count() or 1) // 2, 4))
+llm_semaphore = threading.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
+
 CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -316,85 +321,87 @@ def call_llm_stream(system_message, user_message):
     - Cache Miss: 실제 LLM API를 호출하고, 스트리밍하면서 전체 응답을 캐시에 저장합니다.
     - Cache Hit: 캐시된 전체 응답을 가져와, 실제 스트리밍처럼 보이도록 작은 조각으로 나누어 전송합니다.
     """
-    request_id = str(uuid.uuid4())[:8]
-    start_time = time.time()
-    cache_key = get_cache_key(system_message, user_message)
-    cache_ttl_seconds = CONFIG.get('cache_ttl_days', 7) * 24 * 60 * 60
+    # [사용자 요청] 세마포를 사용하여 동시 LLM 요청 수를 제어합니다.
+    with llm_semaphore:
+        request_id = str(uuid.uuid4())[:8]
+        start_time = time.time()
+        cache_key = get_cache_key(system_message, user_message)
+        cache_ttl_seconds = CONFIG.get('cache_ttl_days', 7) * 24 * 60 * 60
 
-    # 1. 캐시 확인
-    cached_response = cache.get(cache_key)
-    if cached_response is not None:
-        duration = time.time() - start_time
-        response_size = len(cached_response.encode('utf-8'))
-        logging.info(f"[{request_id}] [CACHE HIT][STREAM] 캐시된 응답으로 스트리밍을 시뮬레이션합니다. (Key: {cache_key[:10]}...)")
-        llm_logger.info(f"[{request_id}] [CACHE HIT] Stream from cache. Duration: {duration:.2f}s, Size: {response_size} bytes")
-        full_response = cached_response
-        
-        # 캐시된 전체 응답을 작은 조각으로 나누어 스트리밍처럼 전송
-        chunk_size = 10
-        for i in range(0, len(full_response), chunk_size):
-            yield full_response[i:i+chunk_size]
-            time.sleep(0.002) # 실제 스트리밍처럼 보이게 하기 위한 작은 딜레이
-        return # 스트리밍 시뮬레이션 완료 후 함수 종료
-
-    # 2. Cache Miss: 실제 LLM API 호출
-    headers = {'Content-Type': 'application/json'}
-    if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
-    messages = [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}]
-    payload = {"model": CONFIG["model"], "messages": messages, "max_tokens": 8192, "temperature": 0.2, "stream": True}
-    request_size = len(json.dumps(payload).encode('utf-8'))
-
-    # [신규] LLM 요청 로깅
-    llm_logger.info(f"[{request_id}] [REQ][STREAM] POST {CONFIG['llm_url']}, Size: {request_size} bytes")
-    llm_logger.debug(f"[{request_id}] [REQ PAYLOAD] {json.dumps(messages)}")
-
-    logging.info(f"[{request_id}] [LLM STREAM REQ] POST {CONFIG['llm_url']}")
-    # cache_misses.inc() # 메트릭 기능이 구현될 때까지 주석 처리
-
-    try:
-        full_response_accumulator = []
-        total_tokens = {'prompt': 0, 'completion': 0}
-        response = requests.post(CONFIG["llm_url"], headers=headers, json=payload, timeout=180, stream=True)
-        logging.info(f"[{request_id}] [LLM STREAM RESP] Status Code: {response.status_code}. Starting stream.")
-        response.raise_for_status()
-
-        for line in response.iter_lines():
-            if not line: continue
-            decoded_line = line.decode('utf-8')
-            json_str = decoded_line[len('data: '):].strip() if decoded_line.startswith('data: ') else decoded_line
-            if json_str == '[DONE]': 
-                logging.info("[LLM STREAM RESP] Stream finished with [DONE].")
-                break
-            if json_str:
-                try:
-                    data = json.loads(json_str)
-                    content = data.get('choices', [{}])[0].get('delta', {}).get('content') or data.get('message', {}).get('content')
-                    # 토큰 정보가 스트림의 마지막에 오는 경우 처리 (Ollama 등)
-                    if data.get('done') and 'total_duration' in data:
-                        total_tokens['prompt'] = data.get('prompt_eval_count', 0)
-                        total_tokens['completion'] = data.get('eval_count', 0)
-
-                    if content:
-                        full_response_accumulator.append(content)
-                        yield content
-                except (json.JSONDecodeError, KeyError, IndexError) as e:
-                    logging.warning(f"[LLM STREAM PARSE WARNING] Skipping line: {e} - Line: '{decoded_line}'")
-                    pass
-    except Exception as e: 
-        logging.error(f"[LLM STREAM ERROR] LLM server communication error: {e}", exc_info=True)
-        llm_logger.error(f"[{request_id}] [ERROR][STREAM] Communication error: {e}")
-        yield f"\n\n**Error:** LLM server communication error: {e}"
-    finally:
-        # 3. 스트리밍 완료 후 전체 응답을 캐시에 저장
-        if full_response_accumulator:
-            final_response = "".join(full_response_accumulator)
+        # 1. 캐시 확인
+        cached_response = cache.get(cache_key)
+        if cached_response is not None:
             duration = time.time() - start_time
-            response_size = len(final_response.encode('utf-8'))
+            response_size = len(cached_response.encode('utf-8'))
+            logging.info(f"[{request_id}] [CACHE HIT][STREAM] 캐시된 응답으로 스트리밍을 시뮬레이션합니다. (Key: {cache_key[:10]}...)")
+            llm_logger.info(f"[{request_id}] [CACHE HIT] Stream from cache. Duration: {duration:.2f}s, Size: {response_size} bytes")
+            full_response = cached_response
             
-            cache.set(cache_key, final_response, expire=cache_ttl_seconds)
-            llm_logger.info(f"[{request_id}] [RESP][STREAM] Duration: {duration:.2f}s, Size: {response_size} bytes, Tokens(P/C): {total_tokens['prompt']}/{total_tokens['completion']}")
-            llm_logger.debug(f"[{request_id}] [RESP BODY] {final_response}")
-            logging.info(f"[{request_id}] [CACHE MISS][STREAM] 새로운 스트리밍 응답을 캐시에 저장합니다. (Key: {cache_key[:10]}...)")
+            # 캐시된 전체 응답을 작은 조각으로 나누어 스트리밍처럼 전송
+            chunk_size = 10
+            for i in range(0, len(full_response), chunk_size):
+                yield full_response[i:i+chunk_size]
+                time.sleep(0.002) # 실제 스트리밍처럼 보이게 하기 위한 작은 딜레이
+            return # 스트리밍 시뮬레이션 완료 후 함수 종료
+
+        # 2. Cache Miss: 실제 LLM API 호출
+        headers = {'Content-Type': 'application/json'}
+        if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
+        messages = [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}]
+        payload = {"model": CONFIG["model"], "messages": messages, "max_tokens": 8192, "temperature": 0.2, "stream": True}
+        request_size = len(json.dumps(payload).encode('utf-8'))
+
+        # [신규] LLM 요청 로깅
+        llm_logger.info(f"[{request_id}] [REQ][STREAM] POST {CONFIG['llm_url']}, Size: {request_size} bytes")
+        llm_logger.debug(f"[{request_id}] [REQ PAYLOAD] {json.dumps(messages)}")
+
+        logging.info(f"[{request_id}] [LLM STREAM REQ] POST {CONFIG['llm_url']}")
+        # cache_misses.inc() # 메트릭 기능이 구현될 때까지 주석 처리
+
+        try:
+            full_response_accumulator = []
+            total_tokens = {'prompt': 0, 'completion': 0}
+            response = requests.post(CONFIG["llm_url"], headers=headers, json=payload, timeout=180, stream=True)
+            logging.info(f"[{request_id}] [LLM STREAM RESP] Status Code: {response.status_code}. Starting stream.")
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not line: continue
+                decoded_line = line.decode('utf-8')
+                json_str = decoded_line[len('data: '):].strip() if decoded_line.startswith('data: ') else decoded_line
+                if json_str == '[DONE]': 
+                    logging.info("[LLM STREAM RESP] Stream finished with [DONE].")
+                    break
+                if json_str:
+                    try:
+                        data = json.loads(json_str)
+                        content = data.get('choices', [{}])[0].get('delta', {}).get('content') or data.get('message', {}).get('content')
+                        # 토큰 정보가 스트림의 마지막에 오는 경우 처리 (Ollama 등)
+                        if data.get('done') and 'total_duration' in data:
+                            total_tokens['prompt'] = data.get('prompt_eval_count', 0)
+                            total_tokens['completion'] = data.get('eval_count', 0)
+
+                        if content:
+                            full_response_accumulator.append(content)
+                            yield content
+                    except (json.JSONDecodeError, KeyError, IndexError) as e:
+                        logging.warning(f"[LLM STREAM PARSE WARNING] Skipping line: {e} - Line: '{decoded_line}'")
+                        pass
+        except Exception as e: 
+            logging.error(f"[LLM STREAM ERROR] LLM server communication error: {e}", exc_info=True)
+            llm_logger.error(f"[{request_id}] [ERROR][STREAM] Communication error: {e}")
+            yield f"\n\n**Error:** LLM server communication error: {e}"
+        finally:
+            # 3. 스트리밍 완료 후 전체 응답을 캐시에 저장
+            if full_response_accumulator:
+                final_response = "".join(full_response_accumulator)
+                duration = time.time() - start_time
+                response_size = len(final_response.encode('utf-8'))
+                
+                cache.set(cache_key, final_response, expire=cache_ttl_seconds)
+                llm_logger.info(f"[{request_id}] [RESP][STREAM] Duration: {duration:.2f}s, Size: {response_size} bytes, Tokens(P/C): {total_tokens['prompt']}/{total_tokens['completion']}")
+                llm_logger.debug(f"[{request_id}] [RESP BODY] {final_response}")
+                logging.info(f"[{request_id}] [CACHE MISS][STREAM] 새로운 스트리밍 응답을 캐시에 저장합니다. (Key: {cache_key[:10]}...)")
 
 def initialize_and_monitor_prompts():
     def load_prompts(force_reload=False):
@@ -857,6 +864,8 @@ if __name__ == '__main__':
     parser.add_argument('--cache-ttl-days', type=int, default=7, help='Number of days to keep LLM cache')
     parser.add_argument('--cache-size-gb', type=float, default=1.0, help='Maximum size of the cache in gigabytes')
     # [개선] 서버의 외부 접속 URL을 명시적으로 받기 위한 인자.
+    # [사용자 요청] LLM 동시 요청 수를 설정하는 인자 추가
+    parser.add_argument('--connection-limit', type=int, default=500, help='Maximum number of open connections for the server')
     parser.add_argument('--base-url', default=os.getenv('AIBOX_BASE_URL'), help='External base URL for the server (e.g., http://aibo.example.com)')
     args = parser.parse_args()
 
@@ -887,6 +896,10 @@ if __name__ == '__main__':
     if not CONFIG.get('password'):
         logging.error("FATAL: Password is not set. Please set the AIBOX_PASSWORD environment variable.")
         sys.exit(1)
+    
+    # [사용자 요청] 세마포어 값 로깅
+    logging.info(f"LLM 동시 요청 수가 {MAX_CONCURRENT_LLM_REQUESTS}으로 제한됩니다.")
+
     logging.info("[3/8] AIBOX_PASSWORD 환경 변수 확인 완료.")
     logging.info("[3/8] 비밀번호(AIBOX_PASSWORD) 확인 완료.")
 
@@ -930,4 +943,5 @@ if __name__ == '__main__':
     logging.info("==========================================================")
     logging.info(f"  AIBox 서버가 http://{args.host}:{args.port} 에서 시작됩니다.  ")
     logging.info("==========================================================")
-    serve(app, host=args.host, port=args.port, threads=16)
+    # [사용자 요청] 연결 한도를 늘려 "total open connections reached the connection limit" 오류를 방지합니다.
+    serve(app, host=args.host, port=args.port, threads=16, connection_limit=args.connection_limit)

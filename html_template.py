@@ -48,7 +48,8 @@ def get_html_template(data):
     def create_recommendation_rows(rec_list):
         if not rec_list: return "<tr><td colspan='4' style='text-align:center;'>데이터 없음</td></tr>"
         rows = ""
-        priority_map = {"높음": "high", "중간": "medium", "낮음": "low"}
+        # [사용자 요청] AI가 한글로 반환하는 우선순위를 CSS 클래스에 맞게 매핑합니다.
+        priority_map = {"높음": "high", "중간": "medium", "낮음": "low", "High": "high", "Medium": "medium", "Low": "low"}
         for item in rec_list:
             priority_class = priority_map.get(item.get('priority', ''), "")
             issue_html = h(str(item.get('issue', 'N/A')))
@@ -56,25 +57,31 @@ def get_html_template(data):
             if related_logs and isinstance(related_logs, list):
                 logs_html = h('\n'.join(related_logs))
                 issue_html += f' <div class="tooltip"><span class="log-icon">💬</span><span class="tooltiptext">{logs_html}</span></div>'
-            rows += f"<tr><td><span class='priority-badge {priority_class}'>{h(item.get('priority', 'N/A'))}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{issue_html}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
+            
+            solution_html = h(str(item.get('solution', 'N/A')))
+            rows += f"<tr><td><span class='priority-badge {priority_class}'>{h(item.get('priority', 'N/A'))}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{issue_html}</td><td>{solution_html}</td></tr>"
         return rows
 
     def create_security_audit_rows(audit_list):
         if not audit_list: return "<tr><td colspan='4' style='text-align:center;'>발견된 보안 설정 이슈 없음</td></tr>"
         rows = ""
-        priority_map = {"High": "high", "Medium": "medium", "Low": "low"}
+        # [사용자 요청] 심각도를 한글로 표기하고 CSS 클래스에 맞게 매핑합니다.
+        severity_map = {"High": ("높음", "high"), "Medium": ("중간", "medium"), "Low": ("낮음", "low")}
         for item in audit_list:
-            priority_class = priority_map.get(item.get('severity', ''), "")
-            rows += f"<tr><td><span class='priority-badge {priority_class}'>{h(item.get('severity', 'N/A'))}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{h(str(item.get('name', 'N/A')))}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
+            severity_en = item.get('severity', 'N/A')
+            severity_ko, severity_class = severity_map.get(severity_en, (severity_en, ""))
+            rows += f"<tr><td><span class='priority-badge {severity_class}'>{h(severity_ko)}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{h(str(item.get('name', 'N/A')))}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
         return rows
 
     def create_kb_finding_rows(finding_list):
         if not finding_list: return "<tr><td colspan='4' style='text-align:center;'>규칙 기반으로 발견된 이슈 없음</td></tr>"
         rows = ""
-        priority_map = {"High": "high", "Medium": "medium", "Low": "low"}
+        # [사용자 요청] 심각도를 한글로 표기하고 CSS 클래스에 맞게 매핑합니다.
+        severity_map = {"High": ("높음", "high"), "Medium": ("중간", "medium"), "Low": ("낮음", "low")}
         for item in finding_list:
-            priority_class = priority_map.get(item.get('severity', ''), "")
-            rows += f"<tr><td><span class='priority-badge {priority_class}'>{h(item.get('severity', 'N/A'))}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{h(str(item.get('name', 'N/A')))}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
+            severity_en = item.get('severity', 'N/A')
+            severity_ko, severity_class = severity_map.get(severity_en, (severity_en, ""))
+            rows += f"<tr><td><span class='priority-badge {severity_class}'>{h(severity_ko)}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{h(str(item.get('name', 'N/A')))}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
         return rows
 
     def render_graph(graph_key, title, graphs_data):
@@ -123,6 +130,20 @@ def get_html_template(data):
             rows.append(row_html)
         return "".join(rows)
 
+    def create_routing_table_rows(routing_table):
+        """[신규] 라우팅 테이블 정보를 HTML 행으로 생성합니다."""
+        if not routing_table: return "<tr><td colspan='3' style='text-align:center;'>데이터 없음</td></tr>"
+        rows = []
+        for route in routing_table:
+            row_html = f"""
+                <tr>
+                    <td>{h(route.get('destination', 'N/A'))}</td>
+                    <td>{h(route.get('gateway', 'N/A'))}</td>
+                    <td>{h(route.get('device', 'N/A'))}</td>
+                </tr>"""
+            rows.append(row_html)
+        return "".join(rows)
+
     def create_ethtool_rows(ethtool_data):
         if not ethtool_data: return "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
         return "".join(f"<tr><td>{h(iface)}</td><td>{h(d.get('driver'))}</td><td>{h(d.get('speed'))}</td><td>{h(d.get('duplex'))}</td><td>{'UP' if d.get('link') == 'yes' else 'DOWN'}</td><td>{h(d.get('rx_ring'))}</td></tr>" for iface, d in ethtool_data.items())
@@ -137,12 +158,41 @@ def get_html_template(data):
         return rows
 
     def create_security_news_rows(news_list):
-        if not news_list: return "<tr><td colspan='4' style='text-align:center;'>관련 보안 뉴스 없음</td></tr>"
+        if not news_list: return "<tr><td colspan='4' style='text-align:center;'>AI가 선정한 보안 위협 없음</td></tr>"
         rows = ""
+        # [사용자 요청] AI가 한글 또는 영문으로 반환할 수 있는 심각도를 CSS 클래스에 맞게 매핑합니다.        
+        severity_map = {"심각": "high", "critical": "high", "중요": "medium", "important": "medium"} 
         for item in news_list:
-            severity = item.get('severity', '').lower()
-            severity_badge = f"<span class='priority-badge {'high' if severity == 'critical' else 'medium' if severity == 'important' else 'low'}'>{h(item.get('severity'))}</span>"
-            rows += f"<tr><td><a href='https://access.redhat.com/security/cve/{h(item.get('cve_id'))}' target='_blank'>{h(item.get('cve_id'))}</a></td><td>{severity_badge}</td><td>{h(item.get('package'))}</td><td>{h(item.get('description'))}</td></tr>"
+            severity_class = severity_map.get(item.get('severity', '').lower(), "low") # noqa: E501
+            severity_badge = f"<span class='priority-badge {severity_class}'>{h(item.get('severity', 'N/A'))}</span>"
+            
+            # [사용자 요청] 설치된 버전 정보를 툴팁으로 표시
+            package_name = h(item.get('package'))
+            installed_version = item.get('installed_version')
+            if installed_version:
+                package_html = f'<div class="tooltip">{package_name}<span class="tooltiptext" style="width: 300px; margin-left: -150px;">Installed: {h(installed_version)}</span></div>'
+            else:
+                package_html = package_name
+            
+            # [사용자 요청] CVE ID 아래에 공개일과 CVSSv3 점수를 추가합니다.
+            cve_id = h(item.get('cve_id'))
+            # [BUG FIX] JSON 데이터의 필드 이름(release_date)을 정확히 참조하도록 수정합니다.
+            public_date = h(item.get('release_date', item.get('public_date', '')).split('T')[0])
+            
+            # [BUG FIX] CVSS 점수 필드(cvss3.cvss3_base_score)를 정확히 참조하도록 수정합니다.
+            cvss3_data = item.get('cvss3', {})
+            cvss_score = 'N/A'
+            if isinstance(cvss3_data, dict):
+                cvss_score = h(cvss3_data.get('cvss3_base_score', 'N/A'))
+            
+            cve_cell_html = f"""
+                <a href='https://access.redhat.com/security/cve/{cve_id}' target='_blank'>{cve_id}</a>
+                <div style='font-size: 0.8em; color: #7f8c8d;'>
+                    <span>{public_date}</span> &bull; <span>CVSS: {cvss_score}</span>
+                </div>
+            """
+            
+            rows += f"<tr><td>{cve_cell_html}</td><td>{severity_badge}</td><td>{package_html}</td><td>{h(item.get('description'))}</td></tr>"
         return rows
 
     def create_netdev_rows(netdev_list):
@@ -199,7 +249,7 @@ def get_html_template(data):
             .card-header .icon {{ width: 28px; height: 28px; margin-right: 1rem; color: var(--primary-color); }}
             .card-body {{ padding: 1.5rem; }}
             .data-table {{ width: 100%; border-collapse: collapse; }}
-            .data-table th, .data-table td {{ padding: 0.9rem 1rem; text-align: left; border-bottom: 1px solid var(--border-color); word-break: break-word; }}
+            .data-table th, .data-table td {{ padding: 0.9rem 1rem; text-align: left; border-bottom: 1px solid var(--border-color); word-break: break-all; }}
             .data-table thead th {{ background-color: #f7f9fc; font-weight: 600; }}
             .graph-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(450px, 1fr)); gap: 1.5rem; }}
             .graph-container {{ padding: 1rem; border: 1px solid var(--border-color); border-radius: 8px; margin-top: 1rem; }}
@@ -221,6 +271,10 @@ def get_html_template(data):
             .priority-badge.low {{ background-color: #7f8c8d; }}
             .tooltip {{ position: relative; display: inline-block; cursor: help; }}
             .tooltip .tooltiptext {{ visibility: hidden; width: 450px; background-color: var(--secondary-color); color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 10; bottom: 125%; left: 50%; margin-left: -225px; opacity: 0; transition: opacity 0.3s; white-space: pre-wrap;}}
+            .log-icon {{ font-size: 0.8em; vertical-align: super; }}
+            .solution-box {{ margin-bottom: 0.5rem; }}
+            .validation-box {{ margin-top: 0.8rem; padding: 0.5rem 0.8rem; background-color: #f0f2f5; border-radius: 4px; font-size: 0.9em; }}
+            .validation-box code {{ background-color: transparent; padding: 0; }}
             .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
         </style>
         <script>
@@ -270,7 +324,7 @@ def get_html_template(data):
             <div class="report-card" {'style="display:none;"' if not security_audit_findings else ''}>
                 <div class="card-header">{svg_icons['shield']} 보안 감사 결과</div>
                 <div class="card-body"><table class="data-table">
-                    <thead><tr><th>심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
+                    <thead><tr><th style="width: 10%; text-align: center;">심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
                     <tbody>{create_security_audit_rows(security_audit_findings)}</tbody>
                 </table></div>
             </div>
@@ -278,7 +332,7 @@ def get_html_template(data):
             <div class="report-card" {'style="display:none;"' if not kb_findings else ''}>
                 <div class="card-header">{svg_icons['shield']} 규칙 기반 진단 결과 (Knowledge Base)</div>
                 <div class="card-body"><table class="data-table">
-                    <thead><tr><th>심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
+                    <thead><tr><th style="width: 10%; text-align: center;">심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
                     <tbody>{create_kb_finding_rows(kb_findings)}</tbody>
                 </table></div>
             </div>
@@ -313,6 +367,11 @@ def get_html_template(data):
                     <table class="data-table">
                         <thead><tr><th>Interface</th><th>MAC</th><th>IPv4</th><th>State</th></tr></thead>
                         <tbody>{create_ip4_details_rows(network_details.get('interfaces', []))}</tbody>
+                    </table>
+                    <h3>라우팅 정보</h3>
+                    <table class="data-table">
+                        <thead><tr><th>Destination</th><th>Gateway</th><th>Device</th></tr></thead>
+                        <tbody>{create_routing_table_rows(network_details.get('routing_table', []))}</tbody>
                     </table>
                     <h3>ETHTOOL 상태</h3>
                     <table class="data-table">
@@ -362,10 +421,10 @@ def get_html_template(data):
             </div>
 
             <div class="report-card">
-                <div class="card-header">{svg_icons['shield']} AI 선정 긴급 보안 위협</div>
+                <div class="card-header">{svg_icons['shield']} AI 선정 보안 위협</div>
                  <div class="card-body">
                     <table class="data-table">
-                        <thead><tr><th>CVE</th><th>Severity</th><th>Package</th><th>Description</th></tr></thead>
+                        <thead><tr><th>CVE</th><th>Severity</th><th>영향받는 패키지</th><th>취약점 요약</th></tr></thead>
                         <tbody>{create_security_news_rows(security_news)}</tbody>
                     </table>
                 </div>
