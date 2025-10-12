@@ -225,10 +225,25 @@ def make_request_generic(method, url, **kwargs):
         return None
 
 def _parse_llm_json_response(llm_response_str: str):
-    if not llm_response_str or not llm_response_str.strip(): raise ValueError("LLM 응답이 비어 있습니다.")
+    if not llm_response_str or not llm_response_str.strip():
+        raise ValueError("LLM 응답이 비어 있습니다.")
+
+    # [핵심 버그 수정] re.DOTALL 플래그를 사용하여 정규식이 줄 바꿈 문자를 포함한 모든 문자를 처리하도록 합니다.
+    # 이를 통해 응답 시작 부분의 줄 바꿈 문자나 다른 텍스트를 무시하고 JSON 블록을 정확하게 찾을 수 있습니다.
+    match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```|\{.*\}|\[.*\]', llm_response_str, re.DOTALL)
+    if not match:
+        raise ValueError(f"응답에서 유효한 JSON 형식(객체 또는 배열)을 찾을 수 없습니다. 응답 내용: {llm_response_str[:500]}")
+
+    # 찾은 JSON 문자열을 가져옵니다.
+    json_str = match.group(0)
+
     try:
-        return json.loads(re.sub(r'^```(json)?\s*|\s*```$', '', llm_response_str.strip()))
-    except json.JSONDecodeError as e: raise ValueError(f"LLM 응답 JSON 파싱 실패: {e}\n응답 내용: {llm_response_str[:500]}")
+        # 마크다운 코드 블록 마커를 제거하고 파싱을 시도합니다.
+        # [BUG FIX] 이중 이스케이프 문제를 피하기 위해 불필요한 .replace() 호출을 제거합니다.
+        cleaned_json_str = re.sub(r'^```(json)?\s*|\s*```$', '', json_str.strip(), flags=re.DOTALL)
+        return json.loads(cleaned_json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM 응답 JSON 파싱 실패: {e}\n응답 내용: {json_str[:500]}")
 
 def get_cache_key(system_message, user_message):
     """요청 내용을 기반으로 고유한 캐시 키를 생성합니다."""
@@ -685,24 +700,16 @@ Return ONLY a single, valid JSON object matching this structure:
 """
         response_str = call_llm_blocking("You are an assistant designed to output only a single valid JSON object.", prompt)
     
-        try: # [BUG FIX] response_str이 JSON 문자열일 수 있으므로, 먼저 파싱 시도
-            # [개선] LLM 응답이 JSON 형식이 아닐 경우를 대비한 예외 처리 강화
+        try:
+            # [핵심 버그 수정] LLM 응답이 유효한 JSON인지 파싱을 시도합니다.
             response_json = _parse_llm_json_response(response_str)
-            # [BUG FIX] LLM이 유효한 JSON을 반환한 경우, 다시 문자열로 감싸지 않고 JSON 객체 그대로 반환합니다.
-            # 이렇게 해야 클라이언트(sos_analyzer)가 이중으로 파싱할 필요 없이 데이터를 바로 사용할 수 있습니다.
             return jsonify(response_json)
         except ValueError as e:
-            logging.warning(f"LLM 응답을 JSON으로 직접 파싱하는 데 실패했습니다: {e}. 텍스트에서 JSON 블록 추출을 시도합니다.")
-            # 정규식을 사용하여 마크다운 코드 블록에서 JSON 콘텐츠를 추출합니다.
-            match = re.search(r'```(json)?\s*(\{.*\}|\[.*\])\s*```', response_str, re.DOTALL)
-            if match:
-                json_str = match.group(2)
-                logging.info("응답에서 JSON 블록을 성공적으로 추출하여 반환합니다.")
-                # 추출된 JSON 문자열을 클라이언트에 직접 반환합니다.
-                return Response(json_str, mimetype='application/json; charset=utf-8')
-
-            logging.error("응답에서 유효한 JSON 블록을 찾지 못했습니다. 원본 텍스트를 raw_response로 반환합니다.")
-            return jsonify({"raw_response": response_str, "error": "LLM response was not in a valid JSON format."})
+            # [핵심 버그 수정] 파싱 실패 시, 클라이언트가 오류를 인지할 수 있도록
+            # 유효한 JSON 형식의 오류 메시지를 생성하여 반환합니다.
+            logging.error(f"LLM 응답을 JSON으로 파싱하는 데 실패했습니다: {e}")
+            error_response = {"summary": "AI 분석 실패: LLM 응답이 유효한 JSON 형식이 아닙니다.", "critical_issues": [f"LLM 응답 파싱 오류: {e}", f"원본 응답 (일부): {response_str[:500]}"], "warnings": [], "recommendations": []}
+            return jsonify(error_response)
 
     except Exception as e:
         logging.error(f"/api/sos/analyze_system error: {e}", exc_info=True)

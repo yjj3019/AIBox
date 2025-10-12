@@ -126,36 +126,3 @@ class KnowledgeBase:
         
         print(f"[*] 지식 기반 분석 완료. 총 {len(findings)}개의 문제점을 발견했습니다.")
         return findings
-
-# 이 파일이 직접 실행될 경우를 위한 간단한 테스트 로직
-if __name__ == '__main__':
-    # 가상의 sos_data 생성
-    mock_sos_data = {
-        'logs': {
-            'dmesg': {
-                'content': '...some log...\n[  12.345] Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)\n...more log...'
-            },
-            'secure': {
-                'content': '...some log...\nSep 30 14:20:01 my-server sshd[12345]: Failed password for invalid user admin from 10.0.0.1 port 22 ssh2'
-            }
-        },
-        'configurations': {
-            'sshd_config': {
-                'PermitRootLogin': 'yes',
-                'PasswordAuthentication': 'yes'
-            }
-        }
-    }
-
-    # 지식 기반 초기화 및 분석 수행
-    kb = KnowledgeBase(rules_dir='rules')
-    detected_findings = kb.analyze(mock_sos_data)
-
-    # 결과 출력
-    if detected_findings:
-        print("\n--- 감지된 문제점 ---")
-        for find in detected_findings:
-            print(f"\nID: {find['id']}\n이름: {find['name']}\n심각도: {find['severity']}")
-            print(f"문제: {find['description']}\n해결책: {find['solution']}")
-    else:
-        print("\n감지된 문제점이 없습니다.")

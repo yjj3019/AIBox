@@ -27,26 +27,61 @@ import tempfile
 import time
 import traceback
 from typing import Dict, Any, List, Optional
+from collections import Counter
+import xml.etree.ElementTree as ET
 from datetime import timedelta, date
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from html_template import get_html_template
+from security_analyzer import SecurityAnalyzer
+from knowledge_base import KnowledgeBase
 
-# --- Matplotlib 라이브러리 설정 ---
+# --- 그래프 라이브러리 설정 ---
 try:
+    # [대체 구현] Plotly는 동적 그래프, Matplotlib은 정적 이미지 생성에 사용합니다.
+    try:
+        import plotly.graph_objects as go
+        import plotly.io as pio
+        pio.templates.default = "plotly_white"
+        IS_PLOTLY_AVAILABLE = True
+    except ImportError:
+        IS_PLOTLY_AVAILABLE = False
+
     import matplotlib
-    matplotlib.use('Agg')
+    matplotlib.use('Agg') # GUI 백엔드 없이 실행
     import matplotlib.pyplot as plt
     import matplotlib.font_manager as fm
-    import matplotlib.ticker as mticker
-    IS_GRAPHING_ENABLED = True
+    IS_MATPLOTLIB_AVAILABLE = True
 except ImportError:
-    matplotlib, plt, fm, mticker = None, None, None, None
-    IS_GRAPHING_ENABLED = False
+    IS_PLOTLY_AVAILABLE, IS_MATPLOTLIB_AVAILABLE = False, False
+
+# [BUG FIX] 그래프 라이브러리 사용 가능 여부를 나타내는 플래그를 정의합니다.
+IS_GRAPHING_ENABLED = IS_PLOTLY_AVAILABLE and IS_MATPLOTLIB_AVAILABLE
+
+# [효율성 제안] Pandas 라이브러리 추가
+try:
+    import pandas as pd
+    IS_PANDAS_AVAILABLE = True
+except ImportError:
+    IS_PANDAS_AVAILABLE = False
+
+# [정확성 제안] pytz 라이브러리 추가
+try:
+    import pytz
+    IS_PYTZ_AVAILABLE = True
+except ImportError:
+    IS_PYTZ_AVAILABLE = False
+
+# [개선] 토큰 기반 청크 분할을 위한 tiktoken 라이브러리 추가
+try:
+    import tiktoken
+    IS_TIKTOKEN_AVAILABLE = True
+except ImportError:
+    IS_TIKTOKEN_AVAILABLE = False
 
 # --- 로깅 및 콘솔 출력 설정 ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
 class Color:
     PURPLE, CYAN, BLUE, GREEN, YELLOW, RED, BOLD, END = '\033[95m', '\033[96m', '\033[94m', '\033[92m', '\033[93m', '\033[91m', '\033[1m', '\033[0m'
@@ -68,6 +103,1201 @@ def json_serializer(obj):
     if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.isoformat()
     raise TypeError(f"Object of type '{type(obj).__name__}' is not JSON serializable")
+
+class SosreportParser:
+    def __init__(self, extract_path: Path):
+        subdirs = [d for d in extract_path.iterdir() if d.is_dir()]
+        if not subdirs: raise FileNotFoundError(f"sosreport 베이스 디렉토리를 찾을 수 없습니다: {extract_path}")
+        self.base_path = subdirs[0]
+        # [BUG FIX & 사용자 요청] report_date를 None으로 초기화하고, _initialize_report_date를 먼저 호출하여 올바른 날짜를 설정합니다.
+        self.report_date: Optional[datetime.datetime] = None
+        self._initialize_report_date()
+        self.cpu_cores_count = 0
+        self._sar_cache = {}  # [개선] SAR 출력 캐싱
+        self._initialize_cpu_cores() # [BUG FIX] 생성자에서 CPU 코어 수를 먼저 초기화합니다.
+        self.device_map = self._create_device_map() # [개선] 장치명 매핑 정보 생성
+        self.dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
+
+    def _read_file(self, possible_paths: List[str], default: str = 'N/A') -> str:
+        for path_suffix in possible_paths:
+            full_path = self.base_path / path_suffix
+            if full_path.exists():
+                try: return full_path.read_text(encoding='utf-8', errors='ignore').strip()
+                except Exception: continue
+        return default
+
+    def _initialize_report_date(self):
+        date_content = self._read_file(['sos_commands/date/date', 'date'])
+        # [사용자 요청] sar 데이터 추출 기준 날짜를 sosreport 내의 date 파일로 설정합니다.
+        try:
+            # [BUG FIX] 정규식을 수정하여 요일(Weekday) 대신 월(Month)을 올바르게 캡처합니다.
+            match = re.search(r'[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+([\d:]+)\s+([A-Z]+)\s+(\d{4})', date_content)
+            if match:
+                month_abbr, day, time_str, tz_str, year = match.groups()
+                month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+                if month_abbr in month_map:
+                    hour, minute, second = map(int, time_str.split(':'))
+                    # [정확성 제안] pytz를 사용하여 타임존을 명시적으로 처리
+                    if IS_PYTZ_AVAILABLE:
+                        try:
+                            tz = pytz.timezone(tz_str)
+                            self.report_date = tz.localize(datetime.datetime(int(year), month_map[month_abbr], int(day), hour, minute, second))
+                        except pytz.UnknownTimeZoneError:
+                            self.report_date = datetime.datetime(int(year), month_map[month_abbr], int(day), hour, minute, second)
+                    else:
+                        self.report_date = datetime.datetime(int(year), month_map[month_abbr], int(day), hour, minute, second)
+
+                    logging.info(f"분석 기준 날짜를 'date' 파일 기준으로 설정: {self.report_date.strftime('%Y-%m-%d %Z')}")
+                    return
+        except Exception as e: logging.warning(f"sosreport 생성 날짜 파싱 중 오류 발생: {e}")
+
+        # [사용자 제안] date 파일 파싱 실패 시, sosreport 디렉터리 이름에서 날짜를 추출하는 폴백 로직을 추가합니다.
+        if self.report_date is None:
+            logging.warning(Color.warn("'date' 파일에서 날짜를 파싱하지 못했습니다. sosreport 디렉터리 이름에서 날짜 추출을 시도합니다."))
+            try:
+                # sosreport-hostname-YYYY-MM-DD-xxxxxx 형식의 날짜를 찾습니다.
+                if match := re.search(r'(\d{4})-(\d{2})-(\d{2})', self.base_path.name):
+                    year, month, day = map(int, match.groups())
+                    self.report_date = datetime.datetime(year, month, day)
+                    logging.info(f"분석 기준 날짜를 'sosreport 디렉터리명' 기준으로 설정: {self.report_date.strftime('%Y-%m-%d')}")
+                    return
+            except Exception as e:
+                logging.warning(f"sosreport 디렉터리명에서 날짜 파싱 중 오류 발생: {e}")
+
+        # 모든 날짜 추출 로직이 실패하면, 현재 시간을 기본값으로 사용합니다.
+        if self.report_date is None:
+            self.report_date = datetime.datetime.now()
+            logging.error("분석 기준 날짜를 설정하지 못했습니다. 현재 시간을 기준으로 분석을 시도합니다.")
+
+    def _initialize_cpu_cores(self):
+        lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu'])
+        if match := re.search(r'^CPU\(s\):\s+(\d+)', lscpu_output, re.MULTILINE): self.cpu_cores_count = int(match.group(1))
+
+    def _create_device_map(self) -> Dict[str, str]:
+        """
+        [신규] proc/partitions와 dmsetup 정보를 결합하여 (major, minor) -> device_name 매핑을 생성합니다.
+        """
+        device_map = {}
+        # 1. /proc/partitions 파싱
+        partitions_content = self._read_file(['proc/partitions'])
+        for line in partitions_content.split('\n')[2:]:
+            parts = line.split()
+            if len(parts) == 4:
+                major, minor, name = parts[0], parts[1], parts[3]
+                device_map[f"{major}:{minor}"] = name
+
+        # 2. dmsetup 정보 파싱
+        dmsetup_content = self._read_file(['sos_commands/devicemapper/dmsetup_info_-c'])
+        for line in dmsetup_content.split('\n')[1:]:
+            parts = line.split(maxsplit=2) # Name, <ignored>, Major:Minor
+            if len(parts) >= 3 and ':' in parts[2]:
+                name = parts[0]
+                major, minor = parts[2].strip('()').split(':')
+                device_map[f"{major}:{minor}"] = name
+
+        # [개선] lsblk 대체 로직 추가
+        lsblk_content = self._read_file(['sos_commands/block/lsblk_-d_-o_NAME,MAJ:MIN'])
+        if lsblk_content != 'N/A':
+            for line in lsblk_content.split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 2 and ':' in parts[1]:
+                    name, maj_min = parts[0], parts[1]
+                    device_map[maj_min] = name
+
+        return device_map
+
+    def _safe_float(self, value: Any) -> float:
+        """입력값을 float으로 안전하게 변환합니다."""
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            # [안정성 강화] locale에 따라 소수점이 쉼표(,)로 표현되는 경우를 처리합니다.
+            return float(str(value).replace(',', '.'))
+        except (ValueError, TypeError): return 0.0
+
+    def _parse_system_details(self) -> Dict[str, Any]:
+        logging.info("  - 시스템 기본 정보 파싱 중...")
+        lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu']); meminfo = self._read_file(['proc/meminfo']); dmidecode = self._read_file(['dmidecode', 'sos_commands/hardware/dmidecode'])
+        mem_total_match = re.search(r'MemTotal:\s+(\d+)\s+kB', meminfo); cpu_model_match = re.search(r'Model name:\s+(.+)', lscpu_output); model_match = re.search(r'Product Name:\s*(.*)', dmidecode)
+        cpu_str = f"{self.cpu_cores_count} x {cpu_model_match.group(1).strip()}" if self.cpu_cores_count > 0 and cpu_model_match else 'N/A'
+        uptime_content = self._read_file(['uptime', 'sos_commands/general/uptime']); uptime_str = "N/A"
+        if uptime_match := re.search(r'up\s+(.*?),\s*\d+\s+user', uptime_content): uptime_str = uptime_match.group(1).strip()
+        uname_content = self._read_file(['uname', 'sos_commands/kernel/uname_-a']); kernel_str = uname_content.split()[2] if len(uname_content.split()) >= 3 else uname_content
+        
+        # [사용자 요청 & xsos 참고] /proc/stat의 btime을 사용하여 부팅 시간을 epoch 초 형식으로 가져옵니다.
+        proc_stat_content = self._read_file(['proc/stat'])
+        boot_time_str = "N/A"
+        if btime_match := re.search(r'^btime\s+(\d+)', proc_stat_content, re.MULTILINE):
+            try:
+                epoch_time = int(btime_match.group(1))
+                # 로컬 타임존을 사용하여 datetime 객체로 변환
+                boot_dt = datetime.datetime.fromtimestamp(epoch_time)
+                # 'Fri Mar 21 19:28:29 KST 2025 (epoch: 1742552909)' 형식으로 포맷
+                # 타임존 약어(%Z)는 시스템에 따라 다를 수 있습니다.
+                boot_time_str = f"{boot_dt.strftime('%a %b %d %H:%M:%S %Z %Y')} (epoch: {epoch_time})"
+            except (ValueError, TypeError) as e:
+                logging.warning(f"부팅 시간 변환 중 오류 발생: {e}")
+                boot_time_str = self._read_file(['sos_commands/general/uptime_-s']).strip() # 폴백
+            
+        return { 'hostname': self._read_file(['hostname']), 'os_release': self._read_file(['etc/redhat-release']), 'kernel': kernel_str, 'system_model': model_match.group(1).strip() if model_match else 'N/A', 'cpu': cpu_str, 'memory': f"{int(mem_total_match.group(1)) / 1024 / 1024:.1f} GiB" if mem_total_match else "N/A", 'uptime': uptime_str, 'boot_time': boot_time_str, 'report_creation_date': self.report_date.strftime('%a %b %d %H:%M:%S %Z %Y') if self.report_date else 'N/A' }
+
+    def _parse_storage(self) -> List[Dict[str, Any]]:
+        logging.info("  - 스토리지 및 파일 시스템 정보 파싱 중...")
+        df_output = self._read_file(['df', 'sos_commands/filesys/df_-alPh', 'sos_commands/filesys/df_-h']); storage_list = []
+        for line in df_output.strip().split('\n')[1:]:
+            parts = line.split()
+            if len(parts) >= 6 and parts[0].startswith('/'): storage_list.append({ "filesystem": parts[0], "size": parts[1], "used": parts[2], "avail": parts[3], "use_pct": parts[4], "mounted_on": parts[5] })
+        return storage_list
+
+    def _parse_process_stats(self) -> Dict[str, Any]:
+        logging.info("  - 프로세스 통계 파싱 중...")
+        ps_content = self._read_file(['ps', 'sos_commands/process/ps_auxwww']); processes = []
+        for line in ps_content.split('\n')[1:]:
+            parts = line.split(maxsplit=10)
+            if len(parts) >= 11:
+                try: processes.append({ 'user': parts[0], 'pid': int(parts[1]), 'cpu_pct': float(parts[2]), 'mem_pct': float(parts[3]), 'rss_kb': int(parts[5]), 'stat': parts[7], 'command': parts[10] })
+                except (ValueError, IndexError): continue
+        user_stats = {}
+        for p in processes:
+            user = p['user']
+            if user not in user_stats: user_stats[user] = {'count': 0, 'cpu_pct': 0.0, 'mem_pct': 0.0, 'rss_kb': 0}
+            user_stats[user]['count'] += 1; user_stats[user]['cpu_pct'] += p['cpu_pct']; user_stats[user]['mem_pct'] += p['mem_pct']; user_stats[user]['rss_kb'] += p['rss_kb']
+        top_users = sorted(user_stats.items(), key=lambda item: item[1]['cpu_pct'], reverse=True)[:5]
+        return { 'total': len(processes), 'top_cpu': sorted(processes, key=lambda p: p['cpu_pct'], reverse=True)[:5], 'top_mem': sorted(processes, key=lambda p: p['rss_kb'], reverse=True)[:5], 'uninterruptible': [p for p in processes if 'D' in p['stat']], 'zombie': [p for p in processes if 'Z' in p['stat']], 'by_user': [{ 'user': user, **stats } for user, stats in top_users] }
+
+    def _parse_listening_ports(self) -> List[Dict[str, Any]]:
+        logging.info("    - 리스닝 포트 정보 파싱 중...")
+        ss_content = self._read_file(['sos_commands/networking/ss_-tlpn'])
+        ports = []
+        if ss_content == 'N/A': return ports
+        for line in ss_content.split('\n')[1:]:
+            parts = line.split()
+            if len(parts) < 5 or not parts[0].startswith('LISTEN'): continue
+            try:
+                address, port = parts[3].rsplit(':', 1)
+                process_match = re.search(r'users:\(\("([^"]+)",', ' '.join(parts[4:]))
+                process_name = process_match.group(1) if process_match else 'N/A'
+                ports.append({'port': int(port), 'address': address, 'process': process_name})
+            except (ValueError, IndexError):
+                continue
+        return ports
+
+    def _parse_network_details(self) -> Dict[str, Any]:
+        logging.info("  - 네트워크 상세 정보 파싱 중...")
+        details = {'interfaces': [], 'routing_table': [], 'ethtool': {}, 'bonding': [], 'netdev': [], 'listening_ports': self._parse_listening_ports()}; all_ifaces = set()
+        netdev_content = self._read_file(['proc/net/dev'])
+        for line in netdev_content.split('\n')[2:]:
+            if ':' in line:
+                iface, stats = line.split(':', 1); iface, stat_values = iface.strip(), stats.split(); all_ifaces.add(iface)
+                if len(stat_values) == 16: details['netdev'].append({ 'iface': iface, 'rx_bytes': int(stat_values[0]),'rx_packets': int(stat_values[1]), 'rx_errs': int(stat_values[2]), 'rx_drop': int(stat_values[3]), 'tx_bytes': int(stat_values[8]), 'tx_packets': int(stat_values[9]),'tx_errs': int(stat_values[10]),'tx_drop': int(stat_values[11]) })
+        ip_addr_content = self._read_file(['sos_commands/networking/ip_addr', 'sos_commands/networking/ip_-d_address'])
+        for block in re.split(r'^\d+:\s+', ip_addr_content, flags=re.MULTILINE)[1:]:
+            iface_data = {}
+            if match := re.match(r'([\w.-]+):', block): iface_name = match.group(1); iface_data['iface'] = iface_name; all_ifaces.add(iface_name)
+            else: continue
+            if match := re.search(r'state\s+(\w+)', block): iface_data['state'] = match.group(1).lower()
+            if match := re.search(r'link/\w+\s+([\da-fA-F:]+)', block): iface_data['mac'] = match.group(1)
+            if match := re.search(r'inet\s+([\d.]+/\d+)', block): iface_data['ipv4'] = match.group(1)
+            # [사용자 요청] 'lo' 인터페이스를 제외하고 UP 상태인 인터페이스만 수집합니다.
+            if iface_name != 'lo' and iface_data.get('state') == 'up':
+                details['interfaces'].append(iface_data)
+        bonding_dir = self.base_path / 'proc/net/bonding'
+        if bonding_dir.is_dir():
+            for bond_file in bonding_dir.iterdir():
+                bond_content = bond_file.read_text(errors='ignore'); bond_info = {'device': bond_file.name, 'slaves_info': []}
+                if match := re.search(r'Bonding Mode:\s*(.*)', bond_content): bond_info['mode'] = match.group(1).strip()
+                if match := re.search(r'MII Status:\s*(.*)', bond_content): bond_info['mii_status'] = match.group(1).strip()
+                for slave_block in bond_content.split('Slave Interface:')[1:]:
+                    slave_info = {'name': slave_block.strip().split('\n')[0].strip()}
+                    if m := re.search(r'MII Status:\s*(.*)', slave_block): slave_info['mii_status'] = m.group(1).strip()
+                    if m := re.search(r'Speed:\s*(.*)', slave_block): slave_info['speed'] = m.group(1).strip()
+                    bond_info['slaves_info'].append(slave_info)
+                details['bonding'].append(bond_info)
+        for iface_name in sorted(list(all_ifaces)):
+            ethtool_i = self._read_file([f'sos_commands/networking/ethtool_-i_{iface_name}']); ethtool_main = self._read_file([f'sos_commands/networking/ethtool_{iface_name}']); ethtool_g = self._read_file([f'sos_commands/networking/ethtool_-g_{iface_name}']); iface_ethtool = {}
+            if m := re.search(r'driver:\s*(.*)', ethtool_i): iface_ethtool['driver'] = m.group(1).strip()
+            if m := re.search(r'firmware-version:\s*(.*)', ethtool_i): iface_ethtool['firmware'] = m.group(1).strip()
+            if m := re.search(r'Link detected:\s*(yes|no)', ethtool_main): iface_ethtool['link'] = m.group(1)
+            if m := re.search(r'Speed:\s*(.*)', ethtool_main): iface_ethtool['speed'] = m.group(1).strip()
+            if m := re.search(r'Duplex:\s*(.*)', ethtool_main): iface_ethtool['duplex'] = m.group(1).strip()
+            rx_max_match = re.search(r'RX:\s*(\d+)', ethtool_g)
+            rx_now_match = re.search(r'Current hardware settings:[\s\S]*?RX:\s*(\d+)', ethtool_g)
+            iface_ethtool['rx_ring'] = f"{rx_now_match.group(1)}/{rx_max_match.group(1)}" if rx_now_match and rx_max_match else 'N/A'
+            details['ethtool'][iface_name] = iface_ethtool
+        details['routing_table'] = self._parse_routing_table()
+        return details
+
+    def _parse_routing_table(self) -> List[Dict[str, str]]:
+        logging.info("    - 라우팅 테이블 정보 파싱 중...")
+        content = self._read_file(['sos_commands/networking/ip_route_show_table_all']); routes = []
+        for line in content.split('\n'):
+            parts = line.split();
+            if not parts or parts[0] in ["broadcast", "local", "unreachable"]: continue
+            route = {'destination': parts[0]}
+            if 'via' in parts: route['gateway'] = parts[parts.index('via') + 1]
+            if 'dev' in parts: route['device'] = parts[parts.index('dev') + 1]
+            routes.append(route)
+        return routes
+
+    def _run_sar_command(self, sar_binary_path: str, sar_data_file: Path, options: str) -> str:
+        """[안정성 강화 & 재시도 로직 추가] 지정된 sar 바이너리와 옵션으로 명령을 실행하고, 실패 시 3회 재시도합니다."""
+        # [개선] SAR 명령 결과를 캐싱합니다.
+        cache_key = f"{sar_binary_path}:{sar_data_file}:{options}"
+        if cache_key in self._sar_cache:
+            return self._sar_cache[cache_key]
+
+        command_str = f"LANG=C {sar_binary_path} -f {sar_data_file} {options}"
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                env = os.environ.copy()
+                result = subprocess.run(command_str, capture_output=True, text=True, check=True, env=env, shell=True, timeout=60)
+                self._sar_cache[cache_key] = result.stdout
+                return result.stdout # 성공 시 즉시 결과 반환
+            except (subprocess.CalledProcessError, FileNotFoundError, AttributeError, subprocess.TimeoutExpired) as e:
+                logging.warning(f"sar 명령어 실행 실패 (시도 {attempt + 1}/{max_retries}): {command_str}. 오류: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt # 1, 2초 대기
+                    logging.info(f"  -> {wait_time}초 후 재시도합니다...") # [사용자 요청] 재시도 대기 시간 로깅
+                else:
+                    logging.error(Color.error(f"sar 명령어 실행이 {max_retries}번의 시도 후에도 최종 실패했습니다: {command_str}"))
+                    # [정확성 제안] 실패 시 빈 문자열 대신 예외를 발생시켜 폴백 로직이 동작하도록 함
+                    raise e
+        return "" # Should not be reached
+
+    def _parse_additional_info(self) -> Dict[str, Any]:
+        logging.info("  - 추가 시스템 정보(커널 파라미터, SELinux 등) 파싱 중...")
+        # [사용자 요청] sysctl -a 의 모든 커널 파라미터를 파싱합니다.
+        all_sysctl_params = {k.strip(): v.strip() for k,v in (l.split('=',1) for l in self._read_file(['sos_commands/kernel/sysctl_-a']).split('\n') if '=' in l)}
+        sestatus = {k.strip().lower().replace(' ','_'): v.strip() for k,v in (l.split(':',1) for l in self._read_file(['sos_commands/selinux/sestatus_-v']).split('\n') if ':' in l)}
+        
+        # [보안 분석 추가] 설치된 패키지 목록을 상세 정보(이름, 버전)와 함께 파싱합니다.
+        rpm_content = self._read_file(['installed-rpms'])
+        packages = []
+        for line in rpm_content.split('\n'):
+            if line.strip() and not line.startswith('gpg-pubkey'):
+                match = re.match(r'([^\s]+)-(\d.*)', line.strip())
+                if match:
+                    packages.append({'name': match.group(1), 'version': match.group(2)})
+
+        failed_services = [l.strip().split()[0] for l in self._read_file(['sos_commands/systemd/systemctl_list-units_--all']).split('\n') if 'failed' in l]
+        
+        # [보안 분석 추가] sshd_config 파싱
+        sshd_config_content = self._read_file(['etc/ssh/sshd_config'])
+        sshd_config = {k.strip(): v.strip() for k, v in (re.split(r'\s+', line, 1) for line in sshd_config_content.split('\n') if line.strip() and not line.strip().startswith('#')) if len(re.split(r'\s+', line, 1)) == 2}
+
+        # [사용자 요청] 부팅 시 사용된 커널 파라미터(/proc/cmdline) 파싱
+        boot_cmdline = self._read_file(['proc/cmdline'])
+
+        # [BUG FIX] dmsetup 정보를 파싱하여 메타데이터에 추가합니다. HTMLReportGenerator에서 직접 파일을 읽지 않도록 수정합니다.
+        dmsetup_info = self._read_file(['sos_commands/devicemapper/dmsetup_info_-c'])
+
+        return { "kernel_parameters": all_sysctl_params, "boot_cmdline": boot_cmdline, "selinux_status": sestatus, "installed_packages": packages, "failed_services": failed_services, "configurations": {"sshd_config": sshd_config, "dmsetup_info": dmsetup_info} }
+
+    # [사용자 요청] sar 데이터 형식의 비일관성을 해결하기 위해 스키마 기반 파싱을 도입합니다.
+    # 각 sar 명령어 옵션에 대해 가능한 헤더 이름과 표준화된 키를 매핑합니다.
+    SAR_HEADER_SCHEMA = {
+        'cpu': {
+            '%user': 'pct_user', '%nice': 'pct_nice', '%system': 'pct_system', '%iowait': 'pct_iowait',
+            '%steal': 'pct_steal', '%idle': 'pct_idle'
+        },
+        'memory': {
+            'kbmemfree': 'kbmemfree', 'kbmemused': 'kbmemused', '%memused': 'pct_memused',
+            'kbbuffers': 'kbbuffers', 'kbcached': 'kbcached', 'kbcommit': 'kbcommit',
+            '%commit': 'pct_commit', 'kbactive': 'kbactive', 'kbinact': 'kbinact',
+            'kbdirty': 'kbdirty'
+        },
+        'load': {
+            'runq-sz': 'runq_sz', 'plist-sz': 'plist_sz', 'ldavg-1': 'load_1',
+            'ldavg-5': 'load_5', 'ldavg-15': 'load_15', 'blocked': 'blocked'
+        },
+        'disk': {
+            'tps': 'tps', 'rtps': 'rtps', 'wtps': 'wtps', 'bread/s': 'bread_s',
+            'bwrtn/s': 'bwrtn_s'
+        },
+        'disk_detail': {
+            'tps': 'tps', 'rd_sec/s': 'rd_sec_s', 'wr_sec/s': 'wr_sec_s',
+            'avgrq-sz': 'avgrq_sz', 'avgqu-sz': 'avgqu_sz', 'await': 'await',
+            'svctm': 'svctm', '%util': 'pct_util',
+            # [개선] 로케일 및 버전에 따른 대체 헤더 추가
+            'rd_sect/s': 'rd_sec_s', 'wr_sect/s': 'wr_sec_s',
+            'rd_kB/s': 'rd_sec_s', 'wr_kB/s': 'wr_sec_s'
+        },
+        'swap': {
+            'kbswpfree': 'kbswpfree', 'kbswpused': 'kbswpused', '%swpused': 'pct_swpused',
+            'kbswpcad': 'kbswpcad', '%swpcad': 'pct_swpcad'
+        },
+        'network': {
+            'rxpck/s': 'rxpck_s', 'txpck/s': 'txpck_s', 'rxkB/s': 'rxkB_s', 'txkB/s': 'txkB_s'
+        },
+        'file_handler': {
+            'dentunusd': 'dentunusd', 'file-nr': 'file_nr', 'inode-nr': 'inode_nr', 'pty-nr': 'pty_nr'
+        }
+    }
+
+    def _parse_sar_section(self, sar_binary_path: str, target_sar_file: Path, section: str, option: str) -> List[Dict]:
+        """[신규] 지정된 섹션에 대해 sar 명령을 실행하고 결과를 파싱합니다."""
+        # [효율성 제안] Pandas가 없으면 파싱을 건너뜁니다.
+        if not IS_PANDAS_AVAILABLE:
+            return []
+
+        try:
+            content = self._run_sar_command(sar_binary_path, str(target_sar_file), option)
+        except Exception:
+            return [] # 명령어 실행 실패 시 빈 리스트 반환
+
+        lines = [line.strip() for line in content.strip().split('\n') if line.strip() and not line.startswith('Average:')]
+        if len(lines) < 2:
+            return []
+
+        header_line = lines[0]
+        # [BUG FIX] 헤더가 여러 줄에 걸쳐 있을 수 있는 경우(예: sar -n DEV)를 처리합니다.
+        # 'Linux'로 시작하는 라인을 건너뛰고 실제 헤더를 찾습니다.
+        header_index = 0
+        while header_index < len(lines) and (lines[header_index].startswith('Linux') or not re.search(r'\d{2}:\d{2}:\d{2}', lines[header_index])):
+            header_index += 1
+        
+        if header_index >= len(lines): return []
+
+        header_line = lines[header_index]
+        header_parts = re.split(r'\s+', header_line.strip())
+        
+        data_io = io.StringIO('\n'.join(lines[header_index+1:]))
+        try:
+            df = pd.read_csv(data_io, sep=r'\s+', header=None, engine='python')
+            if df.empty:
+                return []
+
+            # 컬럼 이름 설정
+            schema_keys = self.SAR_HEADER_SCHEMA.get(section, {})
+            raw_headers_for_check = header_parts[1:]
+            
+            # [BUG FIX] 헤더 라인이 '00:00:01 DEV ...' 와 같이 타임스탬프로 시작하는 경우, raw_headers_for_check가 'DEV'부터 시작하도록 조정합니다.
+            if re.match(r'^\d{2}:\d{2}:\d{2}$', header_parts[0]) and len(header_parts) > 1:
+                raw_headers_for_check = header_parts[1:]
+
+            first_header_col_name = raw_headers_for_check[0] if raw_headers_for_check and raw_headers_for_check[0] in ['CPU', 'IFACE', 'DEV'] else None
+            
+            cols = ['timestamp']
+            if first_header_col_name:
+                cols.append(first_header_col_name)
+                raw_headers_for_check = raw_headers_for_check[1:]
+
+            cols.extend([schema_keys.get(h, h.replace('%', 'pct_').replace('/', '_').replace('-', '_')) for h in raw_headers_for_check])
+            df.columns = cols[:len(df.columns)]
+
+            # 타임스탬프 변환
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='%H:%M:%S').dt.time
+            df['timestamp'] = df.apply(lambda row: self.report_date.replace(hour=row['timestamp'].hour, minute=row['timestamp'].minute, second=row['timestamp'].second).astimezone(pytz.utc).isoformat() if IS_PYTZ_AVAILABLE else self.report_date.replace(hour=row['timestamp'].hour, minute=row['timestamp'].minute, second=row['timestamp'].second).isoformat(), axis=1)
+
+            # 숫자형으로 변환
+            for col in df.columns:
+                if col not in ['timestamp', 'IFACE', 'DEV', 'CPU']:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+            # 필터링
+            if section == 'cpu' and 'CPU' in df.columns: df = df[df['CPU'] == 'all']
+            if section == 'network' and 'IFACE' in df.columns: df = df[df['IFACE'] != 'lo']
+
+            return df.to_dict('records')
+
+        except Exception as e:
+            logging.debug(f"'{section}' 섹션 Pandas 파싱 중 오류 발생 (블록 건너뜀): {e}")
+            return []
+
+    def _parse_sar_data_from_text(self) -> Dict[str, List[Dict]]:
+        """[사용자 요청] 텍스트 기반 sar 파일(예: sos_commands/sar/sarDD)을 파싱합니다."""
+        logging.info("  -> [2/2] 텍스트 sar 데이터 파싱 시도...")
+        
+        report_day = self.report_date.day  # type: ignore
+        report_date_str = self.report_date.strftime('%Y%m%d')
+        # [사용자 요청] 다양한 경로와 이름 형식의 텍스트 sar 파일을 순서대로 탐색합니다.
+        possible_paths = [
+            f'var/log/sa/sar{report_day:02d}', f'var/log/sa/sar{report_date_str}',
+            f'sos_commands/sar/sar{report_day:02d}', f'sos_commands/sar/sar{report_date_str}'
+        ]
+        
+        content, found_path = next(((self._read_file([p]), p) for p in possible_paths if self._read_file([p]) != 'N/A'), ('N/A', None))
+        if not found_path:
+            logging.warning(Color.warn(f"  - 날짜에 맞는 텍스트 sar 파일을 찾을 수 없어 텍스트 파싱을 건너뜁니다."))
+            return {}
+
+        logging.info(f"  - 사용할 텍스트 sar 파일: {found_path}")
+
+        all_sar_data: Dict[str, List[Dict]] = {}
+        current_section = None
+        header_cols = []
+
+        for line in content.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('Average:'):
+                if line.startswith('Average:'): header_cols = []
+                continue
+
+            parts = re.split(r'\s+', line)
+            logging.debug(f"  [TEXT] Processing line: {line}")
+            # [BUG FIX] 헤더 라인 식별 로직 강화
+            is_header_line = (parts[0] == 'Linux') or (re.match(r'^\d{2}:\d{2}:\d{2}(?!\d)', parts[0]) and any(p in ['CPU', 'IFACE', 'DEV'] or '%' in p or '/' in p or '-' in p for p in parts[1:]))
+            time_end_idx_check = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
+            is_data_line = re.match(r'^\d{2}:\d{2}:\d{2}(?!\d)', parts[0]) and not is_header_line and any(p.replace('.', '', 1).isdigit() for p in parts[time_end_idx_check:])
+
+            if is_header_line:
+                raw_headers = parts[time_end_idx_check:]
+                logging.debug(f"    -> Identified as HEADER line.")
+                # 헤더를 보고 현재 섹션이 무엇인지 추론
+                for section, schema in self.SAR_HEADER_SCHEMA.items():
+                    if any(h in schema for h in raw_headers):
+                        current_section = section
+                        # [BUG FIX] 'disk'와 'disk_detail' 구분 로직 추가
+                        # 'disk'와 'disk_detail'은 'tps' 헤더를 공유하므로, 'rd_sec/s'와 같은
+                        # disk_detail에만 있는 헤더의 존재 여부로 두 섹션을 구분합니다.
+                        if current_section == 'disk' and any(h in self.SAR_HEADER_SCHEMA['disk_detail'] for h in raw_headers if h != 'tps'):
+                            current_section = 'disk_detail'
+                        if current_section == 'disk' and any(h in self.SAR_HEADER_SCHEMA['disk_detail'] for h in raw_headers if h != 'tps'):
+                            current_section = 'disk_detail'
+                        schema_keys = self.SAR_HEADER_SCHEMA.get(current_section, {})
+                        
+                        first_col_header = parts[time_end_idx_check-1]
+                        header_cols = []
+                        if first_col_header in ['CPU', 'DEV', 'IFACE']:
+                            header_cols.append(first_col_header)
+
+                        for raw_header in raw_headers:
+                            if raw_header not in ['IFACE', 'DEV', 'CPU']:
+                                header_cols.append(schema_keys.get(raw_header, raw_header.replace('%', 'pct_').replace('/', '_').replace('-', '_')))
+                        
+                        logging.debug(f"    -> Section: '{current_section}', Parsed Headers: {header_cols}")
+                        if current_section not in all_sar_data: all_sar_data[current_section] = []
+                        break
+
+            if is_data_line and header_cols and current_section:
+                logging.debug(f"    -> Identified as DATA line for section '{current_section}'.")
+                time_end_idx = time_end_idx_check
+                ts_str = " ".join(parts[:time_end_idx])
+                try:
+                    dt_obj = datetime.datetime.strptime(ts_str, '%I:%M:%S %p' if time_end_idx == 2 else '%H:%M:%S')
+                    timestamp_iso = self.report_date.replace(hour=dt_obj.hour, minute=dt_obj.minute, second=dt_obj.second).isoformat()
+                except ValueError: continue
+
+                values = parts[time_end_idx:]
+                entry = {'timestamp': timestamp_iso}
+                for i in range(min(len(header_cols), len(values))):
+                    header = header_cols[i]
+                    value = values[i]
+                    entry[header] = value if header in ['IFACE', 'DEV', 'CPU'] else self._safe_float(value)
+
+                if current_section == 'disk_detail' and 'DEV' in entry and isinstance(entry['DEV'], str) and entry['DEV'].startswith('dev'):
+                    major, minor = entry['DEV'][3:].split('-')
+                    # [사용자 요청] 장치명 매핑에 실패하면 원본 dev-x-y 이름을 device_name으로 사용합니다.
+                    device_name = self.device_map.get(f"{major}:{minor}", entry['DEV'])
+                    entry['device_name'] = device_name
+                
+                # [사용자 요청] CPU 데이터는 'all'만, 네트워크 데이터는 'lo' 제외
+                if current_section == 'cpu' and entry.get('CPU') != 'all':
+                    continue
+                if current_section == 'network' and entry.get('IFACE') == 'lo':
+                    continue
+                all_sar_data[current_section].append(entry); logging.debug(f"    -> Parsed entry: {entry}")
+
+        if all_sar_data:
+            logging.info("  - 텍스트 sar 파일에서 데이터 수집 완료:")
+            for section, data_list in all_sar_data.items():
+                logging.info(f"    -> '{section}' 데이터 {len(data_list)}개 수집")
+
+        return all_sar_data
+
+    def _parse_sar_data(self) -> Dict[str, List[Dict]]:
+        """[교차 검증] 바이너리와 XML sar 데이터를 모두 파싱하고 결과를 병합하여 완성도를 높입니다."""
+        log_step("sar 데이터 파싱 시작")
+        logging.info(f"sar 데이터 추출 기준 날짜: {self.report_date.strftime('%Y-%m-%d')}")
+
+        os_release_content = self._read_file(['etc/redhat-release'])
+        rhel_version_match = re.search(r'release\s+(\d+)', os_release_content)
+        rhel_version = rhel_version_match.group(1) if rhel_version_match else "7"
+        sar_binary_path = f"/usr/bin/sar_{rhel_version}"
+
+        if not Path(sar_binary_path).exists():
+            logging.warning(Color.warn(f"sar 실행 파일 '{sar_binary_path}'를 찾을 수 없습니다. 텍스트 파일 파싱으로 대체합니다."))
+            return self._parse_sar_data_from_text()
+
+        sa_dir = self.base_path / 'var/log/sa'
+        if not sa_dir.is_dir():
+            logging.warning(Color.warn(f"sar 데이터 디렉토리({sa_dir})를 찾을 수 없습니다. 텍스트 파일 파싱으로 대체합니다."))
+            return self._parse_sar_data_from_text()
+
+        report_day = self.report_date.day
+        report_date_str = self.report_date.strftime('%Y%m%d')
+        possible_filenames = [f"sa{report_day:02d}", f"sa{report_date_str}"]
+        target_sar_file = next((sa_dir / fn for fn in possible_filenames if (sa_dir / fn).exists()), None)
+
+        if not target_sar_file:
+            logging.warning(Color.warn(f"날짜에 맞는 sar 바이너리 파일({', '.join(possible_filenames)})을(를) 찾을 수 없습니다. 텍스트 파일 파싱으로 대체합니다."))
+            return self._parse_sar_data_from_text()
+
+        logging.info(f"  - 사용할 sar 바이너리: {sar_binary_path}, 데이터 파일: {target_sar_file.name}")
+
+        sar_options_map = {
+            'cpu': '-u', 'memory': '-r', 'load': '-q', 'disk': '-b',
+            'disk_detail': '-d', 'swap': '-S', 'network': '-n DEV', 'file_handler': '-v'
+        }
+
+        merged_data: Dict[str, List[Dict]] = {}
+        for section, option in sar_options_map.items():
+            logging.info(f"  -> '{section}' ({option}) 데이터 파싱 중...")
+            section_data = self._parse_sar_section(sar_binary_path, target_sar_file, section, option)
+            merged_data[section] = section_data
+
+        text_data = self._parse_sar_data_from_text()
+        for section, data in text_data.items():
+            if section not in merged_data or not merged_data[section]:
+                logging.info(f"  -> '{section}' 섹션 데이터를 텍스트 소스에서 보충합니다. (데이터 {len(data)}개)")
+                merged_data[section] = data
+
+        # [사용자 요청] 로그 상세화: 각 항목별 추출된 데이터 개수 출력
+        summary = ", ".join([f"{key}: {len(value)}" for key, value in merged_data.items()])
+        if summary:
+            # [사용자 요청] 로그를 더 보기 쉽게 여러 줄로 출력
+            logging.info(Color.info("SAR 데이터 파싱 완료. 수집된 데이터 포인트:"))
+            for key, value in merged_data.items():
+                logging.info(Color.info(f"  - {key}: {len(value)}개"))
+        else:
+            logging.warning(Color.warn("SAR 데이터 파싱 완료. 수집된 데이터 포인트가 없습니다."))
+
+        for section, data in merged_data.items():
+            if not data:
+                logging.warning(Color.warn(f"  -> '{section}' 섹션에 대한 sar 데이터를 수집하지 못했습니다. 관련 그래프가 생성되지 않을 수 있습니다."))
+        return merged_data
+
+    def _find_sar_data_around_time(self, sar_section_data: List[Dict], target_dt: datetime.datetime, window_minutes: int = 2) -> Optional[Dict]:
+        if not sar_section_data: return None
+        closest_entry, min_delta = None, timedelta.max
+        target_dt_utc = target_dt.astimezone(pytz.utc) if IS_PYTZ_AVAILABLE and target_dt.tzinfo else target_dt
+        for entry in sar_section_data:
+            try:
+                entry_dt = datetime.datetime.fromisoformat(entry['timestamp']); delta = abs(entry_dt - target_dt_utc)
+                if delta < min_delta: min_delta, closest_entry = delta, entry
+            except (ValueError, KeyError): continue
+        return closest_entry.copy() if closest_entry and min_delta <= timedelta(minutes=window_minutes) else None
+
+    def _analyze_logs_and_correlate_events(self, sar_data: Dict) -> Dict:
+        logging.info("  - 주요 로그 이벤트 분석 및 SAR 데이터와 연관 관계 분석 중...")
+        log_content = self._read_file(['var/log/messages', 'var/log/syslog']); critical_events = []
+        if log_content == 'N/A': return {"critical_log_events": []}
+        for line in log_content.split('\n'):
+            if match := re.match(r'^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', line):
+                try: log_dt = datetime.datetime.strptime(f"{self.report_date.year} {match.group(1)}", '%Y %b %d %H:%M:%S')
+                except ValueError: continue
+                event_type, context = None, {}
+                if 'i/o error' in line.lower():
+                    event_type = "I/O Error"
+                    if sar_context := self._find_sar_data_around_time(sar_data.get('disk', []), log_dt): context['sar_disk'] = sar_context
+                elif 'out of memory' in line.lower():
+                    event_type = "Out of Memory"
+                    if sar_context := self._find_sar_data_around_time(sar_data.get('memory', []), log_dt): context['sar_memory'] = sar_context
+                if event_type: critical_events.append({"event_type": event_type, "timestamp": log_dt.isoformat(), "log_message": line, "context": context})
+        return {"critical_log_events": critical_events}
+
+    def _analyze_performance_bottlenecks(self, sar_data: Dict) -> Dict:
+        logging.info("  - 성능 병목 현상 분석 중...")
+        analysis = {}
+        if cpu_data := sar_data.get('cpu'):
+            if high_iowait := [d for d in cpu_data if d.get('pct_iowait', 0) > 20]: analysis['io_bottleneck'] = f"CPU I/O Wait이 20%를 초과한 경우가 {len(high_iowait)}번 감지되었습니다."
+        if load_data := sar_data.get('load'):
+            if self.cpu_cores_count > 0 and (high_load := [d for d in load_data if d.get('ldavg-5', 0) > self.cpu_cores_count * 1.5]): analysis['high_load_average'] = f"5분 평균 부하가 CPU 코어 수의 1.5배를 초과한 경우가 {len(high_load)}번 감지되었습니다."
+        if swap_data := sar_data.get('swap'):
+            if swap_data and (max_swap := max(d.get('pct_swpused',0) for d in swap_data)) > 10: analysis['swap_usage'] = f"최대 스왑 사용률이 {max_swap:.1f}%에 달했습니다."
+        return analysis
+
+    def _parse_and_patternize_logs(self) -> Dict[str, Any]:
+        """
+        [신규] /var/log/ 디렉터리의 모든 로그 파일을 분석하여 중요한 로그를 패턴화하고 중복을 제거합니다.
+        """
+        log_step("스마트 로그 분석 및 패턴화 시작")
+        log_dir = self.base_path / 'var/log'
+        if not log_dir.is_dir():
+            logging.warning(Color.warn(f"로그 디렉터리 '{log_dir}'를 찾을 수 없습니다. 스마트 로그 분석을 건너뜁니다."))
+            return {}
+
+        # 중요 로그를 식별하기 위한 키워드 (대소문자 무시)
+        IMPORTANT_KEYWORDS = re.compile(r'\b(error|failed|failure|warning|critical|panic|denied|segfault|traceback)\b', re.IGNORECASE)
+        
+        # 패턴화를 위한 정규식
+        PATTERNS_TO_NORMALIZE = [
+            (re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'), ' <IP> '), # IP 주소
+            (re.compile(r'\[\s*\d+\.\d+\]'), '[ <TIMESTAMP> ]'), # 커널 타임스탬프
+            (re.compile(r'pid\s*=\s*\d+'), 'pid=<PID>'), # PID
+            (re.compile(r'\[\d+\]'), '[<PID>]'), # PID
+            (re.compile(r'(\b[a-zA-Z]{3}\s+\d{1,2}\s+)?\d{2}:\d{2}:\d{2}'), '<TIME>'), # 시간
+            (re.compile(r'0x[0-9a-fA-F]+'), ' <HEX> '), # 16진수 주소
+        ]
+
+        smart_log_analysis = {}
+        log_files = [f for f in log_dir.iterdir() if f.is_file() and f.stat().st_size > 0]
+
+        for log_file in log_files:
+            try:
+                content = log_file.read_text(encoding='utf-8', errors='ignore')
+                important_lines = [line for line in content.split('\n') if IMPORTANT_KEYWORDS.search(line)]
+
+                if not important_lines:
+                    continue
+
+                # 패턴화 및 카운팅
+                patterns = Counter()
+                examples = {}
+                for line in important_lines:
+                    pattern = line
+                    for regex, placeholder in PATTERNS_TO_NORMALIZE:
+                        pattern = regex.sub(placeholder, pattern)
+                    pattern = re.sub(r'\s+', ' ', pattern).strip() # 공백 정규화
+                    patterns[pattern] += 1
+                    if pattern not in examples:
+                        examples[pattern] = line # 첫 번째 발생 예시 저장
+
+                smart_log_analysis[log_file.name] = [{"pattern": p, "count": c, "example": examples[p]} for p, c in patterns.most_common()]
+            except Exception as e:
+                logging.warning(f"  - 로그 파일 '{log_file.name}' 처리 중 오류 발생: {e}")
+        
+        logging.info(Color.info(f"스마트 로그 분석 완료. {len(smart_log_analysis)}개 파일에서 유의미한 로그 패턴 추출."))
+        return {"smart_log_analysis": smart_log_analysis}
+
+    def parse_all(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        log_step("sosreport 데이터 파싱 시작")
+        metadata = { "system_info": self._parse_system_details(), "storage": self._parse_storage(), "processes": self._parse_process_stats(), "network": self._parse_network_details(), **self._parse_additional_info() }
+        sar_data = self._parse_sar_data()
+        log_analysis = self._analyze_logs_and_correlate_events(sar_data); perf_analysis = self._analyze_performance_bottlenecks(sar_data)
+        smart_log_analysis = self._parse_and_patternize_logs() # [신규] 스마트 로그 분석 호출
+        metadata.update(log_analysis)
+        metadata.update(smart_log_analysis) # [신규] 스마트 로그 분석 결과를 메타데이터에 추가
+        metadata["performance_analysis"] = perf_analysis # 분석 결과를 메타데이터에 추가
+        logging.info(Color.success("모든 데이터 파싱 및 추가 분석 완료."))
+        return metadata, sar_data
+class HTMLReportGenerator:
+    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str, report_date: datetime.datetime):
+        self.metadata, self.sar_data, self.ai_analysis, self.hostname = metadata, sar_data, ai_analysis, hostname
+        self.report_date = report_date
+
+    def _generate_graphs(self) -> Dict[str, Any]:
+        """[안정성 강화] 재시도 로직을 적용하여 각 그래프를 생성합니다."""
+        if not IS_GRAPHING_ENABLED: return {}
+        if not IS_PLOTLY_AVAILABLE: logging.warning(Color.warn("Plotly 라이브러리가 설치되지 않았습니다. 그래프 생성을 건너뜁니다.")); return {}
+        log_step("그래프 생성 시작")
+        graphs, sar = {'static': {}, 'interactive': {}}, self.sar_data
+
+        graph_tasks = [
+            ('cpu', 'CPU Usage', self._generate_cpu_graph, ()),
+            ('memory', 'Memory Usage', self._generate_memory_graph, ()),
+            ('load', 'System Load Average', self._generate_load_graph, ()),
+            ('disk_detail', 'Block Device I/O', self._generate_disk_detail_graph, ()),
+            ('io_usage', 'I/O Usage', self._generate_io_usage_graph, ()),
+            ('swap', 'Swap Usage', self._generate_swap_graph, ()),
+            ('network_representative', 'Network Traffic', self._generate_network_graph, ()),
+            ('file_handler', 'File Handler', self._generate_file_handler_graph, ()),
+        ]
+
+        # [효율성 제안] 그래프 생성을 병렬로 처리
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_key = {executor.submit(self._retry_on_failure, task_func, name, *args): key for key, name, task_func, args in graph_tasks}
+            for future in as_completed(future_to_key):
+                key = future_to_key[future]
+                try:
+                    graphs[key] = future.result()
+                except Exception as exc:
+                    logging.error(f"'{key}' 그래프 생성 중 예외 발생: {exc}")
+
+        return graphs
+
+    def _retry_on_failure(self, func, name: str, *args, max_retries: int = 3):
+        """[신규] 함수 실행 실패 시 재시도하는 래퍼. 그래프 생성에 사용됩니다."""
+        for attempt in range(max_retries):
+            try:
+                logging.info(Color.info(f"  - 그래프 생성 중: {name}"))
+                result = func(*args)
+                # 그래프 생성이 성공했지만 데이터가 없어 None을 반환한 경우, 재시도 없이 종료
+                if result is None and attempt == 0:
+                    return None
+                # 성공 시 결과 반환
+                return result
+            except Exception as e:
+                logging.warning(f"'{name}' 그래프 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # 1, 2초 대기
+                    logging.info(f"  -> {wait_time}초 후 재시도합니다...")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(Color.error(f"'{name}' 그래프 생성이 {max_retries}번의 시도 후에도 최종 실패했습니다."))
+                    traceback.print_exc(limit=1)
+        return None # 모든 재시도 실패
+
+    # --- 그래프 생성 로직을 별도 함수로 분리 ---
+    def _generate_cpu_graph(self):
+        return self._create_hybrid_plot(self.sar_data.get('cpu'), 'CPU Usage (%)', {'pct_user': 'User', 'pct_system': 'System', 'pct_iowait': 'I/O Wait', 'pct_idle': 'Idle'}, is_stack=True, is_percentage=True)
+
+    def _generate_memory_graph(self):
+        return self._create_hybrid_plot(self.sar_data.get('memory'), 'Memory Usage (KB)', {'kbmemused': 'Used', 'kbmemfree': 'Free', 'kbbuffers': 'Buffers', 'kbcached': 'Cached'})
+
+    def _generate_load_graph(self):
+        load_data = self.sar_data.get('load')
+        # [개선] 데이터가 부족하여 그래프를 생성하지 못하는 경우, 명확한 경고 로그를 추가합니다.
+        if not load_data or len(load_data) < 2:
+            logging.warning(Color.warn("  - 'load' 데이터가 부족하여 Load Average 그래프를 생성할 수 없습니다."))
+            return None
+        load_labels = {'load_1': '1-min', 'load_5': '5-min', 'load_15': '15-min'} # [BUG FIX] is_percentage 추가
+        return self._create_hybrid_plot(load_data, 'System Load Average', load_labels, is_stack=False, y_axis_title="Load", is_percentage=False)
+
+    def _find_representative_disk(self) -> Optional[str]:
+        """
+        [신규] 루트('/') 파일시스템에 해당하는 대표 블록 디바이스의 sar 장치명(예: dev253-0)을 찾습니다.
+        1. df 정보에서 루트 파일시스템의 장치명(예: rhel-root)을 찾습니다.
+        2. dmsetup 정보에서 Major, Minor 번호를 찾습니다.
+        3. sar에서 사용하는 dev<Major>-<Minor> 형식의 장치명을 반환합니다.
+        """
+        root_fs_info = next((s for s in self.metadata.get('storage', []) if s.get('mounted_on') == '/'), None)
+        if not (root_fs_info and root_fs_info.get('filesystem')):
+            return None
+
+        # 1. df에서 장치명 추출 (예: /dev/mapper/rhel-root -> rhel-root)
+        df_device_name = os.path.basename(root_fs_info.get('filesystem'))
+
+        # 2. dmsetup 정보에서 Major, Minor 번호 찾기
+        dmsetup_info = self.metadata.get('configurations', {}).get('dmsetup_info', '')
+        # 정규식: 라인 시작, 장치명, 하나 이상의 공백, Major, 콜론, Minor
+        # 예: "rhel-root        253   0 L--w..." -> ('253', '0')
+        maj_min_match = re.search(rf'^{re.escape(df_device_name)}\s+(\d+)\s+(\d+)', dmsetup_info, re.MULTILINE)
+
+        if maj_min_match:
+            major, minor = maj_min_match.groups()
+            # 3. sar 장치명 형식으로 조합하여 반환
+            sar_device_name = f"dev{major}-{minor}" # type: ignore
+            logging.info(f"  - Found representative disk for root filesystem ('/'): {df_device_name} -> {sar_device_name}")
+            return sar_device_name
+        
+        # LVM이 아닌 일반 파티션(예: /dev/sda1)의 경우, df_device_name을 그대로 사용
+        # sar 데이터에 'sda1'과 같은 이름이 있는지 확인
+        all_sar_devices = {d.get('device_name') for d in self.sar_data.get('disk_detail', [])}
+        if df_device_name in all_sar_devices:
+            logging.info(f"  - Found representative disk for root filesystem ('/'): {df_device_name}")
+            return df_device_name
+
+        return None
+
+    def _generate_disk_detail_graph(self):
+        disk_detail_data = self.sar_data.get('disk_detail', []) or []
+        if not disk_detail_data or len(disk_detail_data) < 2:
+            logging.warning(Color.warn("  - Not enough 'disk_detail' data to generate Block Device I/O graph."))
+            return None
+
+        # [사용자 요청 반영] 루트('/') 파일시스템의 sar 장치명을 찾는 로직 개선
+        # [수정] _find_representative_disk 함수를 호출하여 대표 디바이스를 찾습니다.
+        root_device_name = self._find_representative_disk()
+        # [수정] 'device_name' 대신 원본 'DEV' 필드를 사용하여 필터링합니다.
+        representative_disk_data = [d for d in disk_detail_data if d.get('DEV') == root_device_name] if root_device_name else []
+
+        if representative_disk_data:
+            logging.info(f"  - Generating I/O graph for representative block device: '{root_device_name}'")
+            title = f"Block Device I/O - {root_device_name} (Rep.)"
+            static_title = f"Block Device I/O - {root_device_name}"
+            return self._create_hybrid_plot(representative_disk_data, title, {'rd_sec_s': 'Read sectors/s', 'wr_sec_s': 'Write sectors/s'}, is_stack=False, y_axis_title='sectors/s', static_title=static_title, is_percentage=False)
+        else:
+            # [수정] 대표 장치를 찾지 못하면 모든 장치의 데이터를 합산하여 그래프를 생성합니다.
+            logging.info("  - Could not find a representative block device. Aggregating I/O data for all devices.")
+            aggregated_data = {}
+            for d in disk_detail_data:
+                ts = d['timestamp']
+                if ts not in aggregated_data:
+                    aggregated_data[ts] = {'timestamp': ts, 'rd_sec_s': 0, 'wr_sec_s': 0}
+                # [BUG FIX] _safe_float를 사용하여 안전하게 숫자 변환
+                aggregated_data[ts]['rd_sec_s'] += self._safe_float(d.get('rd_sec_s', 0)) # type: ignore
+                aggregated_data[ts]['wr_sec_s'] += self._safe_float(d.get('wr_sec_s', 0)) # type: ignore
+            
+            aggregated_list = list(aggregated_data.values())
+            if len(aggregated_list) >= 2:
+                return self._create_hybrid_plot(aggregated_list, 'Total Block Device I/O (All Devices)', {'rd_sec_s': 'Total Read sectors/s', 'wr_sec_s': 'Total Write sectors/s'}, is_stack=False, y_axis_title='sectors/s', static_title='Total Block Device I/O', is_percentage=False)
+            return None
+
+    def _generate_io_usage_graph(self):
+        disk_data = self.sar_data.get('disk')
+        # [개선] 데이터가 부족하여 그래프를 생성하지 못하는 경우, 명확한 경고 로그를 추가합니다.
+        if not disk_data or len(disk_data) < 2: # type: ignore
+            logging.warning(Color.warn("  - Not enough 'disk' data to generate I/O Usage graph."))
+            return None
+        if disk_data[0].get('bread_s') is not None: # type: ignore
+            return self._create_hybrid_plot(disk_data, 'I/O Usage (blocks/s)', {'bread_s': 'Read Blocks/s', 'bwrtn_s': 'Write Blocks/s'}, is_stack=False, is_percentage=False)
+        else:
+            logging.info("  - 'bread_s' 데이터를 찾을 수 없어 'tps' 기준으로 I/O Usage 그래프를 생성합니다.")
+            return self._create_hybrid_plot(disk_data, 'I/O Usage (transactions/s)', {'tps': 'Transactions/s'}, is_stack=False, is_percentage=False)
+
+    def _generate_swap_graph(self):
+        swap_data = self.sar_data.get('swap')
+        if not swap_data: return None
+        return self._create_hybrid_plot(swap_data, 'Swap Usage (%)', {'pct_swpused': 'Used %'}, is_percentage=True)
+
+    def _generate_network_graph(self):
+        network_data = self.sar_data.get('network')
+        # [개선] 데이터가 부족하여 그래프를 생성하지 못하는 경우, 명확한 경고 로그를 추가합니다.
+        if not network_data or len(network_data) < 2:
+            logging.warning(Color.warn("  - Not enough 'network' data to generate Network Traffic graph."))
+            return None
+        
+        net_by_iface = {}; [net_by_iface.setdefault(d.get('IFACE'), []).append(d) for d in network_data if d.get('IFACE')]
+        up_interfaces_info = [iface for iface in self.metadata.get('network', {}).get('interfaces', []) if iface.get('state') == 'up']
+        # [BUG FIX] 'UP' 상태인 인터페이스와 sar 데이터에 기록된 모든 인터페이스를 함께 고려하여 대표 인터페이스를 찾습니다.
+        up_interface_names = {iface['iface'] for iface in up_interfaces_info if 'iface' in iface}
+        all_possible_ifaces = sorted(list(up_interface_names.union(net_by_iface.keys())))
+
+        # [요청 반영] bond0가 있고 UP 상태이면 우선 사용, 아니면 UP 상태인 첫번째 인터페이스 사용
+        is_bond0_up = 'bond0' in up_interface_names
+        representative_iface = 'bond0' if is_bond0_up else next((iface['iface'] for iface in up_interfaces_info if iface.get('iface') in all_possible_ifaces), None)
+
+        if representative_iface and representative_iface in net_by_iface and len(net_by_iface.get(representative_iface, [])) >= 2:
+            logging.info(f"  - Generating traffic graph for representative network interface: '{representative_iface}'")
+            data = net_by_iface[representative_iface]
+            if any('rxkB_s' in d or 'txkB_s' in d for d in data):
+                title = f'Network Traffic - {representative_iface} (Rep.)'
+                static_title = f'Network Traffic - {representative_iface} (Rep.)'
+                return self._create_hybrid_plot(data, title, {'rxkB_s': 'RX kB/s', 'txkB_s': 'TX kB/s'}, y_axis_title='kB/s', static_title=static_title, is_percentage=False)
+        else:
+            # [해결책 제안 반영] 대표 인터페이스가 없으면 'lo'를 제외한 모든 인터페이스의 트래픽을 합산합니다.
+            logging.info("  - Could not find a representative network interface. Aggregating traffic for all interfaces (excluding 'lo').")
+            aggregated_data = {}
+            for iface, data in net_by_iface.items():
+                if iface == 'lo': continue
+                for d in data:
+                    ts = d['timestamp']
+                    if ts not in aggregated_data:
+                        aggregated_data[ts] = {'timestamp': ts, 'rxkB_s': 0, 'txkB_s': 0}
+                    aggregated_data[ts]['rxkB_s'] += self._safe_float(d.get('rxkB_s', 0))
+                    aggregated_data[ts]['txkB_s'] += self._safe_float(d.get('txkB_s', 0))
+            aggregated_list = list(aggregated_data.values())
+            if len(aggregated_list) >= 2:
+                return self._create_hybrid_plot(aggregated_list, 'Total Network Traffic (All Interfaces)', {'rxkB_s': 'Total RX kB/s', 'txkB_s': 'Total TX kB/s'}, y_axis_title='kB/s', static_title='Total Network Traffic', is_percentage=False)
+            return None
+
+    def _generate_file_handler_graph(self):
+        file_handler_data = self.sar_data.get('file_handler')
+        if not file_handler_data: return None
+        return self._create_hybrid_plot(file_handler_data, 'File and Inode Handlers', {'file_nr': 'File Handlers', 'inode_nr': 'Inode Handlers'}, is_stack=False)
+
+    def _generate_individual_disk_graphs_page(self, sar_data: Dict) -> Optional[str]:
+        """[수정] 개별 디스크 장치에 대한 상세 I/O 그래프 HTML 페이지를 생성합니다. 메인 리포트와 동일하게 정적 이미지와 팝업 동적 그래프를 모두 생성합니다."""
+        if not IS_PLOTLY_AVAILABLE or 'disk_detail' not in sar_data:
+            return None
+
+        disk_detail_data = sar_data['disk_detail']
+        # [추가] 생성된 동적 그래프 HTML을 별도 파일로 저장하기 위한 딕셔너리
+        popup_files_to_create: Dict[str, str] = {}
+        graphs_by_dev = {}
+        
+        # 장치별로 데이터 그룹화
+        dev_data = {}
+        for entry in disk_detail_data:
+            original_dev_name = entry.get('DEV')
+            if not original_dev_name:
+                continue
+
+            # [사용자 요청] dev{major}-{minor} 형식의 장치명을 문자 형태의 장치명으로 변환합니다.
+            # 예: 'dev253-0' -> 'rhel-root'
+            display_name = original_dev_name
+            if original_dev_name.startswith('dev') and '-' in original_dev_name:
+                major, minor = original_dev_name[3:].split('-')
+                display_name = self.metadata.get('device_map', {}).get(f"{major}:{minor}", original_dev_name)
+            
+            dev_data.setdefault(display_name, []).append(entry)
+
+        # 각 장치에 대해 그래프 생성
+        for dev_name, data in dev_data.items():
+            if len(data) < 2: continue # 데이터가 너무 적으면 건너뛰기
+            # [사용자 요청] 그래프 제목을 모두 영문으로 변경
+            # 각 장치에 대해 3개의 그래프 생성
+            graphs_by_dev[dev_name] = {
+                'tps': self._create_hybrid_plot(data, f'Transactions per second ({dev_name})', {'tps': 'TPS'}, is_stack=False, is_percentage=False),
+                'io': self._create_hybrid_plot(data, f'I/O Throughput ({dev_name})', {'rd_sec_s': 'Read sectors/s', 'wr_sec_s': 'Write sectors/s'}, is_stack=False, y_axis_title='sectors/s', is_percentage=False),
+                'util': self._create_hybrid_plot(data, f'Queue and Utilization ({dev_name})', {'avgqu-sz': 'Queue Size', 'pct_util': '%Util'}, is_percentage=True)
+            }
+
+        # HTML 페이지 생성
+        graph_html_parts = []
+        for dev_name, graphs in graphs_by_dev.items():
+            graph_html_parts.append(f'<div class="device-section"><h2>Device: {dev_name}</h2><div class="graph-grid">')
+            for graph_key, graph_tuple in graphs.items():
+                if graph_tuple and isinstance(graph_tuple, tuple) and len(graph_tuple) == 2:
+                    base64_png, interactive_html = graph_tuple
+                    
+                    # 팝업 파일 이름 생성 및 저장할 내용 추가
+                    popup_filename = f"popup_disk_{dev_name}_{graph_key}_{self.hostname}.html"
+                    if interactive_html:
+                        popup_files_to_create[popup_filename] = interactive_html
+
+                    # HTML 본문 생성
+                    if base64_png:
+                        graph_html = f'<img src="data:image/png;base64,{base64_png}" alt="{dev_name} {graph_key}" style="width:100%; cursor:pointer;" onclick="openGraphPopup(\'{popup_filename}\')">'
+                    elif interactive_html: # 정적 이미지가 없을 경우 동적 그래프를 직접 표시
+                        graph_html = f'<div class="graph-container">{interactive_html}</div>'
+                    else:
+                        graph_html = '<p class="no-data-message">그래프 데이터 없음</p>'
+                    
+                    graph_html_parts.append(f'<div class="graph-container">{graph_html}</div>')
+
+            graph_html_parts.append('</div></div>')
+
+        # [수정] openGraphPopup 스크립트 추가
+        html_content = f"""<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><title>Block Device I/O Details</title><style>
+            body {{ font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 2rem; }}
+            h1 {{ text-align: center; color: #333; }}
+            .device-section {{ background: #fff; border-radius: 8px; margin-bottom: 2rem; padding: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+            .device-section h2 {{ margin-top: 0; border-bottom: 1px solid #eee; padding-bottom: 1rem; }}
+            .graph-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 1.5rem; }}
+            .graph-container {{ min-height: 400px; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; }}
+            .no-data-message {{ text-align: center; color: #888; padding: 2rem; }}
+            </style><script>function openGraphPopup(filename) {{ window.open(filename, 'GraphPopup', 'width=1200,height=600,scrollbars=yes,resizable=yes'); }}</script></head><body><h1>Block Device I/O Details</h1>{''.join(graph_html_parts)}</body></html>"""
+        
+        return html_content, popup_files_to_create
+
+    def _generate_individual_nic_graphs_page(self, sar_data: Dict, metadata: Dict) -> Optional[str]:
+        """[신규] 개별 NIC에 대한 상세 그래프 HTML 페이지를 생성합니다."""
+        if not IS_PLOTLY_AVAILABLE or 'network' not in sar_data:
+            return None
+
+        net_by_iface = {}; [net_by_iface.setdefault(d.get('IFACE'), []).append(d) for d in sar_data['network'] if d.get('IFACE')]
+        up_interfaces_info = [iface for iface in metadata.get('network', {}).get('interfaces', []) if iface.get('state') == 'up']
+        up_interface_names = sorted([iface['iface'] for iface in up_interfaces_info if 'iface' in iface])
+
+        # [추가] 생성된 동적 그래프 HTML을 별도 파일로 저장하기 위한 딕셔너리
+        popup_files_to_create: Dict[str, str] = {}
+        graphs_by_nic = {}
+        for iface in up_interface_names:
+            if iface in net_by_iface:
+                data = net_by_iface[iface]
+                if len(data) > 1:
+                    graphs_by_nic[iface] = self._create_hybrid_plot(data, f'Network Traffic - {iface}', {'rxkB_s': 'RX kB/s', 'txkB_s': 'TX kB/s'}, is_stack=False, y_axis_title='kB/s', is_percentage=False)
+
+        graph_html_parts = []
+        for nic_name, graph_tuple in graphs_by_nic.items():
+            if graph_tuple and isinstance(graph_tuple, tuple) and len(graph_tuple) == 2:
+                base64_png, interactive_html = graph_tuple
+                
+                popup_filename = f"popup_nic_{nic_name}_{self.hostname}.html"
+                if interactive_html:
+                    popup_files_to_create[popup_filename] = interactive_html
+
+                if base64_png:
+                    graph_html = f'<img src="data:image/png;base64,{base64_png}" alt="Network Traffic {nic_name}" style="width:100%; cursor:pointer;" onclick="openGraphPopup(\'{popup_filename}\')">'
+                elif interactive_html:
+                    graph_html = f'<div class="graph-container">{interactive_html}</div>'
+                else:
+                    graph_html = '<p class="no-data-message">그래프 데이터 없음</p>'
+                
+                graph_html_parts.append(f'<div class="nic-section">{graph_html}</div>')
+
+        html_content = f"""<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><title>Network Interface Details</title><style>
+            body {{ font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 2rem; }} h1 {{ text-align: center; color: #333; }}
+            .nic-section {{ background: #fff; border-radius: 8px; margin-bottom: 2rem; padding: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+            .graph-container {{ min-height: 400px; }}
+            .no-data-message {{ text-align: center; color: #888; padding: 2rem; }}
+             </style><script>function openGraphPopup(filename) {{ window.open(filename, 'GraphPopup', 'width=1200,height=600,scrollbars=yes,resizable=yes'); }}</script></head><body><h1>Network Interface Details</h1>{''.join(graph_html_parts)}</body></html>"""
+        
+        return html_content, popup_files_to_create
+
+    def _create_hybrid_plot(self, data: Optional[List[Dict]], title: str, labels: Dict[str, str], is_stack: bool = False, y_axis_title: str = "Value", static_title: Optional[str] = None, is_percentage: bool = False):
+        """[대체 구현] Matplotlib과 Plotly를 사용하여 하이브리드 그래프(정적+동적)를 생성합니다."""
+        # [해결책 제안 반영] 데이터가 없거나, 유효한 데이터 포인트가 2개 미만이면 그래프를 생성하지 않습니다.
+        if not data or not isinstance(data, list) or len(data) < 2 or not IS_GRAPHING_ENABLED:
+            return (None, None)
+        
+        # [해결책 제안 반영] 그래프를 그릴 키가 데이터에 하나라도 존재하는지 확인합니다.
+        # [정확성 제안] 데이터 완전성 체크: 50% 이상 데이터가 누락된 경우 그래프 생성 건너뛰기
+        valid_points = sum(1 for d in data if any(key in d for key in labels))
+        if valid_points < len(data) * 0.5:
+            logging.warning(Color.warn(f"Graph '{title}' will not be generated because more than 50% of its data is missing."))
+            return (None, None)
+
+        has_data_to_plot = any(key in data[0] for key in labels.keys())
+        if not has_data_to_plot:
+            return (None, None)
+            
+        if 'Swap Usage' in title and data and 'pct_swpused' not in data[0]:
+            for entry in data:
+                total = entry.get('kbswptot', 0)
+                used = entry.get('kbswpused', 0)
+                if total > 0 and used >= 0:
+                    entry['pct_swpused'] = (used / total) * 100
+                # kbswptot가 없는 구버전 sar의 경우
+                elif 'kbswpfree' in entry and 'kbswpused' in entry:
+                    total_fallback = entry['kbswpfree'] + entry['kbswpused']
+                    if total_fallback > 0:
+                        entry['pct_swpused'] = (entry['kbswpused'] / total_fallback) * 100
+
+        # [안정성 강화] 정적/동적 그래프 생성을 독립적으로 분리하여 한쪽의 실패가 다른 쪽에 영향을 주지 않도록 합니다.
+        static_img_b64 = None
+        if IS_MATPLOTLIB_AVAILABLE:
+            try:
+                title_for_static = static_title if static_title else title
+                title_for_static_eng = re.sub(r'[가-힣()]', '', title_for_static).strip()
+                static_img_b64 = self._create_static_plot_matplotlib(data, title_for_static_eng, labels, is_stack, y_axis_title, is_percentage=is_percentage)
+            except Exception as e:
+                logging.warning(f"Failed to create static image (matplotlib) for '{title}': {e}. Using interactive graph only.")
+                static_img_b64 = None
+
+        interactive_html = None
+        if IS_PLOTLY_AVAILABLE:
+            try:
+                interactive_html = self._create_plot_plotly(data, title, labels, is_stack, y_axis_title, is_percentage=is_percentage)
+            except Exception as e:
+                logging.warning(f"Failed to create interactive graph (plotly) for '{title}': {e}. Static image may be used as fallback.")
+                interactive_html = None
+
+        return (static_img_b64, interactive_html)
+
+    def _create_static_plot_matplotlib(self, data: Optional[List[Dict]], title: str, labels: Dict[str, str], is_stack: bool = False, y_axis_title: str = "Value", is_percentage: bool = False) -> Optional[str]:
+        """[사용자 요청] Matplotlib을 사용하여 정적 PNG 이미지를 생성합니다. 모든 텍스트를 영문으로 처리하여 한글 깨짐을 방지합니다."""
+        # [해결책 제안 반영] 데이터 유효성 검사 강화
+        if not data or not isinstance(data, list) or len(data) < 2 or not IS_MATPLOTLIB_AVAILABLE:
+            return None
+        if not any(key in data[0] for key in labels):
+            return None
+
+        # [정확성 제안] 타임존 정보가 포함된 ISO 포맷의 타임스탬프를 파싱합니다.
+        timestamps = []
+        for d in data:
+            if 'timestamp' in d:
+                timestamps.append(datetime.datetime.fromisoformat(d['timestamp']))
+        if not timestamps: return None
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        
+        all_values = []
+        plot_labels = []
+        plot_labels_eng = []
+        for key, label in labels.items():
+            values = [self._safe_float(d.get(key, 0)) for d in data]
+            all_values.append(values)
+            plot_labels.append(label)
+            plot_labels_eng.append(re.sub(r'[가-힣/()]', '', label).strip()) # [수정] 한글과 슬래시(/)를 제거하여 영문 레이블 생성
+            
+        if is_stack:
+            # CPU Usage의 Idle은 스택에서 제외
+            idle_index = -1
+            if 'pct_idle' in labels and 'CPU Usage' in title:
+                idle_index = list(labels.keys()).index('pct_idle')
+            
+            stack_values = [v for i, v in enumerate(all_values) if i != idle_index]
+            stack_labels = [l for i, l in enumerate(plot_labels) if i != idle_index]
+            ax.stackplot(timestamps, stack_values, labels=plot_labels_eng, alpha=0.8)
+
+            if idle_index != -1:
+                ax.plot(timestamps, all_values[idle_index], label=plot_labels_eng[idle_index], linewidth=2.5)
+        else:
+            for values, label in zip(all_values, plot_labels_eng):
+                ax.plot(timestamps, values, label=label, linewidth=2.5)
+
+        ax.set_title(title, fontsize=14, loc='left', pad=20)
+        ax.set_ylabel(re.sub(r'[가-힣/()]', '', y_axis_title).strip()) # [수정] Y축 레이블도 영문으로 변경
+        # [사용자 요청] 백분율 그래프의 Y축 범위를 0-100으로 고정합니다.
+        if is_percentage:
+            ax.set_ylim(0, 100)
+
+        ax.grid(True, linestyle='--', alpha=0.6) # [수정] 범례 위치 조정
+        ax.legend(loc='upper right', bbox_to_anchor=(1, 1.18), ncol=len(labels)//2 or 1)
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=90)
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    def _create_plot_plotly(self, data: Optional[List[Dict]], title: str, labels: Dict[str, str], is_stack: bool = False, y_axis_title: str = "Value", is_percentage: bool = False) -> Optional[str]:
+        """[기능 유지] Plotly를 사용하여 동적/상호작용 그래프 HTML을 생성합니다."""
+        # [해결책 제안 반영] 데이터 유효성 검사 강화
+        if not data or not isinstance(data, list) or len(data) < 2 or not IS_PLOTLY_AVAILABLE:
+            return None
+        
+        # 데이터 포인트에 labels에 지정된 키 중 하나라도 포함되어 있는지 확인
+        if not any(key in data[0] for key in labels):
+            return None
+
+        # [정확성 제안] 타임존 정보가 포함된 ISO 포맷의 타임스탬프를 파싱합니다.
+        timestamps = []
+        for d in data:
+            if 'timestamp' in d:
+                timestamps.append(datetime.datetime.fromisoformat(d['timestamp']))
+
+        fig = go.Figure()
+        
+        # 세련된 색상 팔레트
+        colors = ['#007bff', '#17a2b8', '#28a745', '#ffc107', '#dc3545', '#6c757d']
+
+        for i, (key, label) in enumerate(labels.items()):
+            values = [self._safe_float(d.get(key, 0)) for d in data]
+            
+            # [사용자 요청] CPU 그래프의 'Idle' 항목은 배경색 없이 라인만 표시
+            is_idle_trace = (key == 'pct_idle' and 'CPU Usage' in title)
+            
+            trace_args = {
+                "x": timestamps,
+                "y": values,
+                "name": label,
+                "mode": 'lines',
+                "line": dict(width=2.5, color=colors[i % len(colors)]),
+                # 마우스 호버 시 표시될 정보 맞춤 설정합니다.
+                "hovertemplate": f'<b>{label}</b><br>%{{x|%H:%M:%S}}<br>%{{y:.2f}}<extra></extra>'
+            }
+
+            if is_stack and not is_idle_trace:
+                trace_args['stackgroup'] = 'one'
+
+            fig.add_trace(go.Scatter(**trace_args))
+
+        fig.update_layout(
+            title=dict(text=f'<b>{title}</b>', x=0.5, font=dict(size=18)),
+            xaxis_title=None,
+            yaxis_title=y_axis_title,
+            # [사용자 요청] 백분율 그래프의 Y축 범위를 0-100으로 고정합니다.
+            yaxis=dict(
+                range=[0, 100] if is_percentage else None,
+                title=y_axis_title
+            ),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=50, r=30, t=80, b=50),
+            hovermode="x unified", # x축 기준으로 모든 데이터 표시
+            plot_bgcolor='rgba(247,248,252,1)', # 그래프 배경색
+            paper_bgcolor='rgba(255,255,255,1)', # 전체 배경색
+            font=dict(family="Arial, Noto Sans KR, sans-serif")
+        )
+        
+        # x축 눈금 및 그리드 설정
+        fig.update_xaxes(
+            showgrid=True, gridwidth=1, gridcolor='#e9ecef',
+            tickformat='%H:%M' # 시간:분 형식
+        )
+        # y축 그리드 설정
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#e9ecef')
+
+        return pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+
+    def _safe_float(self, value):
+        try: return float(value)
+        except (ValueError, TypeError): return 0.0
+
+    def generate(self, generated_graphs: Dict) -> str:
+        # [수정] _generate_graphs는 이제 (base64_png, interactive_html) 튜플 또는 (None, interactive_html)을 반환합니다.
+        # raw_graphs = self._generate_graphs() # [개선] 이제 외부에서 생성된 그래프 데이터를 받습니다.
+        
+        graphs_for_template = {}
+        for key, result in generated_graphs.items():
+            if result and isinstance(result, tuple) and len(result) == 2:
+                graphs_for_template[key] = result
+
+        template_data = {
+            "hostname": self.hostname, 
+            "sar_data": self.sar_data, # [BUG FIX] disk_detail 팝업 활성화를 위해 sar_data를 템플릿에 전달합니다.
+            "ai_analysis": self.ai_analysis,
+            "graphs": generated_graphs, # [수정] Plotly HTML을 직접 전달
+            "security_advisories": self.metadata.get('security_advisories', []),
+            **self.metadata
+        }
+        return get_html_template(template_data)
 
 class DataAnonymizer:
     def __init__(self):
@@ -97,704 +1327,392 @@ class DataAnonymizer:
             return text
         return data
 
-class SosreportParser:
-    def __init__(self, extract_path: Path):
-        subdirs = [d for d in extract_path.iterdir() if d.is_dir()]
-        if not subdirs: raise FileNotFoundError(f"sosreport 베이스 디렉토리를 찾을 수 없습니다: {extract_path}")
-        self.base_path = subdirs[0]
-        self.report_date = datetime.datetime.now()
-        self.cpu_cores_count = 0
-        self.device_map = self._create_device_map() # [개선] 장치명 매핑 정보 생성
-        self.dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
-        self._initialize_report_date()
-        self._initialize_cpu_cores()
-
-    def _read_file(self, possible_paths: List[str], default: str = 'N/A') -> str:
-        for path_suffix in possible_paths:
-            full_path = self.base_path / path_suffix
-            if full_path.exists():
-                try: return full_path.read_text(encoding='utf-8', errors='ignore').strip()
-                except Exception: continue
-        return default
-
-    def _initialize_report_date(self):
-        date_content = self._read_file(['sos_commands/date/date', 'date'])
-        try:
-            match = re.search(r'([A-Za-z]{3})\s+[A-Za-z]{3}\s+(\d{1,2})\s+[\d:]+\s+.*?(\d{4})', date_content)
-            if match:
-                month_abbr, day, year = match.groups()
-                month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
-                if month_abbr in month_map: self.report_date = datetime.datetime(int(year), month_map[month_abbr], int(day))
-        except Exception: pass
-
-    def _initialize_cpu_cores(self):
-        lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu'])
-        if match := re.search(r'^CPU\(s\):\s+(\d+)', lscpu_output, re.MULTILINE): self.cpu_cores_count = int(match.group(1))
-
-    def _create_device_map(self) -> Dict[str, str]:
-        """
-        [신규] proc/partitions와 dmsetup 정보를 결합하여 (major, minor) -> device_name 매핑을 생성합니다.
-        """
-        device_map = {}
-        # 1. /proc/partitions 파싱
-        partitions_content = self._read_file(['proc/partitions'])
-        for line in partitions_content.split('\n')[2:]:
-            parts = line.split()
-            if len(parts) == 4:
-                major, minor, name = parts[0], parts[1], parts[3]
-                device_map[f"{major}:{minor}"] = name
-
-        # 2. dmsetup 정보 파싱
-        dmsetup_content = self._read_file(['sos_commands/devicemapper/dmsetup_info_-c'])
-        for line in dmsetup_content.split('\n')[1:]:
-            parts = line.split()
-            if len(parts) >= 3:
-                name, major, minor = parts[0], parts[1], parts[2]
-                # dmsetup 출력의 major/minor는 ':'로 구분되어 있을 수 있음
-                major = major.replace(':', '')
-                device_map[f"{major}:{minor}"] = name
-
-        return device_map
-
-    def _safe_float(self, value: str) -> float:
-        try: return float(value.replace(',', '.'))
-        except (ValueError, TypeError): return 0.0
-
-    def _parse_system_details(self) -> Dict[str, Any]:
-        lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu']); meminfo = self._read_file(['proc/meminfo']); dmidecode = self._read_file(['dmidecode', 'sos_commands/hardware/dmidecode'])
-        mem_total_match = re.search(r'MemTotal:\s+(\d+)\s+kB', meminfo); cpu_model_match = re.search(r'Model name:\s+(.+)', lscpu_output); model_match = re.search(r'Product Name:\s*(.*)', dmidecode)
-        cpu_str = f"{self.cpu_cores_count} x {cpu_model_match.group(1).strip()}" if self.cpu_cores_count > 0 and cpu_model_match else 'N/A'
-        uptime_content = self._read_file(['uptime', 'sos_commands/general/uptime']); uptime_str = "N/A"
-        if uptime_match := re.search(r'up\s+(.*?),\s*\d+\s+user', uptime_content): uptime_str = uptime_match.group(1).strip()
-        uname_content = self._read_file(['uname', 'sos_commands/kernel/uname_-a']); kernel_str = uname_content.split()[2] if len(uname_content.split()) >= 3 else uname_content
-        
-        # [개선] xsos를 참고하여 'uptime -s'를 사용하여 부팅 시간을 더 정확하게 파싱합니다.
-        uptime_s_content = self._read_file(['sos_commands/general/uptime_-s'])
-        last_boot_str = "N/A"
-        if uptime_s_content != 'N/A':
-            last_boot_str = uptime_s_content.strip()
-        else: # 폴백: 기존 방식 사용
-            last_boot_str = self._read_file(['sos_commands/boot/who_-b']).replace('system boot', '').strip()
-            
-        return { 'hostname': self._read_file(['hostname']), 'os_release': self._read_file(['etc/redhat-release']), 'kernel': kernel_str, 'system_model': model_match.group(1).strip() if model_match else 'N/A', 'cpu': cpu_str, 'memory': f"{int(mem_total_match.group(1)) / 1024 / 1024:.1f} GiB" if mem_total_match else "N/A", 'uptime': uptime_str, 'last_boot': last_boot_str }
-
-    def _parse_storage(self) -> List[Dict[str, Any]]:
-        df_output = self._read_file(['df', 'sos_commands/filesys/df_-alPh']); storage_list = []
-        for line in df_output.strip().split('\n')[1:]:
-            parts = line.split()
-            if len(parts) >= 6 and parts[0].startswith('/'): storage_list.append({ "filesystem": parts[0], "size": parts[1], "used": parts[2], "avail": parts[3], "use_pct": parts[4], "mounted_on": parts[5] })
-        return storage_list
-
-    def _parse_process_stats(self) -> Dict[str, Any]:
-        ps_content = self._read_file(['ps', 'sos_commands/process/ps_auxwww']); processes = []
-        for line in ps_content.split('\n')[1:]:
-            parts = line.split(maxsplit=10)
-            if len(parts) >= 11:
-                try: processes.append({ 'user': parts[0], 'pid': int(parts[1]), 'cpu_pct': float(parts[2]), 'mem_pct': float(parts[3]), 'rss_kb': int(parts[5]), 'stat': parts[7], 'command': parts[10] })
-                except (ValueError, IndexError): continue
-        user_stats = {}
-        for p in processes:
-            user = p['user']
-            if user not in user_stats: user_stats[user] = {'count': 0, 'cpu_pct': 0.0, 'mem_pct': 0.0, 'rss_kb': 0}
-            user_stats[user]['count'] += 1; user_stats[user]['cpu_pct'] += p['cpu_pct']; user_stats[user]['mem_pct'] += p['mem_pct']; user_stats[user]['rss_kb'] += p['rss_kb']
-        top_users = sorted(user_stats.items(), key=lambda item: item[1]['cpu_pct'], reverse=True)[:5]
-        return { 'total': len(processes), 'top_cpu': sorted(processes, key=lambda p: p['cpu_pct'], reverse=True)[:5], 'top_mem': sorted(processes, key=lambda p: p['rss_kb'], reverse=True)[:5], 'uninterruptible': [p for p in processes if 'D' in p['stat']], 'zombie': [p for p in processes if 'Z' in p['stat']], 'by_user': [{ 'user': user, **stats } for user, stats in top_users] }
-
-    def _parse_listening_ports(self) -> List[Dict[str, Any]]:
-        ss_content = self._read_file(['sos_commands/networking/ss_-tlpn'])
-        ports = []
-        if ss_content == 'N/A': return ports
-        for line in ss_content.split('\n')[1:]:
-            parts = line.split()
-            if len(parts) < 5 or not parts[0].startswith('LISTEN'): continue
-            try:
-                address, port = parts[3].rsplit(':', 1)
-                process_match = re.search(r'users:\(\("([^"]+)",', ' '.join(parts[4:]))
-                process_name = process_match.group(1) if process_match else 'N/A'
-                ports.append({'port': int(port), 'address': address, 'process': process_name})
-            except (ValueError, IndexError):
-                continue
-        return ports
-
-    def _parse_network_details(self) -> Dict[str, Any]:
-        details = {'interfaces': [], 'routing_table': [], 'ethtool': {}, 'bonding': [], 'netdev': [], 'listening_ports': self._parse_listening_ports()}; all_ifaces = set()
-        netdev_content = self._read_file(['proc/net/dev'])
-        for line in netdev_content.split('\n')[2:]:
-            if ':' in line:
-                iface, stats = line.split(':', 1); iface, stat_values = iface.strip(), stats.split(); all_ifaces.add(iface)
-                if len(stat_values) == 16: details['netdev'].append({ 'iface': iface, 'rx_bytes': int(stat_values[0]),'rx_packets': int(stat_values[1]), 'rx_errs': int(stat_values[2]), 'rx_drop': int(stat_values[3]), 'tx_bytes': int(stat_values[8]), 'tx_packets': int(stat_values[9]),'tx_errs': int(stat_values[10]),'tx_drop': int(stat_values[11]) })
-        ip_addr_content = self._read_file(['sos_commands/networking/ip_addr', 'sos_commands/networking/ip_-d_address'])
-        for block in re.split(r'^\d+:\s+', ip_addr_content, flags=re.MULTILINE)[1:]:
-            iface_data = {}
-            if match := re.match(r'([\w.-]+):', block): iface_name = match.group(1); iface_data['iface'] = iface_name; all_ifaces.add(iface_name)
-            else: continue
-            if match := re.search(r'state\s+(\w+)', block): iface_data['state'] = match.group(1).lower()
-            if match := re.search(r'link/\w+\s+([\da-fA-F:]+)', block): iface_data['mac'] = match.group(1)
-            if match := re.search(r'inet\s+([\d.]+/\d+)', block): iface_data['ipv4'] = match.group(1)
-            details['interfaces'].append(iface_data)
-        bonding_dir = self.base_path / 'proc/net/bonding'
-        if bonding_dir.is_dir():
-            for bond_file in bonding_dir.iterdir():
-                bond_content = bond_file.read_text(errors='ignore'); bond_info = {'device': bond_file.name, 'slaves_info': []}
-                if match := re.search(r'Bonding Mode:\s*(.*)', bond_content): bond_info['mode'] = match.group(1).strip()
-                if match := re.search(r'MII Status:\s*(.*)', bond_content): bond_info['mii_status'] = match.group(1).strip()
-                for slave_block in bond_content.split('Slave Interface:')[1:]:
-                    slave_info = {'name': slave_block.strip().split('\n')[0].strip()}
-                    if m := re.search(r'MII Status:\s*(.*)', slave_block): slave_info['mii_status'] = m.group(1).strip()
-                    if m := re.search(r'Speed:\s*(.*)', slave_block): slave_info['speed'] = m.group(1).strip()
-                    bond_info['slaves_info'].append(slave_info)
-                details['bonding'].append(bond_info)
-        for iface_name in sorted(list(all_ifaces)):
-            ethtool_i = self._read_file([f'sos_commands/networking/ethtool_-i_{iface_name}']); ethtool_main = self._read_file([f'sos_commands/networking/ethtool_{iface_name}']); ethtool_g = self._read_file([f'sos_commands/networking/ethtool_-g_{iface_name}']); iface_ethtool = {}
-            if m := re.search(r'driver:\s*(.*)', ethtool_i): iface_ethtool['driver'] = m.group(1).strip()
-            if m := re.search(r'firmware-version:\s*(.*)', ethtool_i): iface_ethtool['firmware'] = m.group(1).strip()
-            if m := re.search(r'Link detected:\s*(yes|no)', ethtool_main): iface_ethtool['link'] = m.group(1)
-            if m := re.search(r'Speed:\s*(.*)', ethtool_main): iface_ethtool['speed'] = m.group(1).strip()
-            if m := re.search(r'Duplex:\s*(.*)', ethtool_main): iface_ethtool['duplex'] = m.group(1).strip()
-            rx_max_match = re.search(r'RX:\s*(\d+)', ethtool_g)
-            rx_now_match = re.search(r'Current hardware settings:[\s\S]*?RX:\s*(\d+)', ethtool_g)
-            iface_ethtool['rx_ring'] = f"{rx_now_match.group(1)}/{rx_max_match.group(1)}" if rx_now_match and rx_max_match else 'N/A'
-            details['ethtool'][iface_name] = iface_ethtool
-        details['routing_table'] = self._parse_routing_table()
-        return details
-
-    def _parse_routing_table(self) -> List[Dict[str, str]]:
-        content = self._read_file(['sos_commands/networking/ip_route_show_table_all']); routes = []
-        for line in content.split('\n'):
-            parts = line.split();
-            if not parts or parts[0] in ["broadcast", "local", "unreachable"]: continue
-            route = {'destination': parts[0]}
-            if 'via' in parts: route['gateway'] = parts[parts.index('via') + 1]
-            if 'dev' in parts: route['device'] = parts[parts.index('dev') + 1]
-            routes.append(route)
-        return routes
-
-    def _parse_additional_info(self) -> Dict[str, Any]:
-        sysctl = {k.strip(): v.strip() for k,v in (l.split('=',1) for l in self._read_file(['sos_commands/kernel/sysctl_-a']).split('\n') if '=' in l)}
-        sestatus = {k.strip().lower().replace(' ','_'): v.strip() for k,v in (l.split(':',1) for l in self._read_file(['sos_commands/selinux/sestatus_-v']).split('\n') if ':' in l)}
-        rpms = sorted(list(set(l.strip() for l in self._read_file(['installed-rpms']).split('\n') if l.strip() and not l.startswith('gpg-pubkey'))))
-        failed_services = [l.strip().split()[0] for l in self._read_file(['sos_commands/systemd/systemctl_list-units_--all']).split('\n') if 'failed' in l]
-        return { "kernel_parameters": {k: sysctl.get(k, 'N/A') for k in ['vm.swappiness', 'net.core.somaxconn', 'fs.file-max']}, "selinux_status": sestatus, "installed_packages": rpms, "failed_services": failed_services }
-
-    def _parse_sar_data(self) -> Dict[str, List[Dict]]:
-        report_day_str = self.report_date.strftime('%d'); content = self._read_file([f'var/log/sa/sar{report_day_str}', f'sos_commands/sar/sar{report_day_str}', 'sos_commands/monitoring/sar_-A'])
-        if content == 'N/A' or not content.strip(): return {}
-        data: Dict[str, List[Dict]] = {}; header_map, current_section = {}, None
-        section_keys = {
-            'disk_detail': {'avgrq-sz', 'avgqu-sz', 'await', 'svctm', '%util'},
-            'cpu': {'%user', '%usr', '%system', '%iowait', '%idle'},
-            'memory': {'kbmemfree', 'kbmemused', '%memused'},
-            'disk': {'tps', 'rtps', 'wtps', 'rkB/s', 'wkB/s', 'rd_sec/s', 'wr_sec/s', 'bread/s', 'bwrtn/s'},
-            'load': {'runq-sz', 'ldavg-1', 'ldavg-5'},
-            'swap': {'kbswpfree', 'kbswpused', '%swpused'},
-            'network': {'IFACE', 'rxpck/s', 'txpck/s', 'rxkB/s', 'txkB/s'}
-        }
-        for line in content.strip().replace('\r\n', '\n').split('\n'):
-            line = line.strip()
-            if not line or line.startswith(('Average:', 'Linux')): header_map, current_section = {}, None; continue
-            is_header = re.match(r'^\d{2}:\d{2}:\d{2}(?:\s+PM|AM)?', line) and any(k in line for k in ['CPU', '%', 'IFACE', 'kb', 'tps', 'ldavg', 'runq-sz'])
-            if is_header:
-                parts = re.split(r'\s+', line); metric_start_idx = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
-                header_cols_raw = parts[metric_start_idx:]
-                header_cols = [p.replace('%', 'pct_').replace('/', '_').replace('%usr', 'pct_user') for p in header_cols_raw]
-                header_map = {col: i for i, col in enumerate(header_cols)}
-                current_section = None # 섹션 재탐색을 위해 초기화
-                
-                # [BUG FIX] `sar -d`와 `sar -b`를 명확히 구분합니다.
-                # `sar -d`는 'DEV'와 '%util' 또는 'avgqu-sz'를 포함합니다.
-                # `sar -b`는 'bread/s' 또는 'bwrtn/s'를 포함하지만 'DEV'는 없습니다.
-                is_disk_detail = 'DEV' in header_cols_raw and ('%util' in header_cols_raw or 'avgqu-sz' in header_cols_raw)
-                is_disk_io = ('bread/s' in header_cols_raw or 'bwrtn/s' in header_cols_raw) and 'DEV' not in header_cols_raw
-
-                if is_disk_detail:
-                    current_section = 'disk_detail'
-                elif is_disk_io:
-                    current_section = 'disk'
-                else:
-                    for sec, keys in section_keys.items():
-                        if sec not in ['disk', 'disk_detail'] and any(key in header_cols_raw for key in keys):
-                            current_section = sec; break
-                continue
-            if current_section and header_map and (parts := re.split(r'\s+', line)) and re.match(r'^\d{2}:\d{2}:\d{2}', parts[0]):
-                ts_end_idx = 2 if len(parts) > 1 and parts[1] in ['AM', 'PM'] else 1
-                ts_str = " ".join(parts[:ts_end_idx])
-                
-                # [핵심 개선] 파싱 단계에서 timestamp를 완전한 datetime 객체로 변환 후 ISO 형식 문자열로 저장합니다.
-                try:
-                    format_str = '%I:%M:%S %p' if 'M' in ts_str else '%H:%M:%S'
-                    dt_obj = datetime.datetime.strptime(ts_str, format_str)
-                    full_dt = self.report_date.replace(hour=dt_obj.hour, minute=dt_obj.minute, second=dt_obj.second)
-                    timestamp_iso = full_dt.isoformat()
-                except ValueError:
-                    continue # 시간 파싱 실패 시 해당 라인 건너뛰기
-
-                values = parts[ts_end_idx:]
-                entry = {'timestamp': timestamp_iso}
-                for h, i in header_map.items():
-                    if i < len(values):
-                        entry[h] = self._safe_float(values[i]) if h not in ['IFACE', 'DEV', 'CPU'] else values[i]
-                
-                # [개선] DEV 컬럼이 있으면 실제 장치명으로 변환
-                if 'DEV' in entry and entry['DEV'].startswith('dev'):
-                    major, minor = entry['DEV'][3:].split('-') # type: ignore
-                    device_name = self.device_map.get(f"{major}:{minor}")
-                    if device_name:
-                        entry['device_name'] = device_name
-
-                if current_section == 'cpu' and entry.get('CPU') != 'all': continue
-                if current_section == 'network' and entry.get('IFACE') == 'lo': continue
-                data.setdefault(current_section, []).append(entry)
-        
-        # [개선] 파싱된 데이터 개수를 요약하여 출력
-        summary = ", ".join([f"{key}: {len(value)}" for key, value in data.items()])
-        logging.info(f"SAR 데이터 파싱 완료. [{summary}]")
-        return data
-
-    def _find_sar_data_around_time(self, sar_section_data: List[Dict], target_dt: datetime.datetime, window_minutes: int = 2) -> Optional[Dict]:
-        if not sar_section_data: return None
-        closest_entry, min_delta = None, timedelta.max
-        for entry in sar_section_data:
-            try:
-                ts_str = entry['timestamp']; dt = datetime.datetime.strptime(ts_str, '%I:%M:%S %p') if 'M' in ts_str else datetime.datetime.strptime(ts_str, '%H:%M:%S')
-                entry_dt = self.report_date.replace(hour=dt.hour, minute=dt.minute, second=dt.second); delta = abs(entry_dt - target_dt)
-                if delta < min_delta: min_delta, closest_entry = delta, entry
-            except (ValueError, KeyError): continue
-        return closest_entry.copy() if closest_entry and min_delta <= timedelta(minutes=window_minutes) else None
-
-    def _analyze_logs_and_correlate_events(self, sar_data: Dict) -> Dict:
-        log_content = self._read_file(['var/log/messages', 'var/log/syslog']); critical_events = []
-        if log_content == 'N/A': return {"critical_log_events": []}
-        for line in log_content.split('\n'):
-            if match := re.match(r'^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', line):
-                try: log_dt = datetime.datetime.strptime(f"{self.report_date.year} {match.group(1)}", '%Y %b %d %H:%M:%S')
-                except ValueError: continue
-                event_type, context = None, {}
-                if 'i/o error' in line.lower():
-                    event_type = "I/O Error"
-                    if sar_context := self._find_sar_data_around_time(sar_data.get('disk', []), log_dt): context['sar_disk'] = sar_context
-                elif 'out of memory' in line.lower():
-                    event_type = "Out of Memory"
-                    if sar_context := self._find_sar_data_around_time(sar_data.get('memory', []), log_dt): context['sar_memory'] = sar_context
-                if event_type: critical_events.append({"event_type": event_type, "timestamp": log_dt.isoformat(), "log_message": line, "context": context})
-        return {"critical_log_events": critical_events}
-
-    def _analyze_performance_bottlenecks(self, sar_data: Dict) -> Dict:
-        analysis = {}
-        if cpu_data := sar_data.get('cpu'):
-            if high_iowait := [d for d in cpu_data if d.get('pct_iowait', 0) > 20]: analysis['io_bottleneck'] = f"CPU I/O Wait이 20%를 초과한 경우가 {len(high_iowait)}번 감지되었습니다."
-        if load_data := sar_data.get('load'):
-            if self.cpu_cores_count > 0 and (high_load := [d for d in load_data if d.get('ldavg-5', 0) > self.cpu_cores_count * 1.5]): analysis['high_load_average'] = f"5분 평균 부하가 CPU 코어 수의 1.5배를 초과한 경우가 {len(high_load)}번 감지되었습니다."
-        if swap_data := sar_data.get('swap'):
-            if swap_data and (max_swap := max(d.get('pct_swpused',0) for d in swap_data)) > 10: analysis['swap_usage'] = f"최대 스왑 사용률이 {max_swap:.1f}%에 달했습니다."
-        return analysis
-
-    def parse_all(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        log_step("sosreport 데이터 파싱 시작")
-        metadata = { "system_info": self._parse_system_details(), "storage": self._parse_storage(), "processes": self._parse_process_stats(), "network": self._parse_network_details(), **self._parse_additional_info() }
-        sar_data = self._parse_sar_data()
-        log_analysis = self._analyze_logs_and_correlate_events(sar_data); perf_analysis = self._analyze_performance_bottlenecks(sar_data)
-        metadata.update(log_analysis); metadata["performance_analysis"] = perf_analysis
-        logging.info(Color.success("모든 데이터 파싱 및 추가 분석 완료."))
-        return metadata, sar_data
-
 class AIAnalyzer:
-    def __init__(self, api_url: str, report_date: datetime.datetime):
-        self.api_url = api_url.rstrip('/')
-        self.report_date = report_date
-        self.session = requests.Session()
-        self.session.headers.update({'Content-Type': 'application/json', 'Accept': 'application/json'})
+    """
+    [신규] AIBox 서버와 통신하여 sosreport 데이터를 분석하고,
+    보안 위협 정보를 가져오는 클래스.
+    """
+    def __init__(self, server_url: str, report_date: Optional[datetime.datetime]):
+        self.server_url = server_url.rstrip('/')
+        self.report_date_str = report_date.strftime('%Y-%m-%d') if report_date else "N/A"
+        self.tokenizer = None
+        if IS_TIKTOKEN_AVAILABLE:
+            try:
+                # 토크나이저를 미리 로드하여 성능 향상
+                self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            except Exception as e:
+                logging.warning(f"tiktoken 토크나이저 로딩 실패: {e}. 문자 길이 기반으로 폴백합니다.")
 
-    def _create_system_analysis_prompt(self, metadata: Dict) -> str:
-        data_to_send = {
-            "system_info": metadata.get("system_info"),
-            "performance_analysis": metadata.get("performance_analysis"),
-            "critical_log_events": metadata.get("critical_log_events"),
-            "kernel_parameters": metadata.get("kernel_parameters"),
-            "selinux_status": metadata.get("selinux_status"),
-        }
-        data_str = json.dumps(data_to_send, indent=2, ensure_ascii=False, default=str)
+    def _make_request(self, endpoint: str, data: Dict, timeout: int = 600) -> Dict:
+        """AIBox 서버에 POST 요청을 보내고 JSON 응답을 반환합니다."""
+        url = f"{self.server_url}/api/{endpoint}"
+        try:
+            logging.info(f"AI 서버에 분석 요청: {url}")
+            response = requests.post(url, json=data, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(Color.error(f"AI 서버({url}) 통신 오류: {e}"))
+            # [안정성 강화] 서버 통신 실패 시, AI 분석 결과가 없음을 나타내는 기본 구조를 반환합니다.
+            return {
+                "summary": "AI 분석 서버와 통신하지 못했습니다. 네트워크 연결 및 서버 상태를 확인하세요.",
+                "critical_issues": [], "warnings": [], "recommendations": []
+            }
 
-        return f"""당신은 Red Hat Enterprise Linux 시스템의 문제를 해결하는 최고 수준의 전문가입니다. 다음 sosreport에서 추출한 데이터를 종합적으로 검토하여, 전문가 수준의 진단과 해결책을 한국어로 제공해주세요.
+    def _perform_sar_smart_analysis(self, sar_data: Dict[str, Any], cpu_cores: int) -> Dict[str, Any]:
+        """
+        [신규] SAR 데이터에서 임계치를 초과하는 성능 지표만 필터링하는 '스마트 분석'을 수행합니다.
+        AI 분석에 유의미한 데이터만 선별하여 분석 효율을 높입니다.
+        """
+        logging.info("  - SAR 데이터 스마트 분석 시작 (임계치 기반 필터링)...")
+        problematic_data = {}
+        
+        # CPU: iowait > 20%
+        if cpu_data := sar_data.get('cpu'):
+            high_iowait = [d for d in cpu_data if d.get('pct_iowait', 0) > 20]
+            if high_iowait: problematic_data['cpu_high_iowait'] = high_iowait
 
-## 분석 데이터
+        # Load: 5분 평균 부하 > CPU 코어 수
+        if load_data := sar_data.get('load'):
+            high_load = [d for d in load_data if d.get('ldavg-5', 0) > cpu_cores]
+            if high_load: problematic_data['load_average_high'] = high_load
+
+        # Disk: util > 80% or await > 20ms
+        if disk_data := sar_data.get('disk_detail'):
+            disk_bottleneck = [d for d in disk_data if d.get('pct_util', 0) > 80 or d.get('await', 0) > 20]
+            if disk_bottleneck: problematic_data['disk_bottleneck'] = disk_bottleneck
+
+        # Memory: memused > 90%
+        if mem_data := sar_data.get('memory'):
+            high_mem = [d for d in mem_data if d.get('pct_memused', 0) > 90]
+            if high_mem: problematic_data['memory_pressure'] = high_mem
+
+        # Swap: swpused > 10%
+        if swap_data := sar_data.get('swap'):
+            swap_usage = [d for d in swap_data if d.get('pct_swpused', 0) > 10]
+            if swap_usage: problematic_data['swap_activity'] = swap_usage
+
+        if problematic_data:
+            summary_text = f"SAR 데이터 스마트 분석 결과, {len(problematic_data)}개 영역에서 성능 저하 의심 지표가 발견되었습니다: {', '.join(problematic_data.keys())}"
+            logging.info(f"    -> {summary_text}")
+            # AI가 컨텍스트를 이해할 수 있도록 요약 정보를 추가
+            problematic_data['sar_smart_analysis_summary'] = summary_text
+            return problematic_data
+        else:
+            logging.info("    -> SAR 데이터에서 특이점을 발견하지 못했습니다. AI 분석에서 SAR 데이터는 제외됩니다.")
+            # 특이점이 없으면 빈 딕셔너리를 반환하여 AI 요청 데이터 양을 줄임
+            return {}
+
+    def _create_chunk_analysis_prompt(self, chunk_name: str, chunk_data: Any) -> str:
+        """[신규] 개별 데이터 청크(묶음) 분석을 위한 프롬프트를 생성합니다."""
+        return f"""
+[시스템 역할]
+당신은 RHEL 시스템의 특정 데이터 조각을 분석하고 핵심만 요약하는 전문가입니다.
+
+[분석 대상 데이터]
+- 데이터 섹션: {chunk_name}
+- 데이터 내용:
 ```json
-{data_str}
+{json.dumps(chunk_data, indent=2, ensure_ascii=False, default=str)}
 ```
 
-## 분석 가이드라인
-1.  **critical_log_events 최우선 분석**: 각 이벤트의 `log_message`와 `correlated_context`를 함께 분석하여 문제의 **근본 원인**을 추론하세요.
-2.  **performance_analysis 결과와 연계**: 진단된 성능 병목 현상을 다른 데이터와 연관 지어 설명하세요.
-3.  **kernel_parameters 및 SELinux 확인**: 비표준 커널 파라미터나 SELinux 상태가 문제와 관련 있는지 분석하세요. SELinux가 `Enforcing` 모드가 아니면 보안 위험으로 반드시 언급해야 합니다.
+[요청]
+위 데이터에서 가장 중요하거나 비정상적인 특징, 잠재적인 문제점을 나타내는 핵심 사항을 2~3개의 불릿 포인트로 요약해 주십시오.
+"""
 
-## 최종 출력 형식
-**모든 내용은 반드시 자연스러운 한국어로 작성해주세요.**
+    def _create_final_analysis_prompt(self, summaries: Dict[str, str]) -> str:
+        """[신규] 개별 청크 요약본들을 종합하여 최종 분석을 위한 프롬프트를 생성합니다."""
+        summaries_text = "\n".join(f"- **{name}**: {summary}" for name, summary in summaries.items())
+        return f"""
+[시스템 역할]
+당신은 20년 경력의 Red Hat Certified Architect(RHCA)이자 리눅스 성능 분석 전문가입니다. 주어진 시스템 데이터의 각 섹션별 요약본을 종합하여, 시스템의 상태를 진단하고 문제의 근본 원인을 찾아 구체적인 해결 방안을 제시해야 합니다.
+
+[분석 대상: 시스템 데이터 섹션별 요약]
+{summaries_text}
+
+[출력 형식]
+위 요약본들을 종합적으로 분석하여, 다음의 키를 가진 단일 JSON 객체로만 반환하십시오. 다른 설명은 절대 추가하지 마세요.
+
+`summary` 필드는 다음의 마크다운 구조를 반드시 사용해야 합니다:
+**종합 평가 (Overall Assessment):** <시스템의 전반적인 상태에 대한 1~2 문장의 평가 (예: '양호', '주의', '심각') 및 핵심 근거>
+**주요 발견 사항 (Key Findings):**
+* <가장 중요한 발견점 1>
+* <가장 중요한 발견점 2>
+**최우선 권장 사항 (Top Priority Recommendation):** <가장 시급하게 조치해야 할 단 한 가지의 핵심 권장 사항>
 
 ```json
 {{
-  "critical_issues": ["상관관계 분석 및 성능 분석을 기반으로 식별된 심각한 문제들의 구체적인 설명"],
-  "warnings": ["주의가 필요한 로그 패턴, 서비스 실패, 커널 설정 등의 사항"],
+  "summary": "위의 마크다운 구조에 따라 시스템의 전반적인 상태, 주요 발견 사항, 핵심 권장 사항을 요약합니다.",
+  "critical_issues": ["시스템 안정성에 즉각적인 영향을 미치는 심각한 문제점 목록 (예: Kernel panic, OOM Killer 발생)"],
+  "warnings": ["주의가 필요하거나 잠재적인 문제로 발전할 수 있는 경고 사항 목록 (예: 높은 I/O 대기, 특정 로그의 반복적인 오류)"],
   "recommendations": [
     {{
-      "priority": "높음|중간|낮음",
-      "category": "성능|보안|안정성|유지보수",
-      "issue": "근본 원인에 대한 설명 (데이터 기반)",
-      "solution": "구체적이고 실행 가능한 해결 방안"
+      "priority": "높음/중간/낮음",
+      "category": "성능/안정성/보안/구성",
+      "issue": "구체적인 문제점 기술",
+      "solution": "문제 해결을 위한 구체적이고 실행 가능한 단계별 가이드 또는 명령어",
+      "related_logs": ["분석의 근거가 된 특정 로그 메시지 (있는 경우)"]
     }}
-  ],
-  "summary": "시스템 상태와 핵심 문제, 가장 시급한 권장사항에 대한 종합 요약"
+  ]
 }}
 ```
-**중요**: 당신의 전체 응답은 오직 위 형식의 단일 JSON 객체여야 합니다.
 """
 
-    def get_structured_analysis(self, metadata: Dict, anonymize: bool) -> Dict:
-        log_step("전문가 프롬프트 기반 AI 시스템 분석 요청")
-        
-        data_for_prompt = metadata
-        if anonymize:
-            anonymizer = DataAnonymizer()
-            hostnames = [metadata.get("system_info", {}).get("hostname", "")]
-            data_for_prompt = anonymizer.anonymize_data(metadata, specific_hostnames=hostnames)
-            logging.info("데이터 익명화 완료.")
+    def get_structured_analysis(self, metadata_path: Path, sar_data_path: Path, anonymize: bool = False) -> Dict[str, Any]:
+        """
+        [핵심 개선] 분할 정복(Divide and Conquer) 방식으로 AI 분석을 수행합니다.
+        1. 데이터를 작은 묶음(chunk)으로 나누어 개별적으로 요약 분석을 요청합니다. (병렬 처리)
+        2. 요약된 결과들을 모아 최종 종합 분석을 요청합니다.
+        """
+        # [개선] LLM의 컨텍스트 크기를 '토큰' 기준으로 설정 (예: 128k 모델의 경우, 안전 마진을 고려하여 120,000 토큰)
+        # self.tokenizer가 있을 경우 토큰 기반, 없을 경우 문자 길이 기반으로 동작합니다.
+        MAX_CHUNK_TOKENS = 120000
+        MAX_CHUNK_CHARS = MAX_CHUNK_TOKENS * 2 # 토큰을 계산할 수 없을 때의 폴백 (대략 1토큰=2자)
 
-        prompt = self._create_system_analysis_prompt(data_for_prompt)
-        payload = {"prompt": prompt, "data": data_for_prompt}
-
+        log_step("AI 시스템 분석 요청 (지능형 청크 분할)")
         try:
-            logging.info(f"AI 분석 서버로 요청 전송: {self.api_url}")
-            response = self.session.post(self.api_url, json=payload, timeout=300)
-            response.raise_for_status()
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            with open(sar_data_path, 'r', encoding='utf-8') as f:
+                sar_data = json.load(f)
 
-            # [개선] 서버 응답이 JSON이 아닐 경우를 대비한 예외 처리 강화
-            try:
-                analysis_result = response.json()
-            except json.JSONDecodeError:
-                logging.error("서버로부터 유효한 JSON 응답을 받지 못했습니다. HTML 오류 페이지일 수 있습니다.")
-                logging.error(f"서버 응답 내용 (첫 500자): {response.text[:500]}")
-                # JSON 파싱 실패 시, 오류를 포함한 기본 구조를 반환하여 프로그램 중단을 방지합니다.
-                return {
-                    "summary": "AI 분석 서버로부터 유효한 응답을 받지 못했습니다.",
-                    "critical_issues": ["서버가 JSON이 아닌 응답을 반환했습니다. 서버 로그를 확인하세요."],
-                    "warnings": [], "recommendations": []
-                }
-
-            logging.info(Color.success("서버로부터 AI 분석 결과 수신 완료."))
-            return analysis_result
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"AI 분석 서버 통신 오류: {e}")
-            error_details = str(e)
-            if e.response is not None:
-                try: error_details = e.response.json().get('details', e.response.text)
-                except json.JSONDecodeError: error_details = e.response.text[:500]
+            if anonymize:
+                logging.info("  - 민감 정보 익명화(Anonymization) 진행 중...")
+                anonymizer = DataAnonymizer()
+                hostnames = [metadata.get('system_info', {}).get('hostname', '')]
+                metadata = anonymizer.anonymize_data(metadata, hostnames)
+                sar_data = anonymizer.anonymize_data(sar_data, hostnames)
             
-            return {
-                "summary": f"AI 분석 서버와 통신하는 데 실패했습니다.",
-                "critical_issues": [f"서버 통신 오류: {error_details}"],
-                "warnings": [], "recommendations": []
-            }
+            # [핵심 개선] SAR 데이터에 대한 스마트 분석 수행
+            # CPU 코어 수 파싱 (문자열 'x' 기준)
+            cpu_info_str = metadata.get('system_info', {}).get('cpu', '1 x')
+            try:
+                cpu_cores = int(cpu_info_str.split('x')[0].strip())
+            except (ValueError, IndexError):
+                cpu_cores = 1 # 파싱 실패 시 기본값
+            
+            smart_sar_results = self._perform_sar_smart_analysis(sar_data, cpu_cores)
+
+            # 1단계: 데이터 청크 분할 및 병렬 요약
+            logging.info("  - [1/2] 데이터 청크 분할 및 병렬 요약 분석 시작...")
+            all_data = {**metadata, **smart_sar_results} # [변경] sar_data 대신 스마트 분석 결과를 사용
+            chunk_summaries = {}
+            tasks = []
+
+            for chunk_name, chunk_data in all_data.items():
+                if not chunk_data: continue
+
+                chunk_str = json.dumps(chunk_data, ensure_ascii=False, default=str)
+                
+                # [개선] 토큰 기반 크기 측정 및 청크 분할
+                chunk_size = 0
+                if self.tokenizer:
+                    chunk_size = len(self.tokenizer.encode(chunk_str))
+                    max_size = MAX_CHUNK_TOKENS
+                else:
+                    chunk_size = len(chunk_str)
+                    max_size = MAX_CHUNK_CHARS
+
+                if chunk_size <= max_size:
+                    tasks.append((chunk_name, chunk_data))
+                else:
+                    # 토큰 기반 크기를 로그에 명시
+                    size_str = f"{chunk_size} 토큰" if self.tokenizer else f"{chunk_size} 자"
+                    logging.warning(f"    - '{chunk_name}' 섹션이 너무 커서({size_str}) 하위 청크로 분할합니다.")
+                    
+                    # [개선] 청크 분할 로직 고도화
+                    if isinstance(chunk_data, list):
+                        # 리스트는 100개 아이템 단위로 분할
+                        for i in range(0, len(chunk_data), 100):
+                            tasks.append((f"{chunk_name}_{i//100+1}", chunk_data[i:i+100]))
+                    elif isinstance(chunk_data, dict):
+                        items = list(chunk_data.items())
+                        # 딕셔너리는 200개 아이템 단위로 분할
+                        for i in range(0, len(items), 200):
+                            tasks.append((f"{chunk_name}_{i//200+1}", dict(items[i:i+200])))
+
+            # [개선] 병렬 처리 워커 수를 늘려 동시 요청 수를 증가시킴
+            with ThreadPoolExecutor(max_workers=10, thread_name_prefix='Chunk_Summarizer') as executor:
+                future_to_chunk = {executor.submit(self._make_request, 'sos/analyze_system', {"prompt": self._create_chunk_analysis_prompt(name, data)}): name for name, data in tasks}
+
+                for future in as_completed(future_to_chunk):
+                    chunk_name = future_to_chunk[future]
+                    try:
+                        result = future.result()
+                        # AI 응답에서 실제 요약 텍스트를 추출 (오류가 있을 수 있음)
+                        summary_text = result.get('summary', str(result))
+                        chunk_summaries[chunk_name] = summary_text
+                        logging.info(f"    -> '{chunk_name}' 섹션 요약 완료.")
+                    except Exception as e:
+                        logging.error(f"'{chunk_name}' 섹션 요약 중 오류 발생: {e}")
+                        chunk_summaries[chunk_name] = f"오류: {e}"
+
+            # 2단계: 요약본을 취합하여 최종 분석 요청
+            logging.info("  - [2/2] 요약본 취합 및 최종 종합 분석 시작...")
+            final_prompt = self._create_final_analysis_prompt(chunk_summaries)
+            final_analysis = self._make_request('sos/analyze_system', {"prompt": final_prompt})
+
+            return final_analysis
+
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.error(Color.error(f"AI 분석을 위한 데이터 파일을 읽는 중 오류 발생: {e}"))
+            return {"summary": "분석 데이터 파일을 처리할 수 없어 AI 분석을 수행하지 못했습니다.", "critical_issues": [], "warnings": [], "recommendations": []}
 
     def fetch_security_news(self, metadata: Dict) -> List[Dict]:
-        log_step("스마트 보안 위협 분석 시작 (컨텍스트 기반 엔진)")
+        """[보안 분석] 설치된 패키지 정보를 기반으로 보안 위협을 분석하고, AI를 통해 우선순위를 선정합니다."""
+        log_step("보안 위협 분석 시작")
+        packages = metadata.get('installed_packages', [])
+        if not packages:
+            logging.warning("설치된 패키지 정보가 없어 보안 분석을 건너뜁니다.")
+            return []
         
-        all_findings = []
-        
-        if metadata.get("selinux_status", {}).get("current_mode") != "enforcing":
-            all_findings.append({
-                "type": "Configuration", "id": "SELINUX_DISABLED", "severity": "Critical",
-                "package": "selinux-policy", "description": "SELinux가 enforcing 모드가 아닙니다. 시스템이 주요 보안 위협에 노출될 수 있습니다."
-            })
-        
-        db_ports = {3306: "mysql/mariadb", 5432: "postgresql"}
-        for port_info in metadata.get("network", {}).get("listening_ports", []):
-            if port_info.get("port") in db_ports and port_info.get("address") in ["0.0.0.0", "::"]:
-                 all_findings.append({
-                    "type": "Configuration", "id": f"DB_PORT_PUBLIC_{port_info['port']}", "severity": "Critical",
-                    "package": db_ports[port_info['port']], "description": f"데이터베이스 포트({port_info['port']})가 모든 네트워크 인터페이스에 열려있어 외부 공격에 노출될 수 있습니다."
-                })
+        # 패키지 목록을 AI 분석 API로 전송
+        response = self._make_request('cve/analyze', {"packages": packages})
+        return response.get('security_advisories', [])
 
-        CVE_DATA_PATH = "/data/iso/AIBox/cve_data.json"
-        if not Path(CVE_DATA_PATH).exists():
-            logging.warning(f"CVE 데이터 파일({CVE_DATA_PATH})을 찾을 수 없어 CVE 분석을 건너<binary data, 2 bytes><binary data, 1 bytes><binary data, 1 bytes>니다.")
+def _initialize_matplotlib_font():
+    """
+    [사용자 요청 반영] Matplotlib의 폰트 설정을 초기화합니다.
+    지정된 경로의 'NanumGothicBold.ttf' 폰트를 로드하여 그래프에 적용합니다.
+    폰트 파일이 없을 경우, 기본 폰트를 사용하고 경고를 기록합니다.
+    """
+    if not IS_MATPLOTLIB_AVAILABLE:
+        return
+
+    try:
+        plt.rcParams['axes.unicode_minus'] = False
+
+        # 스크립트가 위치한 디렉토리를 기준으로 폰트 파일 경로를 설정합니다.
+        script_dir = Path(__file__).parent
+        font_path = script_dir / 'fonts' / 'NanumGothicBold.ttf'
+
+        if font_path.exists():
+            # 폰트 매니저에 폰트 추가
+            fm.fontManager.addfont(font_path)
+            # Matplotlib의 기본 폰트로 설정
+            plt.rcParams['font.family'] = 'NanumGothic'
+            logging.info(f"Matplotlib에 커스텀 폰트 'NanumGothic'를 로드했습니다: {font_path}")
         else:
-            try:
-                with open(CVE_DATA_PATH, 'r', encoding='utf-8') as f: cve_data = json.load(f)
-                critical_components = {'kernel', 'glibc', 'openssl', 'httpd', 'nginx', 'java', 'python', 'bash', 'sudo', 'systemd', 'qemu-kvm', 'mariadb', 'postgresql'}
-                installed_critical_pkgs = { re.match(r'([a-zA-Z0-9_-]+)', pkg).group(1) for pkg in metadata.get("installed_packages", []) if re.match(r'([a-zA-Z0-9_-]+)', pkg) and re.match(r'([a-zA-Z0-9_-]+)', pkg).group(1) in critical_components }
-                logging.info(f"분석 대상 핵심 컴포넌트: {', '.join(sorted(list(installed_critical_pkgs)))}")
+            logging.warning(Color.warn(f"지정된 폰트 파일을 찾을 수 없습니다: {font_path}. Matplotlib의 기본 폰트를 사용합니다. 그래프의 한글이 깨질 수 있습니다."))
 
-                relevant_cves = []
-                for cve in cve_data:
-                    if cve.get('severity') not in ['critical', 'important']: continue
-                    affected_pkgs = {p.split(':')[0] for p in cve.get('affected_packages', [])}
-                    if installed_critical_pkgs.intersection(affected_pkgs):
-                        relevant_cves.append(cve)
-                
-                logging.info(f"{len(relevant_cves)}개의 관련 CVE를 찾았습니다. AI 기반 우선순위 분석 시작.")
-
-                if relevant_cves:
-                    for cve in relevant_cves:
-                        score = 0
-                        if cve.get('severity') == 'critical': score += 100
-                        if isinstance(cve.get('cvss3'), dict):
-                             try:
-                                score_str = cve['cvss3'].get('cvss3_base_score')
-                                if score_str: score += float(score_str) * 10
-                             except (ValueError, TypeError): pass
-                        cve['priority_score'] = score
-                    
-                    prioritized_cves = sorted(relevant_cves, key=lambda x: x.get('priority_score', 0), reverse=True)
-
-                    for cve in prioritized_cves:
-                        all_findings.append({
-                            "type": "CVE", "id": cve.get('CVE'), "severity": cve.get('severity', 'N/A').capitalize(),
-                            "package": ', '.join(sorted(list({p.split(':')[0] for p in cve.get('affected_packages', [])}))) or 'N/A',
-                            "description": cve.get('bugzilla_description', 'N/A').split('\n\nStatement:')[0]
-                        })
-
-            except (json.JSONDecodeError, FileNotFoundError) as e:
-                logging.error(f"CVE 데이터 파일을 처리하는 중 오류 발생: {e}")
-
-        severity_map = {'Critical': 0, 'Important': 1}
-        sorted_findings = sorted(all_findings, key=lambda x: severity_map.get(x.get('severity'), 2))
-        top_findings = sorted_findings[:10]
-
-        logging.info(Color.success(f"스마트 보안 분석 완료. 총 {len(all_findings)}개의 잠재 위협 발견, 상위 {len(top_findings)}개 선정."))
-        
-        return [{'cve_id': f.get('id'),'severity': f.get('severity'),'package': f.get('package'),'description': f.get('description')} for f in top_findings]
-
-
-class HTMLReportGenerator:
-    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str, report_date: datetime.datetime):
-        self.metadata, self.sar_data, self.ai_analysis, self.hostname = metadata, sar_data, ai_analysis, hostname
-        self._setup_korean_font()
-        self.report_date = report_date # [BUG FIX] report_date 속성을 초기화합니다.
-
-    def _setup_korean_font(self):
-        if not IS_GRAPHING_ENABLED: return
-        font_paths = ['/usr/share/fonts/nanum/NanumGothicBold.ttf', 'NanumGothicBold.ttf']
-        font_path = next((path for path in font_paths if Path(path).exists()), None)
-        if font_path:
-            try:
-                fm.fontManager.addfont(font_path)
-                plt.rc('font', family='NanumGothic', size=10); plt.rc('axes', unicode_minus=False)
-            except Exception as e: logging.warning(f"한글 폰트 로드 실패: {e}")
-        else:
-             logging.warning("나눔고딕 폰트를 찾을 수 없습니다. 'yum install nanum-gothic-fonts' 등으로 설치해주세요.")
-
-    def _generate_graphs(self) -> Dict[str, Any]:
-        if not IS_GRAPHING_ENABLED: return {}
-        log_step("그래프 생성 시작")
-        graphs, sar = {}, self.sar_data
-        
-        logging.info("  - 그래프 생성 중: CPU Usage")
-        graphs['cpu'] = self._create_plot(sar.get('cpu'), 'CPU Usage (%)', {'pct_user': 'User', 'pct_system': 'System', 'pct_iowait': 'I/O Wait'}, True)
-        logging.info("  - 그래프 생성 중: Memory Usage")
-        graphs['memory'] = self._create_plot(sar.get('memory'), 'Memory Usage (KB)', {'kbmemused': 'Used', 'kbcached': 'Cached'})
-        logging.info("  - 그래프 생성 중: System Load Average")
-        graphs['load'] = self._create_plot(sar.get('load'), 'System Load Average', {'ldavg-1': '1-min', 'ldavg-5': '5-min', 'ldavg-15': '15-min'})
-
-        # [요청 반영] Disk I/O 그래프 생성 로직 수정
-        if sar.get('disk'):
-            logging.info("  - 그래프 생성 중: Disk I/O")
-
-        disk_data = sar.get('disk')
-        if disk_data and disk_data[0]:
-            aggregated_disk_data = {}
-            for entry in disk_data:
-                ts = entry['timestamp']
-                if ts not in aggregated_disk_data:
-                    # 복사 시 숫자형 데이터만 초기화
-                    aggregated_disk_data[ts] = {k: v for k, v in entry.items() if not isinstance(v, (int, float))}
-                    aggregated_disk_data[ts].update({k: 0 for k, v in entry.items() if isinstance(v, (int, float))})
-                else:
-                    for key, value in entry.items():
-                        if isinstance(value, (int, float)):
-                            aggregated_disk_data[ts][key] = aggregated_disk_data[ts].get(key, 0) + value
-
-            aggregated_list = list(aggregated_disk_data.values())
-
-            # [요청 반영] bread/s, bwrtn/s 우선 처리
-            # [BUG FIX] 파싱 시 '/'가 '_'로 변환되므로, 변환된 키('bread_s', 'bwrtn_s')를 사용해야 합니다.
-            #           기존 코드에서 'bread/s'를 찾으려고 해서 그래프가 생성되지 않았습니다.
-            if 'bread_s' in aggregated_list[0] and 'bwrtn_s' in aggregated_list[0]:
-                graphs['disk'] = self._create_plot(aggregated_list, 'Disk I/O (blocks/s)', {'bread_s': 'Read Blocks/s', 'bwrtn_s': 'Write Blocks/s'})
-            elif 'rd_sec_s' in aggregated_list[0]: graphs['disk'] = self._create_plot(aggregated_list, 'Disk I/O (sectors/s)', {'rd_sec_s': 'Read', 'wr_sec_s': 'Write'})
-            elif 'rkB_s' in aggregated_list[0]: graphs['disk'] = self._create_plot(aggregated_list, 'Disk I/O (kB/s)', {'rkB_s': 'Read', 'wkB_s': 'Write'})
-
-        if sar.get('swap'):
-            logging.info("  - 그래프 생성 중: Swap Usage")
-        graphs['swap'] = self._create_plot(sar.get('swap'), 'Swap Usage (%)', {'pct_swpused': 'Used %'})
-        
-        # [요청 반영] Network Traffic 그래프를 rxkB/s, txkB/s 기준으로 생성
-        if sar.get('network'):
-            logging.info("  - 그래프 생성 중: Network Traffic")
-            graphs['network'] = {}
-            net_by_iface = {}; [net_by_iface.setdefault(d.get('IFACE'), []).append(d) for d in sar['network'] if d.get('IFACE')]
-            up_interfaces = {iface['iface'] for iface in self.metadata.get('network', {}).get('interfaces', []) if iface.get('state') == 'up'}
-            for iface, data in net_by_iface.items():
-                # rxkB_s 또는 txkB_s 데이터가 있는지 확인
-                if iface in up_interfaces and len(data) > 1 and any('rxkB_s' in d or 'txkB_s' in d for d in data):
-                    logging.info(f"    - 생성: Network Traffic ({iface})")
-                    graphs['network'][iface] = self._create_plot(data, f'Network Traffic: {iface} (kB/s)', {'rxkB_s': 'RX kB/s', 'txkB_s': 'TX kB/s'})
-        return graphs
-
-    def _generate_individual_disk_graphs_page(self, sar_data: Dict) -> Optional[str]:
-        """[신규] 개별 디스크 장치에 대한 상세 I/O 그래프 HTML 페이지를 생성합니다."""
-        if not IS_GRAPHING_ENABLED or 'disk_detail' not in sar_data:
-            return None
-
-        disk_detail_data = sar_data['disk_detail']
-        graphs_by_dev = {}
-        
-        # 장치별로 데이터 그룹화
-        dev_data = {}
-        for entry in disk_detail_data:
-            dev_name = entry.get('device_name') or entry.get('DEV')
-            if dev_name:
-                dev_data.setdefault(dev_name, []).append(entry)
-
-        # 각 장치에 대해 그래프 생성
-        for dev_name, data in dev_data.items():
-            if len(data) < 2: continue # 데이터가 너무 적으면 건너뛰기
-
-            # 각 장치에 대해 3개의 그래프 생성
-            graphs_by_dev[dev_name] = {
-                'tps': self._create_plot(data, f'Transactions per second ({dev_name})', {'tps': 'TPS'}),
-                'io': self._create_plot(data, f'I/O Sectors/s ({dev_name})', {'rd_sec_s': 'Read', 'wr_sec_s': 'Write'}),
-                'util': self._create_plot(data, f'Queue and Utilization ({dev_name})', {'avgqu-sz': 'Queue Size', 'pct_util': '%Util'})
-            }
-
-        # HTML 페이지 생성
-        graph_html_parts = []
-        for dev_name, graphs in graphs_by_dev.items():
-            graph_html_parts.append(f'<div class="device-section"><h2>Device: {dev_name}</h2><div class="graph-grid">')
-            for title, b64_img in graphs.items():
-                if b64_img:
-                    graph_html_parts.append(f'<div class="graph-container"><img src="data:image/png;base64,{b64_img}" alt="{title} graph"></div>')
-            graph_html_parts.append('</div></div>')
-
-        return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><title>Block Device I/O Details</title><style>
-            body {{ font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 2rem; }}
-            h1 {{ text-align: center; color: #333; }}
-            .device-section {{ background: #fff; border-radius: 8px; margin-bottom: 2rem; padding: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-            .device-section h2 {{ margin-top: 0; border-bottom: 1px solid #eee; padding-bottom: 1rem; }}
-            .graph-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 1.5rem; }}
-            .graph-container img {{ max-width: 100%; height: auto; }}
-            </style></head><body><h1>Block Device I/O Details</h1>{''.join(graph_html_parts)}</body></html>"""
-
-    def _create_plot(self, data, title, labels, is_stack=False):
-        if not data: return None
-
-        # [개선] ISO 형식의 timestamp 문자열을 datetime 객체로 변환합니다.
-        timestamps_str = [d['timestamp'] for d in data]
-        timestamps_dt = []
-        for ts_str in timestamps_str:
-            try:
-                timestamps_dt.append(datetime.datetime.fromisoformat(ts_str))
-            except ValueError:
-                timestamps_dt.append(ts_str) # 파싱 실패 시 원본 문자열 사용 (폴백)
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        if is_stack: ax.stackplot(timestamps_dt, [[self._safe_float(d.get(k, 0)) for d in data] for k in labels.keys()], labels=list(labels.values()))
-        else:
-            for key, label in labels.items(): ax.plot(timestamps_dt, [self._safe_float(d.get(key, 0)) for d in data], label=label)
-        ax.set_title(title, fontsize=14, weight='bold'); ax.legend(fontsize='small'); ax.grid(True, linestyle='--', alpha=0.6)
-        
-        # [요청 반영] x축 포맷을 'HH:MM' 형식으로 지정합니다.
-        ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%H:%M', tz=self.report_date.tzinfo))
-        ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-        plt.xticks(rotation=30, ha='right')
-        # [개선] 레이블이 잘리지 않도록 tight_layout()을 savefig 전에 호출합니다.
-        plt.tight_layout()
-        buf = io.BytesIO(); plt.savefig(buf, format='png'); plt.close(fig)
-        return base64.b64encode(buf.getvalue()).decode('utf-8')
-
-    def _create_plot_dual_axis(self, data, title, labels1, labels2):
-        if not data: return None
-        fig, ax1 = plt.subplots(figsize=(12, 6)); ax2 = ax1.twinx()
-
-        # [개선] ISO 형식의 timestamp 문자열을 datetime 객체로 변환합니다.
-        timestamps_str = [d['timestamp'] for d in data]
-        timestamps_dt = []
-        for ts_str in timestamps_str:
-            try:
-                timestamps_dt.append(datetime.datetime.fromisoformat(ts_str))
-            except ValueError:
-                timestamps_dt.append(ts_str)
-
-        colors1 = ['tab:blue', 'tab:cyan']; colors2 = ['tab:red', 'tab:orange']
-        for (key, label), color in zip(labels1.items(), colors1): ax1.plot(timestamps_dt, [self._safe_float(d.get(key,0)) for d in data], label=label, color=color)
-        for (key, label), color in zip(labels2.items(), colors2): ax2.plot(timestamps_dt, [self._safe_float(d.get(key,0)) for d in data], label=label, linestyle='--', color=color)
-        ax1.set_title(title, fontsize=14, weight='bold'); ax1.set_ylabel('Packets/s'); ax2.set_ylabel('kB/s')
-        lines1, labels1 = ax1.get_legend_handles_labels(); lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize='small'); plt.tight_layout(); ax1.grid(True, linestyle='--', alpha=0.6)
-        ax1.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%H:%M', tz=self.report_date.tzinfo))
-        ax1.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-        plt.setp(ax1.get_xticklabels(), rotation=30, ha='right')
-        buf = io.BytesIO(); plt.savefig(buf, format='png'); plt.close(fig)
-        return base64.b64encode(buf.getvalue()).decode('utf-8')
-
-    def _safe_float(self, value):
-        try: return float(value)
-        except (ValueError, TypeError): return 0.0
-
-    def generate(self) -> str:
-        graphs = self._generate_graphs()
-        template_data = {
-            "hostname": self.hostname, 
-            "ai_analysis": self.ai_analysis,
-            "graphs": graphs,
-            "security_advisories": self.metadata.get('security_advisories', []),
-            **self.metadata
-        }
-        return get_html_template(template_data)
+    except Exception as e:
+        logging.error(f"Matplotlib 폰트 설정 중 예외 발생: {e}. 그래프의 한글이 깨질 수 있습니다.", exc_info=True)
 
 #--- 메인 실행 로직 ---
 def main(args: argparse.Namespace):
     extract_path = Path(tempfile.mkdtemp(prefix="sos-"))
+    logging.info(Color.info(f"임시 디렉터리 생성: {extract_path}"))
     try:
-        log_step(f"'{args.tar_path}' 압축 해제 중")
+        log_step(f"'{args.tar_path}' 압축 해제 중...")
         with tarfile.open(args.tar_path, 'r:*') as tar: tar.extractall(path=extract_path)
+        logging.info(Color.success("압축 해제 완료."))
 
         parser = SosreportParser(extract_path)
-        metadata, sar_data = parser.parse_all()
+        metadata, sar_data = parser.parse_all() # 모든 데이터 파싱
         
+        output_dir = Path(args.output); output_dir.mkdir(exist_ok=True)
         hostname = metadata.get('system_info', {}).get('hostname', 'unknown')
 
-        ai_analyzer = AIAnalyzer(args.server_url, parser.report_date)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_ai = executor.submit(ai_analyzer.get_structured_analysis, metadata, args.anonymize)
+        # [사용자 요청] AI 분석 전 metadata.json 파일을 먼저 저장합니다.
+        # [수정] sar_data.json도 AI 분석 전에 저장합니다.
+        metadata_path = output_dir / f"metadata-{hostname}.json"
+        sar_data_path = output_dir / f"sar_data-{hostname}.json"
+        metadata_path.write_text(json.dumps(metadata, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
+        sar_data_path.write_text(json.dumps(sar_data, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
+        logging.info(Color.success(f"분석 데이터 파일 저장 완료: {metadata_path.name}, {sar_data_path.name}"))
+
+        # [BUG FIX] --server-url에 포함된 특정 API 경로를 제거하여 기본 URL만 사용하도록 수정합니다.
+        # 이렇게 하면 AIAnalyzer가 여러 다른 API 엔드포인트(cve/analyze, sos/analyze_system)를 올바르게 호출할 수 있습니다.
+        base_server_url = args.server_url
+        # [BUG FIX] URL에서 '/api/...' 부분을 제거하여 순수 base URL만 남깁니다.
+        if '/api/' in base_server_url:
+            base_server_url = base_server_url.split('/api/')[0]
+
+        ai_analyzer = AIAnalyzer(base_server_url, parser.report_date)
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix='AI_Analysis') as executor:
+            future_ai = executor.submit(ai_analyzer.get_structured_analysis, metadata_path, sar_data_path, args.anonymize)
             future_sec = executor.submit(ai_analyzer.fetch_security_news, metadata)
+            
             structured_analysis = future_ai.result()
             security_advisories = future_sec.result()
             metadata['security_advisories'] = security_advisories
-            
-        reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date)
-        html_content = reporter.generate()
 
-        output_dir = Path(args.output); output_dir.mkdir(exist_ok=True)
+        # [보안 분석 추가] 로컬 보안 분석기 실행
+        log_step("로컬 보안 감사 시작")
+        security_analyzer = SecurityAnalyzer()
+        security_findings = security_analyzer.analyze(metadata)
+        structured_analysis['security_audit_findings'] = security_findings
+
+        # [개선] 규칙 기반 분석(Knowledge Base) 실행
+        log_step("규칙 기반 진단 시작")
+        kb = KnowledgeBase(rules_dir='rules')
+        kb_findings = kb.analyze(metadata)
+        structured_analysis['kb_findings'] = kb_findings
+            
+        log_step("HTML 보고서 생성 시작")
+        reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date)
+        
+        # [사용자 요청] 그래프 생성 시, 저장된 sar_data.json 파일을 다시 읽어 사용합니다.
+        logging.info(f"  - 그래프 생성을 위해 '{sar_data_path.name}' 파일 로딩 중...")
+        try:
+            with open(sar_data_path, 'r', encoding='utf-8') as f:
+                sar_data_for_graph = json.load(f)
+            reporter.sar_data = sar_data_for_graph # 리포터의 sar_data를 파일에서 읽은 것으로 교체
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.error(Color.error(f"sar_data.json 파일을 읽는 중 오류 발생: {e}. 그래프 생성이 제한될 수 있습니다."))
+
+        generated_graphs = reporter._generate_graphs()
+        logging.info("  - 메인 보고서 HTML 생성 중...")
+        html_content = reporter.generate(generated_graphs)
         
         report_path = output_dir / f"report-{hostname}.html"
         report_path.write_text(html_content, encoding='utf-8')
-        logging.info(Color.success(f"HTML 보고서 저장 완료: {report_path}"))
+        logging.info(Color.success(f"메인 HTML 보고서 저장 완료: {report_path}"))
+        
+        # [사용자 요청] 동적 그래프 팝업 HTML 파일 저장
+        for key, result in generated_graphs.items():
+            if result and isinstance(result, tuple) and len(result) == 2:
+                _, interactive_html = result
+                if interactive_html:
+                    popup_filename = f"popup_{key}_{hostname}.html"
+                    popup_path = output_dir / popup_filename
+                    popup_path.write_text(f'<!DOCTYPE html><html><head><title>{key.replace("_", " ").title()}</title></head><body style="margin:0;padding:0;">{interactive_html}</body></html>', encoding='utf-8')
 
         # [신규] 개별 디스크 I/O 그래프 페이지 생성
-        individual_disk_report_html = reporter._generate_individual_disk_graphs_page(sar_data)
-        if individual_disk_report_html:
+        logging.info("  - 디스크 상세 정보 팝업 페이지 생성 중...")
+        disk_report_result = reporter._generate_individual_disk_graphs_page(sar_data)
+        if disk_report_result:
+            individual_disk_report_html, disk_popups = disk_report_result
             disk_report_path = output_dir / f"sar_gui_disk-{hostname}.html"
             disk_report_path.write_text(individual_disk_report_html, encoding='utf-8')
             logging.info(Color.success(f"개별 디스크 I/O 보고서 저장 완료: {disk_report_path}"))
-        
-        (output_dir / f"metadata-{hostname}.json").write_text(json.dumps(metadata, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
-        (output_dir / f"sar_data-{hostname}.json").write_text(json.dumps(sar_data, indent=2, default=json_serializer, ensure_ascii=False), encoding='utf-8')
-        logging.info(Color.success(f"JSON 데이터 저장 완료: {output_dir}"))
+            # 디스크 팝업 파일 저장
+            for popup_filename, popup_html in disk_popups.items():
+                popup_path = output_dir / popup_filename
+                popup_path.write_text(f'<!DOCTYPE html><html><head><title>Disk Detail</title></head><body style="margin:0;padding:0;">{popup_html}</body></html>', encoding='utf-8')
+
+        # [신규] 개별 NIC 그래프 페이지 생성
+        logging.info("  - 네트워크 상세 정보 팝업 페이지 생성 중...")
+        nic_report_result = reporter._generate_individual_nic_graphs_page(sar_data, metadata)
+        if nic_report_result:
+            individual_nic_report_html, nic_popups = nic_report_result
+            nic_report_path = output_dir / f"sar_nic_detail-{hostname}.html"
+            nic_report_path.write_text(individual_nic_report_html, encoding='utf-8')
+            logging.info(Color.success(f"개별 NIC 보고서 저장 완료: {nic_report_path}"))
+            # NIC 팝업 파일 저장
+            for popup_filename, popup_html in nic_popups.items():
+                popup_path = output_dir / popup_filename
+                popup_path.write_text(f'<!DOCTYPE html><html><head><title>NIC Detail</title></head><body style="margin:0;padding:0;">{popup_html}</body></html>', encoding='utf-8')
+        logging.info(Color.success(f"JSON 데이터 파일 저장 완료: {output_dir}"))
 
     except Exception as e:
-        logging.error(f"치명적인 오류 발생: {e}", exc_info=True)
+        logging.error(Color.error(f"치명적인 오류 발생: {e}"), exc_info=True)
         sys.exit(1)
     finally:
-        if extract_path.exists(): shutil.rmtree(extract_path, ignore_errors=True)
+        if extract_path.exists(): 
+            shutil.rmtree(extract_path, ignore_errors=True)
+            logging.info(Color.info(f"임시 디렉터리 삭제 완료: {extract_path}"))
+            
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Smart sosreport Analyzer")
@@ -802,4 +1720,15 @@ if __name__ == '__main__':
     parser.add_argument("--output", default="output", help="보고서 및 데이터 저장 디렉토리")
     parser.add_argument("--server-url", required=True, help="AI 분석을 위한 ABox_Server.py의 API 엔드포인트 URL (예: http://12.34.56.78/AIBox/api/sos/analyze_system)")
     parser.add_argument("--anonymize", action='store_true', help="서버 전송 전 민감 정보 익명화")
-    main(parser.parse_args())
+    parser.add_argument("--debug", action='store_true', help="디버그 레벨 로그를 활성화합니다.")
+    
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.info(Color.warn("디버그 로깅이 활성화되었습니다."))
+
+    # [개선] 프로그램 시작 시 Matplotlib 폰트를 한 번만 설정합니다.
+    _initialize_matplotlib_font()
+    
+    main(args)

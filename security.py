@@ -1007,6 +1007,21 @@ def markdown_to_html(md_text):
 def generate_report(processed_cves, executive_summary):
     """최종 분석 리포트를 HTML 파일로 생성합니다."""
     logging.info(f"\n{Color.header('Step 8: 최종 HTML 분석 리포트 생성')}...\n")
+
+    # [사용자 요청] 로컬 폰트 파일을 읽어 Base64로 인코딩
+    font_base64 = ""
+    font_path = os.path.join(os.path.dirname(__file__), 'fonts', 'NanumGothicBold.ttf')
+    if os.path.exists(font_path):
+        try:
+            import base64
+            with open(font_path, 'rb') as f:
+                font_base64 = base64.b64encode(f.read()).decode('utf-8')
+            logging.info(f"로컬 폰트 '{font_path}'를 성공적으로 로드하여 보고서에 포함합니다.")
+        except Exception as e:
+            logging.warning(f"로컬 폰트 파일을 읽는 중 오류 발생: {e}")
+    else:
+        logging.warning(f"지정된 폰트 파일 '{font_path}'를 찾을 수 없습니다. 기본 웹 폰트를 사용합니다.")
+
     
     table_rows_html = ""
     for i, cve in enumerate(processed_cves):
@@ -1074,8 +1089,8 @@ def generate_report(processed_cves, executive_summary):
 
     html_content = f"""<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RHEL 보안 위협 분석 리포트 ({report_month})</title>
-    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
     <style>
+    {'@font-face {{ font-family: "NanumGothic"; src: url(data:font/truetype;base64,{font_base64}) format("truetype"); font-weight: normal; font-style: normal; }}' if font_base64 else ''}
     :root{{
         --primary-color: #007bff; --secondary-color: #6c757d; --success-color: #28a745;
         --danger-color: #dc3545; --warning-color: #ffc107; --background-color: #f0f4f8;
@@ -1083,7 +1098,7 @@ def generate_report(processed_cves, executive_summary):
         --header-text: #ffffff; --border-color: #dee2e6; --shadow: 0 4px 12px rgba(0,0,0,0.08);
     }}
     body{{
-        font-family:'Noto Sans KR',sans-serif; margin:0; padding: 2rem;
+        font-family:{'"NanumGothic", "Noto Sans KR", sans-serif' if font_base64 else '"Noto Sans KR", sans-serif'}; margin:0; padding: 2rem;
         background-color:var(--background-color); color:var(--text-color); 
         font-size:16px; line-height:1.6;
     }}

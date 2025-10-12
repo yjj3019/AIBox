@@ -2,12 +2,12 @@
 # ==============================================================================
 # HTML Template Module
 # ------------------------------------------------------------------------------
-# [BUG FIX] 네트워크 그래프 생성 시 발생하던 TypeError를 해결하기 위해
-#           잘못된 중괄호 문법을 수정했습니다.
-# [BUG FIX] 누락되었던 'Last Boot' 정보가 시스템 요약 테이블에 표시되도록 수정.
+# [BUG FIX] 네트워크 그래프 생성 시 발생하던 TypeError를 해결하기 위해 잘못된 중괄호 문법을 수정했습니다.
+# [BUG FIX] 누락되었던 'Last Boot' 정보가 시스템 요약 테이블에 표시되도록 수정했습니다.
 # ==============================================================================
 
 import html
+import re
 from datetime import datetime
 
 def get_html_template(data):
@@ -59,15 +59,52 @@ def get_html_template(data):
             rows += f"<tr><td><span class='priority-badge {priority_class}'>{h(item.get('priority', 'N/A'))}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{issue_html}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
         return rows
 
+    def create_security_audit_rows(audit_list):
+        if not audit_list: return "<tr><td colspan='4' style='text-align:center;'>발견된 보안 설정 이슈 없음</td></tr>"
+        rows = ""
+        priority_map = {"High": "high", "Medium": "medium", "Low": "low"}
+        for item in audit_list:
+            priority_class = priority_map.get(item.get('severity', ''), "")
+            rows += f"<tr><td><span class='priority-badge {priority_class}'>{h(item.get('severity', 'N/A'))}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{h(str(item.get('name', 'N/A')))}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
+        return rows
+
+    def create_kb_finding_rows(finding_list):
+        if not finding_list: return "<tr><td colspan='4' style='text-align:center;'>규칙 기반으로 발견된 이슈 없음</td></tr>"
+        rows = ""
+        priority_map = {"High": "high", "Medium": "medium", "Low": "low"}
+        for item in finding_list:
+            priority_class = priority_map.get(item.get('severity', ''), "")
+            rows += f"<tr><td><span class='priority-badge {priority_class}'>{h(item.get('severity', 'N/A'))}</span></td><td>{h(str(item.get('category', 'N/A')))}</td><td>{h(str(item.get('name', 'N/A')))}</td><td>{h(str(item.get('solution', 'N/A')))}</td></tr>"
+        return rows
+
     def render_graph(graph_key, title, graphs_data):
-        graph_data = graphs_data.get(graph_key)
-        # [요청 반영] disk_detail 데이터가 있을 때만 팝업을 활성화합니다.
-        has_disk_detail = data.get('sar_data', {}).get('disk_detail')
-        if isinstance(graph_data, str) and graph_data:
-            # [요청 반영] Disk I/O 그래프에 팝업을 여는 onclick 이벤트 추가
-            if graph_key == 'disk' and has_disk_detail:
-                return f'<div class="graph-container interactive" onclick="openDiskDetailPopup()"><h3>{title}</h3><img src="data:image/png;base64,{graph_data}" alt="{title} Graph"><div class="graph-overlay">상세 정보 보기</div></div>'
-            return f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graph_data}" alt="{title} Graph"></div>'
+        # [사용자 요청] 하이브리드 그래프: (base64_png, interactive_html) 튜플을 받습니다.
+        graph_tuple = graphs_data.get(graph_key)
+        # [BUG FIX & 개선] disk_detail 데이터가 존재하고 비어있지 않을 때만 팝업을 활성화합니다.
+        #                  'data.get('sar_data', {}).get('disk_detail')'은 리스트가 비어있어도 True로 평가될 수 있습니다.
+        has_disk_detail = bool(data.get('sar_data', {}).get('disk_detail'))
+        # [수정] 네트워크 그래프 팝업을 위한 조건 추가 (UP 상태인 인터페이스가 2개 이상일 때)
+        up_interfaces = [iface for iface in data.get('network', {}).get('interfaces', []) if iface.get('state') == 'up']
+        has_multiple_nics = len(up_interfaces) > 1
+
+        if graph_tuple and isinstance(graph_tuple, tuple) and len(graph_tuple) == 2:
+            base64_png, interactive_html = graph_tuple
+            hostname = h(data.get('hostname', ''))
+            popup_filename = f"popup_{graph_key}_{hostname}.html"
+
+            if base64_png: # 정적 이미지가 있으면 이미지로 표시
+                graph_html = f'<img src="data:image/png;base64,{base64_png}" alt="{title}" style="width:100%; cursor:pointer;" onclick="openGraphPopup(\'{popup_filename}\')">'
+            else: # 정적 이미지가 없으면 (kaleido 미설치) 동적 그래프를 직접 표시
+                graph_html = f'<div class="plotly-graph-container">{interactive_html}</div>'
+            
+            # "Details" 버튼 로직은 그대로 유지
+            details_button_html = ""
+            if graph_key == 'disk_detail' and has_disk_detail:
+                details_button_html = '<div class="details-button-container"><button class="details-button" onclick="openDiskDetailPopup()">세부 정보 보기 (Details)</button></div>'
+            if graph_key == 'network_representative' and has_multiple_nics:
+                details_button_html = '<div class="details-button-container"><button class="details-button" onclick="openNicDetailPopup()">다른 인터페이스 보기 (Details)</button></div>'
+            return f'<div class="graph-container"><h3>{title}</h3>{graph_html}{details_button_html}</div>'
+
         return f'<div class="graph-container"><h3 class="no-data-message">{title}</h3><p class="no-data-message">그래프 데이터 없음</p></div>'
 
     def create_ip4_details_rows(interfaces):
@@ -130,11 +167,19 @@ def get_html_template(data):
     ai_analysis = data.get('ai_analysis', {})
     graphs = data.get('graphs', {})
     network_details = data.get('network', {})
+    kb_findings = ai_analysis.get('kb_findings', [])
+    security_audit_findings = ai_analysis.get('security_audit_findings', [])
     process_stats = data.get('processes', {})
     security_news = data.get('security_advisories', [])
     
     summary_raw = ai_analysis.get('summary', '분석 결과 없음')
-    summary_html = h(summary_raw).replace('\n', '<br>')
+    # [개선] 전문가 프롬프트에 맞춰 마크다운 형식의 요약을 HTML로 변환 (더 정교한 방식)
+    summary_html = h(summary_raw)
+    summary_html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', summary_html)  # Bold
+    # 여러 줄에 걸친 리스트 항목을 하나의 <ul>로 감싸기
+    summary_html = re.sub(r'(\* (?:.|\n)*?)(?=\n\n|\Z)', lambda m: f"<ul>{m.group(1)}</ul>", summary_html, flags=re.DOTALL)
+    summary_html = re.sub(r'\* (.*?)\n', r'<li>\1</li>\n', summary_html)
+    summary_html = summary_html.replace('\n', '<br>')
 
     return f"""
     <!DOCTYPE html>
@@ -159,11 +204,15 @@ def get_html_template(data):
             .graph-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(450px, 1fr)); gap: 1.5rem; }}
             .graph-container {{ padding: 1rem; border: 1px solid var(--border-color); border-radius: 8px; margin-top: 1rem; }}
             .graph-container h3 {{ text-align: center; border: none; }}
-            .graph-container img {{ width: 100%; display: block; }}
+            .plotly-graph-container {{ width: 100%; min-height: 450px; }}
             .no-data-message {{ text-align: center; color: #888; padding: 2rem; }}
-            .graph-container.interactive {{ cursor: pointer; position: relative; }}
-            .graph-container.interactive:hover .graph-overlay {{ opacity: 1; }}
-            .graph-overlay {{ position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); color: white; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; font-weight: bold; opacity: 0; transition: opacity 0.3s; }}
+            .details-button-container {{ text-align: center; margin-top: 1rem; }}
+            .details-button {{
+                background-color: #f0f2f5; color: #34495e; border: 1px solid #dfe4ea;
+                padding: 8px 16px; border-radius: 6px; cursor: pointer;
+                font-weight: 500; font-size: 0.9rem; transition: all 0.2s ease;
+            }}
+            .details-button:hover {{ background-color: #e9ecef; border-color: #ced4da; }}
             .progress-bar-container {{ height: 12px; width: 100%; background-color: var(--light-gray); border-radius: 6px; overflow:hidden;}}
             .progress-bar {{ height: 100%; border-radius: 6px; }}
             .priority-badge {{ padding: 0.25em 0.6em; border-radius: 5px; font-size: 0.85em; color: white; font-weight: 600; }}
@@ -173,8 +222,12 @@ def get_html_template(data):
             .tooltip {{ position: relative; display: inline-block; cursor: help; }}
             .tooltip .tooltiptext {{ visibility: hidden; width: 450px; background-color: var(--secondary-color); color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 10; bottom: 125%; left: 50%; margin-left: -225px; opacity: 0; transition: opacity 0.3s; white-space: pre-wrap;}}
             .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
-            footer {{ text-align: center; padding-top: 2rem; color: #777; }}
         </style>
+        <script>
+            function openGraphPopup(filename) {{
+                window.open(filename, 'GraphPopup', 'width=1200,height=600,scrollbars=yes,resizable=yes');
+            }}
+        </script>
     </head>
     <body>
         <div class="container">
@@ -189,15 +242,16 @@ def get_html_template(data):
                     <tr><th>CPU</th><td>{h(system_info.get('cpu', 'N/A'))}</td></tr>
                     <tr><th>Memory</th><td>{h(system_info.get('memory', 'N/A'))}</td></tr>
                     <tr><th>Uptime</th><td>{h(system_info.get('uptime', 'N/A'))}</td></tr>
-                    <tr><th>Last Boot</th><td>{h(system_info.get('last_boot', 'N/A'))}</td></tr>
+                    <tr><th>Boot time</th><td>{h(system_info.get('boot_time', 'N/A'))}</td></tr>
+                    <tr><th>Report creation date</th><td>{h(system_info.get('report_creation_date', 'N/A'))}</td></tr>
                 </table></div>
             </div>
 
             <div class="report-card">
                 <div class="card-header">{svg_icons['summary_ai']} AI 종합 분석</div>
-                <div class="card-body"><p>{summary_html}</p></div>
+                <div class="card-body" style="line-height: 1.8;">{summary_html}</div>
             </div>
-            <div class="report-card">
+            <div class="report-card" {'style="display:none;"' if not ai_analysis.get('critical_issues') else ''}>
                 <div class="card-header">{svg_icons['critical']} AI 분석: 심각한 이슈</div>
                 <div class="card-body"><table class="data-table"><tbody>{create_list_table(ai_analysis.get('critical_issues', []), "발견된 심각한 이슈가 없습니다.")}</tbody></table></div>
             </div>
@@ -213,15 +267,34 @@ def get_html_template(data):
                 </table></div>
             </div>
 
+            <div class="report-card" {'style="display:none;"' if not security_audit_findings else ''}>
+                <div class="card-header">{svg_icons['shield']} 보안 감사 결과</div>
+                <div class="card-body"><table class="data-table">
+                    <thead><tr><th>심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
+                    <tbody>{create_security_audit_rows(security_audit_findings)}</tbody>
+                </table></div>
+            </div>
+
+            <div class="report-card" {'style="display:none;"' if not kb_findings else ''}>
+                <div class="card-header">{svg_icons['shield']} 규칙 기반 진단 결과 (Knowledge Base)</div>
+                <div class="card-body"><table class="data-table">
+                    <thead><tr><th>심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
+                    <tbody>{create_kb_finding_rows(kb_findings)}</tbody>
+                </table></div>
+            </div>
+
+
             <div class="report-card">
                 <div class="card-header">{svg_icons['dashboard']} 자원 사용 현황</div>
                 <div class="card-body graph-grid">
                     {render_graph('cpu', 'CPU Usage (%)', graphs)}
                     {render_graph('memory', 'Memory Usage (KB)', graphs)}
                     {render_graph('load', 'System Load Average', graphs)}
-                    {render_graph('disk', 'Disk I/O', graphs)}
+                    {render_graph('io_usage', 'I/O Usage (sar -b)', graphs)}
+                    {render_graph('disk_detail', 'Block Device I/O (sar -d)', graphs)}
                     {render_graph('swap', 'Swap Usage (%)', graphs)}
-                    {''.join(render_graph(iface, f"Network Traffic ({iface})", {iface: graph_data}) for iface, graph_data in graphs.get('network', {}).items())}
+                    {render_graph('file_handler', 'File and Inode Handlers', graphs)}
+                    {render_graph('network_representative', 'Network Traffic', graphs)}
                 </div>
             </div>
 
@@ -302,8 +375,12 @@ def get_html_template(data):
         <footer>AI System Analyzer &bull; Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</footer>
         <script>
             function openDiskDetailPopup() {{
-                const hostname = "{h(data.get('hostname', ''))}";
+                const hostname = "{h(data.get('hostname', ''))}"; // eslint-disable-line
                 window.open(`sar_gui_disk-${{hostname}}.html`, 'DiskIODetail', 'width=1200,height=800,scrollbars=yes,resizable=yes');
+            }}
+            function openNicDetailPopup() {{
+                const hostname = "{h(data.get('hostname', ''))}"; // eslint-disable-line
+                window.open(`sar_nic_detail-${{hostname}}.html`, 'NicDetail', 'width=1200,height=800,scrollbars=yes,resizable=yes');
             }}
         </script>
     </body>
