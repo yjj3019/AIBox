@@ -197,8 +197,15 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
     try:
         python_interpreter = "/usr/bin/python3.11"
         output_dir = app.config['OUTPUT_FOLDER']
-        
-        command = [python_interpreter, SOS_ANALYZER_SCRIPT, file_path, "--server-url", server_url, "--output", output_dir]
+        # [BUG FIX] sos_analyzer.py를 호출하는 방식을 수정합니다.
+        # Python 인터프리터를 명시하고, 모든 인자(--server-url, --output, tar_path)를
+        # 명령줄 인자로 전달하여 'unrecognized arguments' 오류를 해결합니다.
+        command = [
+            python_interpreter, SOS_ANALYZER_SCRIPT,
+            "--server-url", server_url,
+            "--output", output_dir,
+            file_path
+        ]
         
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
 
@@ -210,14 +217,14 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
             line = line.strip()
             if not line: continue
             with ANALYSIS_LOCK:
-                # [개선] 로그 파싱을 통한 상세 상태 업데이트
-                if "압축 해제 중" in line:
+                # [개선] sos_analyzer.py의 표준화된 로그 포맷("[STEP]")을 파싱하여 상태 업데이트
+                if "[STEP] EXTRACTING" in line:
                     ANALYSIS_STATUS[log_key]["status"] = "extracting"
-                elif "데이터 파싱 시작" in line:
+                elif "[STEP] PARSING" in line:
                     ANALYSIS_STATUS[log_key]["status"] = "parsing"
-                elif "AI 시스템 분석 요청" in line or "보안 위협 분석 시작" in line:
+                elif "[STEP] ANALYZING" in line:
                     ANALYSIS_STATUS[log_key]["status"] = "analyzing"
-                elif "HTML 보고서 저장 완료" in line:
+                elif "[STEP] GENERATING_REPORT" in line:
                     ANALYSIS_STATUS[log_key]["status"] = "generating_report"
                 
                 ANALYSIS_STATUS[log_key]["log"].append(line)
@@ -226,8 +233,14 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
         stderr_output = process.stderr.read().strip()
 
         with ANALYSIS_LOCK:
-            final_log = "\n".join(ANALYSIS_STATUS[log_key]["log"])
-            if "HTML 보고서 저장 완료" in final_log and process.returncode == 0:
+            # [핵심 개선] 분석 프로세스의 성공/실패를 더 명확하게 판단합니다.
+            # 1. 프로세스 종료 코드가 0 (성공)인지 확인합니다.
+            # 2. 로그에 'HTML 보고서 저장 완료' 메시지가 있는지 확인합니다.
+            # 두 조건이 모두 충족되어야 최종 성공으로 처리합니다.
+            final_log = "\n".join(ANALYSIS_STATUS[log_key].get("log", []))
+            is_success = process.returncode == 0 and "HTML 보고서 저장 완료" in final_log
+
+            if is_success:
                 ANALYSIS_STATUS[log_key]["status"] = "complete"
                 ANALYSIS_STATUS[log_key]["log"].append("분석 성공적으로 완료.")
                 match = re.search(r"HTML 보고서 저장 완료: (.+)", final_log)
@@ -236,7 +249,7 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
                     ANALYSIS_STATUS[log_key]["report_file"] = os.path.basename(report_full_path)
             else:
                 ANALYSIS_STATUS[log_key]["status"] = "failed"
-                ANALYSIS_STATUS[log_key]["log"].append("분석 실패.")
+                ANALYSIS_STATUS[log_key]["log"].append(f"분석 실패 (종료 코드: {process.returncode}).")
                 if stderr_output:
                     ANALYSIS_STATUS[log_key]["log"].append("--- ERROR LOG ---")
                     ANALYSIS_STATUS[log_key]["log"].extend(stderr_output.split('\n'))
@@ -246,6 +259,16 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
             ANALYSIS_STATUS[log_key]["status"] = "failed"
             ANALYSIS_STATUS[log_key]["log"].append(f"서버 내부 오류 발생: {e}")
             traceback.print_exc()
+    finally:
+        # [사용자 요청] 분석이 성공하든 실패하든, 완료 후에는 원본 sosreport 파일을 삭제하여 디스크 공간을 확보합니다.
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logging.info(f"분석 완료 후 업로드된 sosreport 파일 삭제: {file_path}")
+        except OSError as e:
+            # 파일 삭제 실패가 전체 프로세스에 영향을 주지 않도록 오류만 기록합니다.
+            logging.error(f"업로드된 sosreport 파일 삭제 실패 '{file_path}': {e}")
+
 
 def cleanup_old_analysis_statuses():
     """오래된 분석 상태 정보를 정리하여 메모리 사용량을 관리합니다."""
@@ -742,31 +765,35 @@ def api_reports():
         if not filename:
             return jsonify({"error": "File parameter is missing"}), 400
 
-        # [핵심 개선] 단일 파일이 아닌, 분석과 관련된 모든 파일(html, json)을 삭제합니다.
+        # [핵심 개선] 단일 파일이 아닌, 분석과 관련된 모든 파일(html, json 등)을 삭제합니다.
         if filename.startswith('report-') and filename.endswith('.html'):
             try:
                 # 'report-hostname.html'에서 'hostname'을 추출합니다.
                 hostname = filename[len('report-'):-len('.html')]
+                output_folder = app.config['OUTPUT_FOLDER']
                 
-                files_to_delete = [
-                    f"report-{hostname}.html",
-                    f"metadata-{hostname}.json",
-                    f"sar_data-{hostname}.json"
-                ]
+                # [개선] 호스트네임을 포함하는 모든 관련 파일을 찾습니다.
+                # 예: report-{hostname}.html, metadata-{hostname}.json, sar_gui_disk-{hostname}.html, popup_cpu_{hostname}.html 등
+                files_to_delete = [f for f in os.listdir(output_folder) if f.endswith(f"_{hostname}.html") or f.endswith(f"-{hostname}.html") or f.endswith(f"-{hostname}.json")]
                 
                 deleted_count = 0
                 for f_to_delete in files_to_delete:
-                    file_path = os.path.join(app.config['OUTPUT_FOLDER'], secure_filename(f_to_delete))
+                    # secure_filename은 슬래시 등을 제거하므로 여기서는 사용하지 않습니다.
+                    file_path = os.path.join(output_folder, f_to_delete)
                     if os.path.exists(file_path):
-                        os.remove(file_path)
-                        deleted_count += 1
+                        try:
+                            os.remove(file_path)
+                            deleted_count += 1
+                        except OSError as e:
+                            logging.error(f"파일 삭제 중 오류 발생 '{file_path}': {e}")
                 
+                logging.info(f"리포트 '{hostname}'와 관련된 파일 {deleted_count}개를 삭제했습니다.")
                 return jsonify({"success": True, "message": f"{deleted_count}개의 관련 파일이 삭제되었습니다."})
             except Exception as e:
                 logging.error(f"리포트 관련 파일 삭제 중 오류 발생: {e}", exc_info=True)
                 return jsonify({"error": "파일 삭제 중 서버 오류가 발생했습니다."}), 500
         
-        return jsonify({"error": "잘못된 파일 이름 형식입니다. 'report-...' 형태의 파일만 삭제할 수 있습니다."}), 400
+        return jsonify({"error": "잘못된 파일 이름 형식입니다. 'report-{hostname}.html' 형태의 파일만 삭제할 수 있습니다."}), 400
     else: # GET
         try:
             reports = sorted([
@@ -785,8 +812,18 @@ def api_delete_all_reports():
         return jsonify({"error": "Unauthorized"}), 401
         
     try:
-        count = sum(1 for f in os.listdir(app.config['OUTPUT_FOLDER']) if f.startswith('report-') and f.endswith('.html') and os.remove(os.path.join(app.config['OUTPUT_FOLDER'], f)) is None)
-        logging.info(f"Deleted {count} report(s).")
+        # [개선] 단순히 report-*.html 파일만 삭제하는 대신, output 디렉토리의 모든 파일을 삭제합니다.
+        output_folder = app.config['OUTPUT_FOLDER']
+        count = 0
+        for filename in os.listdir(output_folder):
+            file_path = os.path.join(output_folder, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                    count += 1
+            except Exception as e:
+                logging.error(f"전체 리포트 삭제 중 '{file_path}' 파일 삭제 실패: {e}")
+        logging.info(f"모든 리포트 및 관련 파일 {count}개를 삭제했습니다.")
         return jsonify({"success": True, "message": f"{count} reports deleted."})
     except Exception as e:
         logging.error(f"Error deleting all reports: {e}", exc_info=True)
@@ -898,17 +935,16 @@ def api_upload_and_analyze():
             if file_size > available_space:
                 return jsonify({"error": "Disk space is insufficient to save the file."}), 507
 
-            # [개선] request 컨텍스트에 의존하지 않도록 서버 URL을 설정 파일에서 가져옵니다.
-            # AIBOX_BASE_URL 환경 변수 또는 --base-url 인자를 통해 설정할 수 있습니다.
-            base_url = CONFIG.get('base_url', f"{request.scheme}://{request.host}")
-            server_url_for_analyzer = f"{base_url.rstrip('/')}/AIBox/api/sos/analyze_system"
+            # [BUG FIX] sos_analyzer 스크립트가 서버 자신을 호출할 때, 외부 URL 대신
+            # 항상 로컬 주소를 사용하도록 수정합니다. 이는 서버가 프록시 뒤에 있을 때
+            # 외부 IP로 잘못된 요청을 보내는 문제를 해결합니다.
+            # 서버가 실행 중인 포트 번호를 CONFIG에서 가져와 동적으로 URL을 생성합니다.
+            local_port = CONFIG.get('port', 5000)
+            server_url_for_analyzer = f"http://127.0.0.1:{local_port}/AIBox/api/sos/analyze_system"
 
             file.save(file_path)
             analysis_id = str(uuid.uuid4())
             
-            # 백그라운드에서 분석 시작
-            # [개선] request 컨텍스트에 의존하지 않도록 server_url을 명시적으로 전달합니다.
-            server_url_for_analyzer = f"{request.scheme}://{request.host}/AIBox/api/sos/analyze_system"
             thread = threading.Thread(target=run_analysis_in_background, args=(file_path, analysis_id, server_url_for_analyzer))
             thread.daemon = True
             thread.start()

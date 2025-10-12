@@ -1970,13 +1970,13 @@ def main(args: argparse.Namespace):
     extract_path = Path(tempfile.mkdtemp(prefix="sos-"))
     logging.info(Color.info(f"임시 디렉터리 생성: {extract_path}"))
     try:
-        logging.info(f"  - '{tar_path.name}' 압축 해제 중...")
+        logging.info(f"[STEP] EXTRACTING: '{tar_path.name}' 압축 해제 중...")
         with tarfile.open(args.tar_path, 'r:*') as tar: tar.extractall(path=extract_path)
         logging.info(Color.success("압축 해제 완료."))
 
         parser = SosreportParser(extract_path)
-        logging.info("Sosreport 파서 초기화 완료. 데이터 파싱을 시작합니다.")
-        metadata, sar_data = parser.parse_all() # 모든 데이터 파싱
+        logging.info("[STEP] PARSING: Sosreport 파서 초기화 완료. 데이터 파싱을 시작합니다.")
+        metadata, sar_data = parser.parse_all()
         
         output_dir = Path(args.output); output_dir.mkdir(exist_ok=True)
         hostname = metadata.get('system_info', {}).get('hostname', 'unknown')
@@ -1997,6 +1997,7 @@ def main(args: argparse.Namespace):
             base_server_url = base_server_url.split('/api/')[0] # type: ignore
 
         ai_analyzer = AIAnalyzer(base_server_url, parser.report_date)
+        logging.info("[STEP] ANALYZING: 병렬 AI 분석을 시작합니다.")
         log_step("2단계: 병렬 AI 분석 (시스템 & 보안)")
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix='AI_Analysis') as executor:
             future_ai = executor.submit(ai_analyzer.get_structured_analysis, metadata_path, sar_data_path, args.anonymize)
@@ -2024,6 +2025,7 @@ def main(args: argparse.Namespace):
         structured_analysis['kb_findings'] = kb_findings
         logging.info(Color.success("로컬 감사 및 진단 완료."))
             
+        logging.info("[STEP] GENERATING_REPORT: 최종 보고서 생성을 시작합니다.")
         log_step("5단계: 최종 보고서 생성")
         reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date, parser.device_map)
         
@@ -2095,13 +2097,20 @@ def main(args: argparse.Namespace):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Smart sosreport Analyzer")
+    # [BUG FIX] 서버에서 모든 인자를 명령줄로 전달하는 방식으로 통일합니다.
+    # 위치 인자로 파일 경로를 받고, --server-url과 --output을 옵션 인자로 받도록 수정합니다.
     parser.add_argument("tar_path", help="분석할 sosreport tar 아카이브 경로")
+    parser.add_argument("--server-url", help="AI 분석을 위한 ABox_Server.py의 API 엔드포인트 URL")
     parser.add_argument("--output", default="output", help="보고서 및 데이터 저장 디렉토리")
-    parser.add_argument("--server-url", required=True, help="AI 분석을 위한 ABox_Server.py의 API 엔드포인트 URL (예: http://12.34.56.78/AIBox/api/sos/analyze_system)")
     parser.add_argument("--anonymize", action='store_true', help="서버 전송 전 민감 정보 익명화")
     parser.add_argument("--debug", action='store_true', help="디버그 레벨 로그를 활성화합니다.")
     
     args = parser.parse_args()
+
+    # [BUG FIX] 필수 인자인 tar_path와 server_url이 모두 제공되었는지 확인합니다.
+    if not args.tar_path or not args.server_url:
+        logging.error(Color.error("치명적인 오류: 스크립트 실행 시 'tar_path'와 '--server-url' 인자가 모두 필요합니다."))
+        sys.exit(1)
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)

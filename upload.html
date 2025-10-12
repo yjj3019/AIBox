@@ -256,6 +256,13 @@
         const timerDisplay = document.getElementById('timer-display');
         const analysisStepper = document.getElementById('analysis-stepper');
 
+        // [개선] 상태 값들을 상수로 관리하여 코드 가독성 및 유지보수성 향상
+        const STATUS = {
+            QUEUED: 'queued', RUNNING: 'running', EXTRACTING: 'extracting', PARSING: 'parsing',
+            ANALYZING: 'analyzing', GENERATING_REPORT: 'generating_report',
+            COMPLETE: 'complete', FAILED: 'failed'
+        };
+
         let analysisTimer;
         let secondsElapsed = 0;
         let currentPollingId = null;
@@ -345,12 +352,12 @@
             });
         }
 
-
+        // [개선] 분석 상태에 따라 UI를 업데이트하는 로직 강화
         function uploadAndAnalyze() {
             const file = fileInput.files[0];
             if (!file) { alert('파일을 선택해주세요.'); return; }
 
-            uploadButton.disabled = true;
+            uploadButton.disabled = true; // [개선] 분석 시작 시 버튼 비활성화
             resetProgress();
             
             const formData = new FormData();
@@ -362,36 +369,49 @@
                 if (e.lengthComputable) {
                     const percent = (e.loaded / e.total) * 100;
                     progressBarInner.style.width = percent + '%';
-                    progressText.textContent = `업로드 중: ${Math.round(percent)}%`;
+                    progressText.textContent = `업로드 중: ${Math.round(percent)}%`; // [BUG FIX] updateStepUI -> updateStep
                     updateStep(1, 'active');
                 }
             };
             
             xhr.onload = () => {
-                if (xhr.status === 200) {
-                    updateStep(1, 'completed');
-                    progressText.textContent = '서버에서 분석 준비 중...';
-                    const response = JSON.parse(xhr.responseText);
-                    checkAnalysisStatus(response.analysis_id);
-                    startTimer();
-                } else {
-                    progressText.textContent = `업로드 실패: ${xhr.status} ${xhr.statusText}`;
+                // [BUG FIX] 서버 응답 처리 로직을 try-catch로 감싸 안정성을 높입니다.
+                // 업로드 완료 후 서버 응답 파싱에 실패하여 진행이 멈추는 현상을 방지합니다.
+                try {
+                    if (xhr.status === 200) {
+                        updateStep(1, 'completed'); // [BUG FIX] updateStepUI -> updateStep
+                        progressText.textContent = '서버에서 분석 준비 중...';
+                        const response = JSON.parse(xhr.responseText);
+                        if (!response.analysis_id) {
+                            throw new Error("서버 응답에서 분석 ID를 찾을 수 없습니다.");
+                        }
+                        checkAnalysisStatus(response.analysis_id);
+                        startTimer();
+                    } else {
+                        // 서버가 200이 아닌 상태 코드를 반환했을 때, 응답 본문을 오류 메시지로 표시합니다.
+                        const errorResponse = xhr.responseText ? JSON.parse(xhr.responseText) : { error: `HTTP 상태 코드: ${xhr.status}` };
+                        throw new Error(errorResponse.error || xhr.statusText);
+                    }
+                } catch (e) {
+                    progressText.textContent = `오류: ${e.message}`;
                     progressBarInner.style.background = 'var(--error-color)';
-                    uploadButton.disabled = false;
-                    updateStep(1, 'error');
+                    uploadButton.disabled = false; // 오류 발생 시 버튼을 다시 활성화합니다.
+                    updateStep(1, 'error'); // [BUG FIX] updateStepUI -> updateStep
                 }
             };
 
+            // [개선] 업로드 실패 시 명확한 오류 처리
             xhr.onerror = () => {
                 progressText.textContent = '업로드 중 네트워크 오류 발생';
                 progressBarInner.style.background = 'var(--error-color)';
                 uploadButton.disabled = false;
-                updateStep(1, 'error');
+                updateStep(1, 'error'); // [BUG FIX] updateStepUI -> updateStep
             };
             
             xhr.send(formData);
         }
 
+        // [개선] async/await를 사용하여 비동기 로직의 가독성 향상
         function checkAnalysisStatus(analysisId) {
             currentPollingId = setInterval(async () => {
                 try {
@@ -404,26 +424,34 @@
                     const result = await response.json();
                     
                     const lastLog = result.log && result.log.length > 0 ? result.log[result.log.length - 1].replace(/<[^>]*>?/gm, '') : '...';
+                    
+                    // [개선] 상태별 메시지를 명확하게 매핑
                     const statusTextMap = {
-                        'extracting': 'sosreport 압축 해제 중...', 'parsing': '시스템 데이터 파싱 중...',
-                        'analyzing': 'AI 종합 분석 중...', 'generating_report': '리포트 생성 중...'
+                        [STATUS.QUEUED]: '분석 대기열에 추가되었습니다...',
+                        [STATUS.RUNNING]: '분석 프로세스를 시작합니다...',
+                        [STATUS.EXTRACTING]: 'sosreport 압축 해제 중...', 
+                        [STATUS.PARSING]: '시스템 데이터 파싱 중...',
+                        [STATUS.ANALYZING]: 'AI 종합 분석 중...', 
+                        [STATUS.GENERATING_REPORT]: '리포트 생성 중...'
                     };
                     progressText.textContent = statusTextMap[result.status] || lastLog;
                     
+                    // [개선] 상태와 스텝 번호를 명확하게 매핑
                     const statusMap = {
-                        'queued': 1, 'running': 1, 'extracting': 2, 'parsing': 3,
-                        'analyzing': 4, 'generating_report': 5
+                        [STATUS.QUEUED]: 1, [STATUS.RUNNING]: 1, [STATUS.EXTRACTING]: 2, 
+                        [STATUS.PARSING]: 3, [STATUS.ANALYZING]: 4, [STATUS.GENERATING_REPORT]: 5
                     };
                     const currentStep = statusMap[result.status] || 0;
 
+                    // [개선] 단계가 진행 중일 때 'active' 상태로 아이콘 및 스타일 업데이트
                     if (currentStep > 0) {
-                        updateStep(currentStep, 'active');
+                        updateStep(currentStep, 'active'); // [BUG FIX] updateStepUI -> updateStep
                     }
 
                     if (result.status === 'complete') {
                         clearInterval(currentPollingId);
                         clearInterval(analysisTimer);
-                        updateStep(5, 'completed');
+                        updateStep(5, 'completed'); // [BUG FIX] updateStepUI -> updateStep
                         progressText.textContent = `분석 완료! (총 ${secondsElapsed}초 소요)`;
                         progressBarInner.style.background = 'var(--success-color)';
                         progressBarInner.style.width = '100%';
@@ -437,7 +465,7 @@
                     } else if (result.status === 'failed') {
                         clearInterval(currentPollingId);
                         clearInterval(analysisTimer);
-                        updateStep(currentStep > 0 ? currentStep : 1, 'error');
+                        updateStep(currentStep > 0 ? currentStep : 1, 'error'); // [BUG FIX] updateStepUI -> updateStep
                         progressText.textContent = `분석 실패. 최종 로그: ${lastLog}`;
                         progressBarInner.style.background = 'var(--error-color)';
                         uploadButton.disabled = false;
@@ -491,7 +519,7 @@
         }
         
         async function deleteAllReports() {
-            if (!confirm('모든 리포트를 정말 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.')) return;
+            if (!confirm('생성된 모든 리포트와 분석 데이터(.json)를 정말 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.')) return;
             const password = prompt("관리자 비밀번호를 입력하세요:");
             if (password === null) return; // 사용자가 '취소'를 누른 경우
             try {
