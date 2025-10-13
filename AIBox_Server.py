@@ -33,6 +33,7 @@ import shutil
 import hashlib
 from diskcache import Cache
 from typing import List, Dict, Any, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
@@ -182,7 +183,7 @@ class LLMChunker:
                 item_str = json.dumps({key: value}, ensure_ascii=False, default=str)
                 item_tokens = self.get_token_count(item_str)
                 if current_chunk and current_tokens + item_tokens > available_tokens:
-                    yield current_chunk; current_chunk, current_tokens = [], 0
+                    yield current_chunk; current_chunk, current_tokens = {}, 0
                 current_chunk[key] = value; current_tokens += item_tokens
             if current_chunk: yield current_chunk
         else:
@@ -325,25 +326,29 @@ def make_request_generic(method, url, **kwargs):
         return None
 
 def _parse_llm_json_response(llm_response_str: str):
-    if not llm_response_str or not llm_response_str.strip():
-        raise ValueError("LLM 응답이 비어 있습니다.")
-
-    # [핵심 버그 수정] re.DOTALL 플래그를 사용하여 정규식이 줄 바꿈 문자를 포함한 모든 문자를 처리하도록 합니다.
-    # 이를 통해 응답 시작 부분의 줄 바꿈 문자나 다른 텍스트를 무시하고 JSON 블록을 정확하게 찾을 수 있습니다.
-    match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```|\{.*\}|\[.*\]', llm_response_str, re.DOTALL)
-    if not match:
-        raise ValueError(f"응답에서 유효한 JSON 형식(객체 또는 배열)을 찾을 수 없습니다. 응답 내용: {llm_response_str[:500]}")
-
-    # 찾은 JSON 문자열을 가져옵니다.
-    json_str = match.group(0)
-
     try:
-        # 마크다운 코드 블록 마커를 제거하고 파싱을 시도합니다.
-        # [BUG FIX] 이중 이스케이프 문제를 피하기 위해 불필요한 .replace() 호출을 제거합니다.
-        cleaned_json_str = re.sub(r'^```(json)?\s*|\s*```$', '', json_str.strip(), flags=re.DOTALL)
-        return json.loads(cleaned_json_str)
+        # [BUG FIX] LLM 응답이 문자열이 아닌 경우를 처리합니다.
+        if not isinstance(llm_response_str, str) or not llm_response_str.strip():
+            raise ValueError("LLM 응답이 비어 있거나 문자열이 아닙니다.")
+
+        # [BUG FIX] re.DOTALL 플래그를 사용하여 여러 줄에 걸친 JSON 블록을 찾습니다.
+        match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```', llm_response_str, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+        else:
+            # 코드 블록이 없는 경우, 응답에서 첫 '{' 또는 '[' 부터 마지막 '}' 또는 ']' 까지를 JSON으로 간주합니다.
+            start = llm_response_str.find('{')
+            if start == -1: start = llm_response_str.find('[')
+            end = llm_response_str.rfind('}')
+            if end == -1: end = llm_response_str.rfind(']')
+            if start != -1 and end != -1:
+                json_str = llm_response_str[start:end+1]
+            else:
+                raise ValueError(f"응답에서 유효한 JSON 형식(객체 또는 배열)을 찾을 수 없습니다.")
+
+        return json.loads(json_str)
     except json.JSONDecodeError as e:
-        raise ValueError(f"LLM 응답 JSON 파싱 실패: {e}\n응답 내용: {json_str[:500]}")
+        raise ValueError(f"LLM 응답 JSON 파싱 실패: {e}\n응답 내용: {llm_response_str[:500]}")
 
 def get_cache_key(system_message, user_message):
     """요청 내용을 기반으로 고유한 캐시 키를 생성합니다."""
@@ -362,10 +367,118 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
     # 1. 캐시 확인
     cached_response = cache.get(cache_key)
     if cached_response is not None:
-        logging.info(f"[CACHE HIT] 캐시된 응답을 반환합니다. (Key: {cache_key[:10]}...)") 
+        logging.info(f"[CACHE HIT] 캐시된 응답(객체)을 반환합니다. (Key: {cache_key[:10]}...)")
         llm_logger.info(f"[CACHE HIT] Returning cached response for key: {cache_key}")
         return cached_response
 
+    # 2. Cache Miss: LLMChunker를 사용하여 데이터 분할 및 분석
+    logging.info(f"[CACHE MISS] LLM 서버에 분석을 요청합니다. (Key: {cache_key[:10]}...)") # noqa: E501
+    chunker = LLMChunker()
+    base_prompt_tokens = chunker.get_token_count(system_message)
+    
+    # 사용자 메시지를 JSON 데이터로 파싱 시도
+    try:
+        # [BUG FIX] re.DOTALL을 사용하여 여러 줄의 JSON을 포함한 프롬프트도 파싱 가능하도록 수정
+        match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```', user_message, re.DOTALL) # noqa: E501
+        if match:
+            json_str = match.group(1)
+            data_to_chunk = json.loads(json_str)
+            # 프롬프트에서 JSON 부분을 제외한 나머지 텍스트
+            user_prompt_template = user_message.replace(match.group(0), '{data_chunk}') # noqa: E501
+        else:
+            data_to_chunk = user_message
+            user_prompt_template = '{data_chunk}'
+    except (json.JSONDecodeError, TypeError):
+        data_to_chunk = user_message
+        user_prompt_template = '{data_chunk}'
+
+    chunks = list(chunker.split_data(data_to_chunk, base_prompt_tokens))
+    
+    if len(chunks) == 1:
+        # 청크가 하나뿐이면 바로 호출
+        final_content = _call_llm_single_blocking(system_message, user_message, max_tokens, cache_key)
+    else:
+        logging.info(f"요청 데이터가 너무 커서 {len(chunks)}개의 묶음(chunk)으로 분할하여 분석합니다.")
+        
+        # [BUG FIX] NameError: name 'summaries' is not defined 오류를 해결하기 위해 summaries 리스트를 초기화합니다.
+        summaries = [None] * len(chunks)
+        
+        # [BUG FIX & 개선] 잘못된 재귀 호출을 수정하고, 각 청크 요약도 JSON 객체로 받도록 합니다.
+        # 각 청크를 요약하기 위해 _call_llm_single_blocking 함수를 병렬로 호출합니다.
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_REQUESTS) as executor:
+            # 각 청크에 대한 요약 프롬프트 생성
+            chunk_prompts = [user_prompt_template.format(data_chunk=json.dumps(chunk, ensure_ascii=False, default=str)) for chunk in chunks]
+            # 요약용 시스템 메시지
+            summarization_system_message = "You are an assistant that summarizes data. Please extract only the most critical and abnormal points from the following data chunk."
+
+            future_to_chunk_index = {executor.submit(_call_llm_single_blocking, summarization_system_message, prompt): i for i, prompt in enumerate(chunk_prompts)}
+            
+            # 결과를 순서대로 수집
+            temp_summaries = [None] * len(chunks)
+            for future in as_completed(future_to_chunk_index):
+                index = future_to_chunk_index[future]
+                try:
+                    summary = future.result()
+                    temp_summaries[index] = f"Summary of chunk {index+1}:\n{summary}"
+                except Exception as e:
+                    logging.error(f"Chunk {index+1} 요약 중 오류 발생: {e}")
+                    temp_summaries[index] = f"Summary of chunk {index+1}: FAILED ({e})"
+            # [BUG FIX] 이미 실패 처리된 요약을 덮어쓰지 않도록, 성공한 요약만 업데이트합니다.
+            for i, summary in enumerate(temp_summaries):
+                if summary is not None:
+                    summaries[i] = summary
+        
+        # [핵심 개선] 재귀적 요약(Recursive Summarization) 로직 도입
+        # 최종 분석 프롬프트가 너무 클 경우, 요약본 자체를 다시 청킹하여 분석합니다.
+        final_user_message = f"The data was too large and was split into chunks. Here are the summaries of each chunk:\n\n{''.join(summaries)}\n\nBased on these summaries, please provide a final comprehensive analysis following the original user request format."
+        
+        final_prompt_tokens = chunker.get_token_count(system_message + final_user_message)
+        
+        if final_prompt_tokens > chunker.max_tokens:
+            logging.warning(f"최종 분석 프롬프트({final_prompt_tokens} 토큰)가 너무 큽니다. 요약본을 다시 분할하여 분석합니다.")
+            # call_llm_blocking 함수를 재귀적으로 호출하여 요약본들을 다시 요약하고 종합합니다.
+            # 이 때, 시스템 메시지는 동일하게 유지하고, 사용자 메시지로 요약본들의 묶음을 전달합니다.
+            # 이렇게 하면 아무리 큰 데이터라도 최종적으로 하나의 분석 결과로 종합될 수 있습니다.
+            return call_llm_blocking(system_message, final_user_message, max_tokens)
+        else:
+            final_content = _call_llm_single_blocking(system_message, final_user_message, max_tokens, cache_key + "_final")
+
+    # [구조적 오류 수정] _call_llm_single_blocking이 문자열을 반환하므로, 여기서 JSON 객체로 파싱합니다.
+    # 이 함수는 항상 파싱된 객체를 반환하도록 보장합니다.
+    try:
+        final_object = _parse_llm_json_response(final_content)
+    except ValueError as e:
+        logging.error(f"최종 LLM 응답 파싱 실패: {e}")
+        final_object = {"error": "Final LLM response parsing failed", "details": str(e), "raw_response": final_content}
+        
+    # 3. 성공적인 응답(객체)을 캐시에 저장
+    if isinstance(final_object, dict) and 'error' not in final_object:
+        cache.set(cache_key, final_object, expire=cache_ttl_seconds)
+        logging.info(f"[CACHE SET] 새로운 응답을 캐시에 저장합니다. (Key: {cache_key[:10]}...)")
+
+    return final_object
+
+def _correct_json_string(text: str) -> str:
+    """
+    [신규] LLM이 생성한 JSON 문자열 내의 이스케이프되지 않은 줄 바꿈 문자를 보정합니다.
+    문자열 리터럴 내부에 있는 줄 바꿈 문자(\n)만 \\n으로 치환합니다.
+    """
+    in_string = False
+    escaped_text = ""
+    for i, char in enumerate(text):
+        if char == '"':
+            # 문자열 리터럴의 시작 또는 끝을 토글합니다. (이스케이프된 따옴표는 무시)
+            if i == 0 or text[i-1] != '\\':
+                in_string = not in_string
+        elif char == '\n' and in_string:
+            escaped_text += '\\n' # 문자열 내의 줄 바꿈 문자를 이스케이프합니다.
+            continue
+        escaped_text += char
+    return escaped_text
+
+def _call_llm_single_blocking(system_message, user_message, max_tokens=16384, cache_key=None):
+    """단일 LLM 호출을 처리하는 내부 블로킹 함수."""
+    # [구조적 오류 수정] 이 함수는 이제 항상 문자열을 반환합니다. (성공 시 LLM 응답, 실패 시 오류 JSON 문자열)
     headers = {'Content-Type': 'application/json'}
     if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
     payload = {"model": CONFIG["model"], "messages": [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}], "max_tokens": max_tokens, "temperature": 0.1, "stream": False}
@@ -374,8 +487,6 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
     llm_logger.info("--- LLM Request (Blocking) ---")
     llm_logger.info(f"System Message: {system_message}")
     llm_logger.debug(f"User Message: {user_message}")
-
-    logging.info(f"[CACHE MISS] LLM 서버에 분석을 요청합니다. (POST {CONFIG['llm_url']})")
     
     # cache_misses.inc() # 메트릭 기능이 구현될 때까지 주석 처리
     # [제안 반영] LLM 호출 타임아웃을 600초(10분)로 늘려 긴 분석 작업(예: CVE 순위 선정)을 지원합니다.
@@ -386,15 +497,13 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
         result = response.json() 
         content = result.get('choices', [{}])[0].get('message', {}).get('content') or result.get('message', {}).get('content')
         if not content or not content.strip():
-            return json.dumps({"error": "LLM returned an empty response."})
+            return json.dumps({"error": "LLM이 빈 응답을 반환했습니다."})
         
         # [신규] LLM 응답 로깅
         llm_logger.debug(f"--- LLM Response (Blocking) ---\n{content}\n")
 
-        # 2. 성공적인 응답을 캐시에 저장
-        cache.set(cache_key, content, expire=cache_ttl_seconds)
-        logging.info(f"[CACHE MISS] 새로운 응답을 캐시에 저장합니다. (Key: {cache_key[:10]}...)")
-        llm_logger.info(f"[CACHE SET] Storing new response in cache for key: {cache_key}")
+        # [구조적 오류 수정] 보정된 '문자열'을 반환합니다. 파싱은 상위 호출자에서 수행합니다.
+        # [BUG FIX] LLM이 생성한 JSON 문자열 내의 이스케이프되지 않은 줄 바꿈 문자를 보정합니다.
         return content
     except requests.exceptions.HTTPError as e:
         error_details = f"LLM Server Error: {e}"
@@ -402,8 +511,8 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
         # [개선] LLM 서버가 500 오류를 반환할 때, 응답 본문을 로그에 포함하여 디버깅을 용이하게 합니다.
         if e.response is not None:
             error_details += f"\nLLM Response Body:\n{e.response.text}"
-        logging.error(error_details)
-        return json.dumps({"error": "LLM server returned an error.", "details": str(e)})
+        logging.error(error_details)        
+        return json.dumps({"error": "LLM server returned an error.", "details": str(e), "raw_response": e.response.text if e.response else ""})
     except Exception as e:
         logging.error(f"LLM server connection or processing failed: {e}")
         return json.dumps({"error": "LLM server connection failed.", "details": str(e)})
@@ -860,18 +969,10 @@ Return ONLY a single, valid JSON object matching this structure:
 ]
 }}
 """
-        response_str = call_llm_blocking("You are an assistant designed to output only a single valid JSON object.", prompt)
-    
-        try:
-            # [핵심 버그 수정] LLM 응답이 유효한 JSON인지 파싱을 시도합니다.
-            response_json = _parse_llm_json_response(response_str)
-            return jsonify(response_json)
-        except ValueError as e:
-            # [핵심 버그 수정] 파싱 실패 시, 클라이언트가 오류를 인지할 수 있도록
-            # 유효한 JSON 형식의 오류 메시지를 생성하여 반환합니다.
-            logging.error(f"LLM 응답을 JSON으로 파싱하는 데 실패했습니다: {e}")
-            error_response = {"summary": "AI 분석 실패: LLM 응답이 유효한 JSON 형식이 아닙니다.", "critical_issues": [f"LLM 응답 파싱 오류: {e}", f"원본 응답 (일부): {response_str[:500]}"], "warnings": [], "recommendations": []}
-            return jsonify(error_response)
+        # [근본 대책] call_llm_blocking은 이제 항상 파싱된 객체 또는 오류 객체를 반환합니다.
+        # 별도의 파싱 로직이 필요 없습니다.
+        response_obj = call_llm_blocking("You are an assistant designed to output only a single valid JSON object.", prompt)
+        return jsonify(response_obj)
 
     except Exception as e:
         logging.error(f"/api/sos/analyze_system error: {e}", exc_info=True)
@@ -912,6 +1013,45 @@ def api_cve_analyze():
     except Exception as e:
         logging.error(f"CVE analysis error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+@app.route('/AIBox/api/cve/generate-report', methods=['POST'])
+def api_generate_cve_report():
+    """
+    [신규] cve_report.html로부터 리포트 생성 요청을 받아 create_cve_report.py를 실행하고
+    그 결과를 HTML로 반환하는 엔드포인트.
+    """
+    cve_id = request.json.get('cve_id')
+    if not cve_id:
+        return jsonify({"error": "CVE ID is required."}), 400
+
+    logging.info(f"'{cve_id}'에 대한 리포트 생성 요청을 수신했습니다.")
+
+    try:
+        # create_cve_report.py 스크립트 경로
+        script_path = os.path.join(SCRIPT_DIR, 'create_cve_report.py')
+        python_interpreter = "/usr/bin/python3.11" # 또는 sys.executable
+
+        # 스크립트 실행에 필요한 인자 구성
+        # 서버 자신을 가리키는 URL을 동적으로 생성하여 전달
+        server_url_for_script = f"http://127.0.0.1:{CONFIG.get('port', 5000)}"
+        command = [
+            python_interpreter,
+            script_path,
+            cve_id,
+            "--server-url", server_url_for_script
+        ]
+
+        # 스크립트를 실행하고 표준 출력을 캡처합니다.
+        process = subprocess.run(command, capture_output=True, text=True, check=True, timeout=300, encoding='utf-8')
+        html_report = process.stdout
+        return Response(html_report, mimetype='text/html')
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"리포트 생성 스크립트 실행 실패 (CVE: {cve_id}):\n{e.stderr}")
+        return jsonify({"error": "리포트 생성 중 오류가 발생했습니다.", "details": e.stderr}), 500
+    except Exception as e:
+        logging.error(f"리포트 생성 중 예외 발생 (CVE: {cve_id}): {e}", exc_info=True)
+        return jsonify({"error": "서버 내부 오류가 발생했습니다.", "details": str(e)}), 500
 
 @app.route('/AIBox/api/upload', methods=['POST'])
 def api_upload_and_analyze():

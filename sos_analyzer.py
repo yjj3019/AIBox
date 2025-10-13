@@ -435,23 +435,28 @@ class SosreportParser:
             'ldavg-5': 'load_5', 'ldavg-15': 'load_15', 'blocked': 'blocked'
         },
         'disk': {
-            'tps': 'tps', 'rtps': 'rtps', 'wtps': 'wtps', 'bread/s': 'bread_s',
-            'bwrtn/s': 'bwrtn_s'
+            'tps': 'tps', 'rtps': 'rtps', 'wtps': 'wtps', 
+            'bread/s': 'bread_s', 'bwrtn/s': 'bwrtn_s', # RHEL 7
+            'rkB/s': 'bread_s', 'wkB/s': 'bwrtn_s'      # RHEL 8
         },
         'disk_detail': {
             'tps': 'tps', 'rd_sec/s': 'rd_sec_s', 'wr_sec/s': 'wr_sec_s',
             'avgrq-sz': 'avgrq_sz', 'avgqu-sz': 'avgqu_sz', 'await': 'await',
-            'svctm': 'svctm', '%util': 'pct_util',
-            # [개선] 로케일 및 버전에 따른 대체 헤더 추가
+            'svctm': 'svctm', '%util': 'pct_util', 'rkB/s': 'rkB_s', 'wkB/s': 'wkB_s',
+            'areq-sz': 'avgrq_sz', 'aqu-sz': 'avgqu_sz',
+            # [개선 & RHEL8 호환성] 로케일 및 버전에 따른 대체 헤더 추가
             'rd_sect/s': 'rd_sec_s', 'wr_sect/s': 'wr_sec_s',
-            'rd_kB/s': 'rd_sec_s', 'wr_kB/s': 'wr_sec_s'
+            'rkB/s': 'rd_sec_s', 'wkB/s': 'wr_sec_s',
+            'areq-sz': 'avgrq_sz', 'aqu-sz': 'avgqu_sz'
         },
         'swap': {
             'kbswpfree': 'kbswpfree', 'kbswpused': 'kbswpused', '%swpused': 'pct_swpused',
             'kbswpcad': 'kbswpcad', '%swpcad': 'pct_swpcad'
         },
         'network': {
-            'rxpck/s': 'rxpck_s', 'txpck/s': 'txpck_s', 'rxkB/s': 'rxkB_s', 'txkB/s': 'txkB_s'
+            'rxpck/s': 'rxpck_s', 'txpck/s': 'txpck_s', 'rxkB/s': 'rxkB_s', 'txkB/s': 'txkB_s',
+            # [RHEL8 호환성] RHEL 8에 추가된 네트워크 헤더
+            'rxcmp/s': 'rxcmp_s', 'txcmp/s': 'txcmp_s', 'rxmcst/s': 'rxmcst_s', '%ifutil': 'pct_ifutil'
         },
         'file_handler': {
             'dentunusd': 'dentunusd', 'file-nr': 'file_nr', 'inode-nr': 'inode_nr', 'pty-nr': 'pty_nr'
@@ -477,37 +482,68 @@ class SosreportParser:
         # [BUG FIX] 헤더가 여러 줄에 걸쳐 있을 수 있는 경우(예: sar -n DEV)를 처리합니다.
         # 'Linux'로 시작하는 라인을 건너뛰고 실제 헤더를 찾습니다.
         header_index = 0
-        while header_index < len(lines) and (lines[header_index].startswith('Linux') or not re.search(r'\d{2}:\d{2}:\d{2}', lines[header_index])):
+        # [BUG FIX] RHEL8의 '00:00:00 CPU ...'와 같은 헤더를 건너뛰지 않도록, 타임스탬프만 있는 라인을 찾는 조건을 수정합니다.
+        # 실제 헤더는 타임스탬프 외에 다른 문자(예: CPU, IFACE)를 포함합니다.
+        while header_index < len(lines) and (lines[header_index].startswith('Linux') or not re.search(r'[a-zA-Z]', lines[header_index])):
             header_index += 1
         
         if header_index >= len(lines): return []
-
-        header_line = lines[header_index]
-        header_parts = re.split(r'\s+', header_line.strip())
         
-        data_io = io.StringIO('\n'.join(lines[header_index+1:]))
+        # [BUG FIX] RHEL8의 sar 출력은 헤더 라인에 타임스탬프가 포함될 수 있습니다.
+        # 예: '00:00:00 CPU %user ...' 또는 '00:00:00 IFACE rxpck/s ...'
+        # 타임스탬프 부분을 제외하고 실제 헤더만 추출합니다.
+        header_line_full = lines[header_index].strip()
+        header_parts_full = re.split(r'\s+', header_line_full)
+        
+        # 첫 번째 요소가 타임스탬프 형식인지 확인
+        if re.match(r'^\d{2}:\d{2}:\d{2}$', header_parts_full[0]):
+            header_parts = header_parts_full[1:] # 타임스탬프 제외
+        else:
+            header_parts = header_parts_full
+        
+        # [BUG FIX] 데이터 시작 라인을 더 정확하게 찾습니다.
+        # 헤더 다음 라인부터 시작하되, 비어있거나 'Linux'로 시작하는 라인은 건너뜁니다.
+        data_start_index = header_index + 1
+        while data_start_index < len(lines) and (not lines[data_start_index].strip() or lines[data_start_index].startswith('Linux')):
+            data_start_index += 1
+
+        data_io = io.StringIO('\n'.join(lines[data_start_index:]))
+
         try:
-            df = pd.read_csv(data_io, sep=r'\s+', header=None, engine='python')
+            # [BUG FIX] 로케일에 따라 소수점이 쉼표(,)로 표시되는 경우를 처리하기 위해 decimal=',' 추가
+            df = pd.read_csv(data_io, sep=r'\s+', header=None, engine='python', decimal=',')
             if df.empty:
                 return []
 
-            # 컬럼 이름 설정
+            # --- [BUG FIX] RHEL8 호환성을 위한 컬럼 이름 설정 로직 개선 ---
             schema_keys = self.SAR_HEADER_SCHEMA.get(section, {})
-            raw_headers_for_check = header_parts[1:]
             
-            # [BUG FIX] 헤더 라인이 '00:00:01 DEV ...' 와 같이 타임스탬프로 시작하는 경우, raw_headers_for_check가 'DEV'부터 시작하도록 조정합니다.
-            if re.match(r'^\d{2}:\d{2}:\d{2}$', header_parts[0]) and len(header_parts) > 1:
-                raw_headers_for_check = header_parts[1:]
-
-            first_header_col_name = raw_headers_for_check[0] if raw_headers_for_check and raw_headers_for_check[0] in ['CPU', 'IFACE', 'DEV'] else None
+            # 1. 최종 컬럼 이름을 담을 리스트 초기화
+            cols = []
             
-            cols = ['timestamp']
-            if first_header_col_name:
-                cols.append(first_header_col_name)
-                raw_headers_for_check = raw_headers_for_check[1:]
+            # 2. 헤더의 첫 번째 열이 타임스탬프가 아닌 식별자(CPU, IFACE, DEV)인 경우를 처리
+            first_header = header_parts[0] if header_parts else ''
+            if first_header in ['CPU', 'IFACE', 'DEV']:
+                # 데이터의 첫 번째 열은 타임스탬프, 두 번째 열이 식별자(CPU/DEV/IFACE)가 됩니다.
+                # cols 리스트에 ['timestamp', 'CPU'] 와 같이 컬럼을 미리 추가합니다.
+                cols.extend(['timestamp', first_header])
+                # 실제 데이터 헤더는 식별자 다음부터 시작합니다.
+                raw_headers_for_check = header_parts[1:] 
+            else:
+                # CPU/DEV/IFACE가 없는 경우 (예: sar -r), 첫 열은 타임스탬프입니다.
+                cols = ['timestamp']
+                # 모든 헤더 파트를 데이터 컬럼으로 사용합니다.
+                raw_headers_for_check = header_parts
 
+            # 3. 나머지 헤더들을 스키마에 따라 표준화하여 컬럼 목록에 추가합니다.
             cols.extend([schema_keys.get(h, h.replace('%', 'pct_').replace('/', '_').replace('-', '_')) for h in raw_headers_for_check])
-            df.columns = cols[:len(df.columns)]
+            
+            # 4. [안정성 강화] 데이터프레임의 실제 컬럼 수와 생성된 컬럼 이름 목록의 길이를 비교하여 안전하게 컬럼 이름을 할당합니다.
+            #    이는 예상치 못한 출력 형식으로 인해 발생하는 오류를 방지합니다.
+            num_cols_to_assign = min(len(df.columns), len(cols))
+            df.columns = cols[:num_cols_to_assign]
+            # 데이터프레임의 컬럼 수를 할당된 컬럼 수에 맞게 자릅니다.
+            df = df.iloc[:, :num_cols_to_assign]
 
             # 타임스탬프 변환
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='%H:%M:%S').dt.time
@@ -942,7 +978,9 @@ class HTMLReportGenerator:
             logging.info(f"  - 대표 블록 장치 '{display_name}'(from {root_device_name})의 I/O 그래프를 생성합니다.")
             title = f"Block Device I/O - {display_name} (Rep.)"
             static_title = f"Block Device I/O - {display_name}"
-            return self._create_hybrid_plot(representative_disk_data, title, {'rd_sec_s': 'Read sectors/s', 'wr_sec_s': 'Write sectors/s'}, is_stack=False, y_axis_title='sectors/s', static_title=static_title, is_percentage=False)
+            # [수정] rd_sec_s/wr_sec_s 대신 rkB_s/wkB_s를 사용하고 await를 함께 표시
+            labels = {'rkB_s': 'Read kB/s', 'wkB_s': 'Write kB/s', 'await': 'await (ms)'}
+            return self._create_hybrid_plot(representative_disk_data, title, labels, is_stack=False, y_axis_title='Value', static_title=static_title, is_percentage=False)
         else:
             # [수정] 대표 장치를 찾지 못하면 모든 장치의 데이터를 합산하여 그래프를 생성합니다.
             logging.info("  - 대표 블록 장치를 찾지 못했습니다. 모든 장치의 I/O 데이터를 합산하여 그래프를 생성합니다.")
@@ -950,14 +988,17 @@ class HTMLReportGenerator:
             for d in disk_detail_data:
                 ts = d['timestamp']
                 if ts not in aggregated_data:
-                    aggregated_data[ts] = {'timestamp': ts, 'rd_sec_s': 0, 'wr_sec_s': 0}
+                    # [수정] await 항목 추가
+                    aggregated_data[ts] = {'timestamp': ts, 'rkB_s': 0, 'wkB_s': 0, 'await': 0}
                 # [BUG FIX] _safe_float를 사용하여 안전하게 숫자 변환
-                aggregated_data[ts]['rd_sec_s'] += self._safe_float(d.get('rd_sec_s', 0)) # type: ignore
-                aggregated_data[ts]['wr_sec_s'] += self._safe_float(d.get('wr_sec_s', 0)) # type: ignore
+                aggregated_data[ts]['rkB_s'] += self._safe_float(d.get('rkB_s', 0)) # type: ignore
+                aggregated_data[ts]['wkB_s'] += self._safe_float(d.get('wkB_s', 0)) # type: ignore
+                aggregated_data[ts]['await'] += self._safe_float(d.get('await', 0)) # type: ignore
             
             aggregated_list = list(aggregated_data.values())
             if len(aggregated_list) >= 2:
-                return self._create_hybrid_plot(aggregated_list, 'Total Block Device I/O (All Devices)', {'rd_sec_s': 'Total Read sectors/s', 'wr_sec_s': 'Total Write sectors/s'}, is_stack=False, y_axis_title='sectors/s', static_title='Total Block Device I/O', is_percentage=False)
+                labels = {'rkB_s': 'Total Read kB/s', 'wkB_s': 'Total Write kB/s', 'await': 'Avg await (ms)'}
+                return self._create_hybrid_plot(aggregated_list, 'Total Block Device I/O (All Devices)', labels, is_stack=False, y_axis_title='Value', static_title='Total Block Device I/O', is_percentage=False) # type: ignore
             return None
 
     def _generate_io_usage_graph(self):
@@ -1051,12 +1092,11 @@ class HTMLReportGenerator:
         # 각 장치에 대해 그래프 생성
         for dev_name, data in dev_data.items():
             if len(data) < 2: continue # 데이터가 너무 적으면 건너뛰기
-            # [사용자 요청] 그래프 제목을 모두 영문으로 변경
-            # 각 장치에 대해 3개의 그래프 생성
+            # [수정] 메인 리포트와의 일관성을 위해 그래프를 2개로 통합합니다.
             graphs_by_dev[dev_name] = {
                 'tps': self._create_hybrid_plot(data, f'Transactions per second ({dev_name})', {'tps': 'TPS'}, is_stack=False, is_percentage=False),
-                'io': self._create_hybrid_plot(data, f'I/O Throughput ({dev_name})', {'rd_sec_s': 'Read sectors/s', 'wr_sec_s': 'Write sectors/s'}, is_stack=False, y_axis_title='sectors/s', is_percentage=False),
-                'util': self._create_hybrid_plot(data, f'Queue and Utilization ({dev_name})', {'avgqu-sz': 'Queue Size', 'pct_util': '%Util'}, is_percentage=True)
+                # [수정] I/O 처리량과 대기 시간을 하나의 그래프에 표시합니다.
+                'io': self._create_hybrid_plot(data, f'I/O Throughput & Wait ({dev_name})', {'rkB_s': 'Read kB/s', 'wkB_s': 'Write kB/s', 'await': 'await (ms)'}, is_stack=False, y_axis_title='Value', is_percentage=False),
             }
 
         # HTML 페이지 생성
@@ -1460,7 +1500,7 @@ class AIAnalyzer:
         """[신규] 개별 데이터 청크(묶음) 분석을 위한 프롬프트를 생성합니다."""
         return f"""
 [시스템 역할]
-당신은 Red Hat Enterprise Linux(RHEL) 시스템의 특정 데이터 조각을 분석하고, 성능, 안정성, 보안 관점에서 가장 중요한 핵심만 요약하는 진단 전문가입니다.
+당신은 Red Hat Enterprise Linux(RHEL) 시스템의 특정 데이터 조각을 면밀히 분석하여 사소한 이상 징후나 잠재적 문제점까지도 찾아내는 진단 전문가입니다. 당신의 목표는 현재의 명백한 문제뿐만 아니라, 미래에 문제가 될 수 있는 모든 가능성을 식별하는 것입니다.
 
 [분석 대상 데이터]
 - 데이터 섹션: {chunk_name}
@@ -1589,10 +1629,20 @@ class AIAnalyzer:
                     chunk_name = future_to_chunk[future]
                     try:
                         result = future.result()
-                        # AI 응답에서 실제 요약 텍스트를 추출 (오류가 있을 수 있음)
-                        summary_text = result.get('summary', str(result))
-                        chunk_summaries[chunk_name] = summary_text
-                        logging.info(f"    -> '{chunk_name}' 섹션 요약 분석 완료.")
+                        # [디버깅 강화] AI 서버로부터 받은 응답의 타입과 내용을 로그로 기록합니다.
+                        logging.debug(f"    [DEBUG] '{chunk_name}' 응답 수신: Type={type(result)}, Content={str(result)[:200]}")
+
+                        # [안정성 강화] AI 응답이 딕셔너리 형태인지 확인합니다.
+                        if isinstance(result, dict):
+                            # AI 응답에서 실제 요약 텍스트를 추출합니다.
+                            summary_text = result.get('summary', str(result))
+                            chunk_summaries[chunk_name] = summary_text
+                            logging.info(f"    -> '{chunk_name}' 섹션 요약 분석 완료.")
+                        else:
+                            # 딕셔너리가 아닐 경우, 오류로 기록하고 응답 내용을 그대로 저장합니다.
+                            error_message = f"'{chunk_name}' 섹션의 AI 응답이 예상된 딕셔너리 형식이 아닙니다 (Type: {type(result)})."
+                            logging.error(error_message)
+                            chunk_summaries[chunk_name] = f"분석 오류: {error_message}\n응답 내용: {str(result)}"
                     except Exception as e:
                         logging.error(f"'{chunk_name}' 섹션 요약 중 오류 발생: {e}")
                         chunk_summaries[chunk_name] = f"오류: {e}"

@@ -39,16 +39,17 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, server_url: str) -> str:
     """제공된 CVE 데이터를 기반으로 지정된 AIBox 서버를 호출하여 분석을 수행합니다."""
     logging.info(f"'{cve_id}'에 대한 AI 분석을 시작합니다 (서버: {server_url})...")
     
-    # [개선] LLM이 Markdown 형식으로 구조화된 답변을 생성하도록 프롬프트를 강화했습니다.
+    # [사용자 요청 반영] 제공된 가이드라인을 기반으로, AI가 더 완벽하고 구조화된 리포트를 생성하도록 프롬프트를 전면 개편합니다.
     prompt = f"""[시스템 역할]
 당신은 Red Hat Enterprise Linux(RHEL)의 보안 취약점을 분석하는 최고 수준의 사이버 보안 전문가입니다. 주어진 CVE 데이터를 분석하여 상세 보고서를 한국어 Markdown 형식으로 작성하십시오.
 
 [분석 가이드라인]
-1.  **외부 정보 통합**: 웹 검색을 통해 KISA/KrCERT, CISA KEV, 알려진 PoC(Proof of Concept), EPSS(Exploit Prediction Scoring System) 점수 등의 추가 정보를 수집하여 분석에 포함시키십시오.
-2.  **상세 분석**: 수집된 모든 정보를 종합하여 아래 각 항목에 대해 깊이 있는 분석을 수행합니다.
-3.  **출력 형식 준수**: 반드시 아래의 Markdown 구조에 맞춰 응답을 생성해야 합니다.
+1.  **외부 정보 통합**: 웹 검색을 통해 KISA/KrCERT, CISA KEV, 알려진 PoC(Proof of Concept), EPSS(Exploit Prediction Scoring System) 점수 등 추가 정보를 수집하여 분석에 포함시키십시오.
+2.  **상세 분석**: 수집된 모든 정보를 종합하여 아래 각 항목에 대해 깊이 있는 분석을 수행합니다. CVSS v3 벡터(AV, AC, UI, PR, S, C, I, A)를 해석하여 구체적인 위협 시나리오를 설명해야 합니다.
+3.  **출력 형식 준수**: 반드시 아래의 Markdown 구조에 맞춰 응답을 생성해야 합니다. 각 섹션의 제목은 한글과 영문을 병기합니다.
 
 [입력 데이터: CVE 정보]
+[입력 데이터: CVE 정보 (JSON)]
 ```json
 {dumps(cve_data, indent=True)}
 ```
