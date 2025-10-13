@@ -7,6 +7,7 @@ import argparse
 import logging
 import html
 from jinja2 import Environment, FileSystemLoader
+from datetime import datetime
 
 # [개선] orjson 라이브러리가 있으면 사용하여 JSON 처리 속도를 높입니다.
 try:
@@ -35,21 +36,17 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', stream=sys.stderr)
 
 # --- AI(LLM) 분석 함수 ---
-def analyze_data_with_llm(cve_id: str, cve_data: dict, server_url: str) -> str:
+def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, server_url: str) -> str:
     """제공된 CVE 데이터를 기반으로 지정된 AIBox 서버를 호출하여 분석을 수행합니다."""
     logging.info(f"'{cve_id}'에 대한 AI 분석을 시작합니다 (서버: {server_url})...")
     
-    # [사용자 요청 반영] 제공된 가이드라인을 기반으로, AI가 더 완벽하고 구조화된 리포트를 생성하도록 프롬프트를 전면 개편합니다.
+    # [사용자 요청 반영] Red Hat 보안 전문가의 관점에서 체계적인 보고서를 생성하도록 프롬프트를 전면 개편합니다.
+    # AI가 웹 검색을 통해 최신 정보를 수집하고, 지정된 형식에 맞춰 상세 분석을 수행하도록 지시합니다.
     prompt = f"""[시스템 역할]
-당신은 Red Hat Enterprise Linux(RHEL)의 보안 취약점을 분석하는 최고 수준의 사이버 보안 전문가입니다. 주어진 CVE 데이터를 분석하여 상세 보고서를 한국어 Markdown 형식으로 작성하십시오.
-
-[분석 가이드라인]
-1.  **외부 정보 통합**: 웹 검색을 통해 KISA/KrCERT, CISA KEV, 알려진 PoC(Proof of Concept), EPSS(Exploit Prediction Scoring System) 점수 등 추가 정보를 수집하여 분석에 포함시키십시오.
-2.  **상세 분석**: 수집된 모든 정보를 종합하여 아래 각 항목에 대해 깊이 있는 분석을 수행합니다. CVSS v3 벡터(AV, AC, UI, PR, S, C, I, A)를 해석하여 구체적인 위협 시나리오를 설명해야 합니다.
-3.  **출력 형식 준수**: 반드시 아래의 Markdown 구조에 맞춰 응답을 생성해야 합니다. 각 섹션의 제목은 한글과 영문을 병기합니다.
+당신은 Red Hat의 최고 수준 보안 전문가입니다. 주어진 CVE 데이터와 **웹 검색을 통해 수집한 최신 정보를 바탕으로**, 아래의 상세한 가이드라인과 출력 형식에 맞춰 전문적인 보안 분석 보고서를 한국어로 작성하십시오.
+**모든 분석 내용은 핵심만 간결하게 요약해야 합니다.**
 
 [입력 데이터: CVE 정보]
-[입력 데이터: CVE 정보 (JSON)]
 ```json
 {dumps(cve_data, indent=True)}
 ```
@@ -64,14 +61,10 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, server_url: str) -> str:
 ### 잠재적 영향 (Impact Assessment)
 - 'cvss3' 데이터를 기반으로, 이 취약점이 악용될 경우 발생할 수 있는 비즈니스 및 보안 위험을 구체적으로 기술합니다. (예: 데이터 유출, 서비스 거부, 원격 코드 실행 등)
 
-### 완화 및 해결 방안 (Mitigation & Remediation)
-- 'package_state' 정보를 분석하여 공식 패치 적용 방법을 안내하고, 패치가 불가능할 경우 적용할 수 있는 임시 완화책(workaround)을 제안합니다.
-
-### 최신 위협 동향 (Recent Threat Intelligence)
-- 웹 검색 결과를 바탕으로 실제 공격(in-the-wild) 여부, 관련 공격 그룹 정보, PoC 공개 여부 등 최신 동향을 종합하여 위협 수준을 평가합니다.
 """
-
-    api_url = f'{server_url.rstrip("/")}/AIBox/api/cve/analyze'
+    # [요청 수정] AI 분석을 위한 엔드포인트를 명시적으로 지정합니다.
+    # 이제 이 스크립트는 --server-url 인자에 의존하지 않고 항상 고정된 로컬 주소로 요청합니다.
+    api_url = 'http://127.0.0.1:5000/AIBox/api/cve/analyze'
     payload = {"prompt": prompt}
 
     try:
@@ -79,33 +72,75 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, server_url: str) -> str:
         response = requests.post(api_url, json=payload, timeout=180)
         response.raise_for_status()
         
-        # AI 서버는 분석 결과를 순수 텍스트(Markdown)로 반환합니다.
-        return response.text.strip()
+        # [BUG FIX] AI 서버가 JSON 객체 또는 순수 텍스트를 반환하는 모든 경우에 대응합니다.
+        try:
+            # 1. JSON 응답을 먼저 시도합니다.
+            response_json = loads(response.content)
+            # 2. 'raw_response' 키 또는 다른 키에서 텍스트를 찾습니다.
+            #    이것은 AIBox_Server.py가 JSON 파싱에 실패하고 원본 응답을 반환하는 경우를 처리합니다.
+            if isinstance(response_json, dict):
+                return response_json.get('raw_response') or response_json.get('analysis_report') or dumps(response_json, indent=True)
+            return dumps(response_json, indent=True)
+        except (json.JSONDecodeError, orjson.JSONDecodeError):
+            # 3. JSON 파싱에 실패하면, 응답을 순수 텍스트로 간주하고 처리합니다.
+            #    이것이 문제의 근본 원인을 해결하는 부분입니다.
+            logging.warning("AI 서버 응답이 JSON 형식이 아닙니다. 순수 텍스트로 처리합니다.")
+            return response.text.strip()
 
     except requests.RequestException as e:
         logging.error(f"AIBox 서버 통신 오류: {e}")
         return "### AI 분석 실패\n- AIBox 서버와의 통신 중 오류가 발생했습니다. 서버 주소와 네트워크 상태를 확인해주세요."
 
 # --- 외부 데이터 소스 조회 함수 ---
-def fetch_cve_data_from_redhat(cve_id: str) -> dict:
-    """Red Hat Product Security API에서 CVE 데이터를 조회합니다."""
-    url = f"https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
+def fetch_cve_data(cve_id: str) -> dict:
+    """
+    [사용자 요청 반영] CVE 데이터를 조회합니다.
+    1. 로컬 서버(http://127.0.0.1:5000)에서 먼저 조회 (프록시 미사용)
+    2. 실패 시, 외부 Red Hat 서버에서 조회 (프록시 사용)
+    """
+    # 1. 로컬 서버에서 조회
+    local_url = f"http://127.0.0.1:5000/AIBox/cve/{cve_id}.json"
+    logging.info(f"로컬 서버에서 '{cve_id}' 데이터 조회를 시도합니다...")
+    try:
+        # 로컬 통신이므로 프록시를 명시적으로 비활성화합니다.
+        response = requests.get(local_url, timeout=10, proxies={'http': None, 'https': None})
+        if response.status_code == 200:
+            logging.info(f"'{cve_id}' 데이터를 로컬 서버에서 성공적으로 찾았습니다.")
+            return loads(response.content)
+        logging.warning(f"로컬 서버에 '{cve_id}' 정보가 없습니다 (HTTP {response.status_code}). 외부 API 조회를 시도합니다.")
+    except requests.RequestException as e:
+        logging.warning(f"로컬 서버 연결 실패: {e}. 외부 API 조회를 시도합니다.")
+
+    # 2. 외부 Red Hat 서버에서 조회 (로컬 조회 실패 시)
+    external_url = f"https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
     logging.info(f"Red Hat API에서 '{cve_id}' 데이터 조회를 시도합니다...")
     try:
-        # [개선] 프록시 설정이 필요한 환경을 위해 환경 변수(HTTP_PROXY, HTTPS_PROXY)를 자동으로 사용합니다.
-        # 실행 환경에서 `export HTTPS_PROXY=http://your-proxy-server:port` 와 같이 설정해야 합니다.
-        proxies = {
-            "http": os.environ.get("HTTP_PROXY"),
-            "https": os.environ.get("HTTPS_PROXY"),
-        }
-        response = requests.get(url, timeout=15, proxies=proxies)
-        if response.status_code == 200:
-            logging.info(f"'{cve_id}' 데이터를 Red Hat API에서 성공적으로 찾았습니다.")
-            return loads(response.content)
-        logging.warning(f"Red Hat API에 '{cve_id}' 정보가 없습니다 (HTTP {response.status_code}).")
+        # requests는 기본적으로 http_proxy, https_proxy 환경 변수를 사용합니다.
+        response = requests.get(external_url, timeout=60)
+        response.raise_for_status()
+        logging.info(f"'{cve_id}' 데이터를 Red Hat API에서 성공적으로 찾았습니다.")
+        return loads(response.content)
     except requests.RequestException as e:
         logging.error(f"Red Hat API 네트워크 오류: {e}")
-    return None
+        return None
+
+def fetch_external_threat_intel(cve_id: str) -> dict:
+    """[사용자 요청 반영] 로컬 cisa_kev.json 파일에서 외부 위협 인텔리전스 정보를 수집합니다."""
+    logging.info(f"'{cve_id}'에 대한 외부 위협 인텔리전스 조회를 시작합니다...")
+    intel = {"cisa_kev": {"in_kev": False, "date_added": None}}
+    kev_file_path = "/data/iso/AIBox/cisa_kev.json"
+    try:
+        with open(kev_file_path, 'rb') as f:
+            kev_data = loads(f.read())
+        for vuln in kev_data.get("vulnerabilities", []):
+            if vuln.get("cveID") == cve_id:
+                intel["cisa_kev"]["in_kev"] = True
+                intel["cisa_kev"]["date_added"] = vuln.get("dateAdded")
+                logging.info(f"-> 로컬 KEV 파일에서 '{cve_id}'를 찾았습니다 (추가된 날짜: {vuln.get('dateAdded')}).")
+                break
+    except (FileNotFoundError, json.JSONDecodeError, orjson.JSONDecodeError) as e:
+        logging.warning(f"로컬 CISA KEV 데이터({kev_file_path}) 조회 중 오류 발생: {e}")
+    return intel
 
 # --- HTML 렌더링 함수 ---
 def render_html_report(template_path: str, cve_id: str, context: dict) -> str:
@@ -141,18 +176,46 @@ def main():
 
     logging.info(f"'{cve_id}'에 대한 리포트 생성을 시작합니다.")
 
-    cve_data = fetch_cve_data_from_redhat(cve_id)
+    cve_data = fetch_cve_data(cve_id)
     
     if not cve_data:
         logging.error(f"Red Hat Product Security에서 '{cve_id}' 정보를 찾지 못했습니다. 스크립트를 종료합니다.")
-        # [수정] 에러 발생 시 표준 에러로 메시지를 출력하고 0이 아닌 코드로 종료합니다.
+        # [수정] 에러 발생 시 표준 에러로 메시지를 출력하고 0이 아닌 코드로 종료하여 호출 측에서 오류를 인지할 수 있도록 합니다.
         sys.stderr.write(f"Error: Could not find CVE data for {cve_id} from Red Hat.\n")
         sys.exit(1)
 
-    llm_summary = analyze_data_with_llm(cve_id, cve_data, server_url)
-    cve_data['comprehensive_summary'] = llm_summary
+    # [사용자 요청 복원] 로컬 파일에서 외부 위협 인텔리전스 수집 및 AI 분석을 다시 활성화합니다.
+    external_intel = fetch_external_threat_intel(cve_id)
+    llm_summary = analyze_data_with_llm(cve_id, cve_data, external_intel, server_url)
+
+    # [사용자 요청] 지정된 제품 목록 및 패턴에 대해서만 'affected_release' 정보를 그룹화하고 정렬합니다.
+    TARGET_PRODUCTS_EXACT = {
+        "Red Hat Enterprise Linux 7",
+        "Red Hat Enterprise Linux 7 Extended Lifecycle Support",
+        "Red Hat Enterprise Linux 8",
+        "Red Hat Enterprise Linux 9",
+        "Red Hat Enterprise Linux 10"
+    }
+    # 'Red Hat Enterprise Linux {major}.{minor} for SAP Solutions' 와 같은 패턴을 처리하기 위한 정규식
+    target_product_pattern = re.compile(r'^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$')
+
+    grouped_packages = {}
+    if cve_data.get('affected_release'):
+        # 패키지 이름으로 먼저 정렬하여 일관된 순서를 보장합니다.
+        sorted_releases = sorted(cve_data['affected_release'], key=lambda p: p.get('package', ''))
+        for release in sorted_releases:
+            product_name = release.get('product_name', 'Unknown Product')
+            # 정확히 일치하거나, 패턴에 맞는 경우에만 데이터를 포함합니다.
+            if product_name in TARGET_PRODUCTS_EXACT or target_product_pattern.match(product_name):
+                if product_name not in grouped_packages:
+                    grouped_packages[product_name] = []
+                grouped_packages[product_name].append(release)
     
-    # Jinja2 템플릿에 전달할 데이터(context)를 구성합니다.
+    grouped_packages = dict(sorted(grouped_packages.items()))
+    
+    # [사용자 요청] security.py를 참고하여 CVE에 연결된 모든 RHSA ID를 추출합니다.
+    all_rhsa_ids = sorted([rhsa for rhsa in cve_data.get('advisories', []) if isinstance(rhsa, str) and rhsa.startswith("RHSA-")])
+
     context = {
         'cve_id': cve_id,
         'report_title': cve_data.get('bugzilla', {}).get('description', cve_id).replace(f"{cve_id} ", ""),
@@ -162,14 +225,19 @@ def main():
         'bugzilla': cve_data.get('bugzilla'),
         'cwe': cve_data.get('CWE'),
         'package_state': cve_data.get('package_state'),
-        'comprehensive_summary': llm_summary
+        'grouped_packages': grouped_packages, # 그룹화된 데이터를 컨텍스트에 추가
+        'all_rhsa_ids': all_rhsa_ids, # 전체 RHSA 목록을 컨텍스트에 추가
+        'comprehensive_summary': llm_summary, # AI 분석 결과 추가
+        'external_intel': external_intel # 외부 위협 정보 추가
     }
+    context['current_year'] = datetime.now().year
 
     # 템플릿 파일 경로를 이 스크립트가 위치한 디렉토리 기준으로 설정합니다.
     template_path = os.path.join(os.path.dirname(__file__), 'cve_report_template.html')
     
     if not os.path.exists(template_path):
         error_msg = f"Error: Template file not found at {template_path}\n"
+        logging.error(error_msg.strip())
         sys.stderr.write(error_msg)
         sys.exit(1)
         

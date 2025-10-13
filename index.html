@@ -105,10 +105,12 @@
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 2rem;
+            grid-auto-rows: 1fr; /* [수정] 모든 카드의 높이를 동일하게 맞춥니다. */
         }
 
         .card {
-            display: block;
+            display: flex;
+            flex-direction: column;
             background: var(--surface-color);
             border: 1px solid var(--border-color);
             border-radius: 12px;
@@ -141,6 +143,7 @@
             font-size: 1rem;
             line-height: 1.6;
             color: var(--text-secondary);
+            flex-grow: 1;
             margin: 0;
         }
 
@@ -310,6 +313,19 @@
                     <p>sosreport 파일을 업로드하여 시스템의 구성, 성능, 문제점 등을 AI가 자동으로 분석하고 해결책을 제시합니다.</p>
                 </a>
 
+                <!-- CVE 상세 분석 리포트 카드 -->
+                <a href="cve_report.html" class="card">
+                    <div class="card-icon">
+                         <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>
+                            <polyline points="14 2 14 8 20 8"></polyline>
+                            <circle cx="11.5" cy="14.5" r="2.5"></circle>
+                            <line x1="13.25" y1="16.25" x2="15" y2="18"></line>
+                         </svg>
+                    </div>
+                    <h2>CVE 분석 리포트</h2>
+                    <p>특정 CVE ID에 대한 상세 정보를 조회하고 AI 기반의 심층 분석 리포트를 생성합니다.</p>
+                </a>
             </div>
         </main>
 

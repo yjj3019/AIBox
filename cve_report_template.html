@@ -1,86 +1,226 @@
-<!-- 
-    이 파일은 create_cve_report.py 스크립트가 리포트 내용을 채울 때 사용하는 Jinja2 템플릿입니다.
-    사용자에게 직접 보여지는 cve_report.html 파일과는 다른 용도입니다.
--->
-<div id="report-container">
-    <div class="mb-8 p-6 bg-white rounded-lg shadow-md border-l-4 border-blue-600">
-        <h2 class="text-2xl md:text-3xl font-bold text-slate-900">{{ cve_id }} - {{ report_title }}</h2>
-        <p class="text-slate-500 mt-2">공개일: {{ public_date_str }}</p>
-    </div>
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ cve_id }} - 지능형 보안 분석 리포트</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Noto Sans KR', sans-serif; }
+        .markdown-content h3 {
+            font-size: 1.25rem; /* text-xl */
+            font-weight: 700; /* font-bold */
+            margin-top: 1.5rem; /* mt-6 */
+            margin-bottom: 1rem; /* mb-4 */
+            padding-bottom: 0.5rem; /* pb-2 */
+            border-bottom: 1px solid #e5e7eb; /* border-b border-slate-200 */
+            display: flex;
+            align-items: center;
+            gap: 0.75rem; /* gap-3 */
+        }
+        .markdown-content ul {
+            list-style-type: disc;
+            padding-left: 1.5rem; /* pl-6 */
+            margin-bottom: 1rem; /* mb-4 */
+        }
+        .markdown-content li {
+            margin-bottom: 0.5rem; /* mb-2 */
+        }
+        .markdown-content code {
+            background-color: #f3f4f6; /* bg-slate-100 */
+            color: #1f2937; /* text-slate-800 */
+            padding: 0.2rem 0.4rem;
+            border-radius: 0.25rem; /* rounded */
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9em;
+        }
+        .markdown-content pre {
+            background-color: #1f2937; /* bg-slate-800 */
+            color: #d1d5db; /* text-slate-300 */
+            padding: 1rem; /* p-4 */
+            border-radius: 0.5rem; /* rounded-lg */
+            overflow-x: auto;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+        .markdown-content pre code {
+            background-color: transparent;
+            padding: 0;
+            color: inherit;
+        }
+        .markdown-content strong {
+            font-weight: 700; /* font-bold */
+        }
+        .markdown-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 1rem;
+        }
+        .markdown-content th, .markdown-content td {
+            border: 1px solid #e5e7eb;
+            padding: 0.75rem;
+            text-align: left;
+        }
+        .markdown-content th {
+            background-color: #f9fafb;
+        }
+        .severity-critical { background-color: #fee2e2; color: #b91c1c; border-color: #fecaca; }
+        .severity-important { background-color: #fffbeb; color: #b45309; border-color: #fde68a; }
+        .severity-moderate { background-color: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+        .severity-low { background-color: #f7fee7; color: #3f6212; border-color: #d9f99d; }
+    </style>
+</head>
+<body class="bg-slate-100">
+    <div class="container mx-auto p-4 md:p-8 max-w-7xl">
+        <!-- Header -->
+        <header class="mb-8">
+            <div class="flex items-center gap-4 mb-2">
+                <span class="text-red-600">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M10 1.944A11.954 11.954 0 012.166 5.02.125.125 0 012 4.877l-.001-.002A11.952 11.952 0 0110 1.944zM10 18c-3.866 0-7-3.134-7-7s3.134-7 7-7 7 3.134 7 7-3.134 7-7 7z" clip-rule="evenodd" />
+                    </svg>
+                </span>
+                <h1 class="text-3xl font-bold text-slate-800">Red Hat 보안 분석 리포트</h1>
+            </div>
+            <p class="text-slate-600">AI 기반의 심층 분석을 통해 생성된 {{ cve_id }} 취약점 리포트입니다.</p>
+        </header>
 
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        <div class="lg:col-span-2 space-y-8">
-            <div class="bg-white shadow-md rounded-lg p-6">
-                <h3 class="text-xl font-bold text-slate-800 mb-4">AI 종합 분석</h3>
-                <div class="prose max-w-none text-slate-700">
+        <!-- Main Content Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Left Column: Key Information -->
+            <div class="lg:col-span-1 space-y-6">
+                <!-- CVE Info Card -->
+                <div class="bg-white p-6 rounded-lg shadow-md border border-slate-200">
+                    <h2 class="text-2xl font-bold text-slate-900 mb-2">{{ cve_id }}</h2>
+                    <p class="text-slate-600 mb-4">{{ report_title }}</p>
+                    <div class="flex items-center justify-between text-sm text-slate-500">
+                        <span>공개일: {{ public_date_str }}</span>
+                        {% if bugzilla and bugzilla.id %}
+                        <a href="https://bugzilla.redhat.com/show_bug.cgi?id={{ bugzilla.id }}" target="_blank" class="text-blue-600 hover:underline">Bugzilla #{{ bugzilla.id }}</a>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <!-- Severity & Score Card -->
+                <div class="bg-white p-6 rounded-lg shadow-md border border-slate-200">
+                    <h3 class="text-lg font-semibold text-slate-800 mb-4">위협 수준</h3>
+                    <div class="flex items-center justify-around text-center">
+                        <div>
+                            <p class="text-sm text-slate-500 mb-1">심각도</p>
+                            {% set severity_class = 'severity-' + severity.lower() if severity in ['Critical', 'Important', 'Moderate', 'Low'] else 'bg-slate-200 text-slate-700' %}
+                            <span class="font-bold text-lg px-3 py-1 rounded-full border {{ severity_class }}">{{ severity }}</span>
+                        </div>
+                        <div>
+                            <p class="text-sm text-slate-500 mb-1">CVSSv3 점수</p>
+                            <p class="text-2xl font-bold text-slate-800">{{ cvss3_score }}</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- [사용자 요청 복원] 외부 위협 인텔리전스 카드 -->
+                <div class="bg-white p-6 rounded-lg shadow-md border border-slate-200">
+                    <h3 class="text-lg font-semibold text-slate-800 mb-4">외부 위협 인텔리전스</h3>
+                    <div class="space-y-3">
+                        <div class="flex items-center gap-3">
+                            <span class="w-8 h-8 rounded-full flex items-center justify-center {{ 'bg-red-100 text-red-700' if external_intel.cisa_kev.in_kev else 'bg-slate-100 text-slate-500' }}">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" /></svg>
+                            </span>
+                            <div>
+                                <p class="font-medium">CISA KEV 등재</p>
+                                {% if external_intel.cisa_kev.in_kev %}
+                                <p class="text-sm text-red-600">실제 공격에 악용됨 ({{ external_intel.cisa_kev.date_added }})</p>
+                                {% else %}
+                                <p class="text-sm text-slate-500">해당 없음</p>
+                                {% endif %}
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <span class="w-8 h-8 rounded-full flex items-center justify-center bg-slate-100 text-slate-500">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z" /></svg>
+                            </span>
+                            <div>
+                                <p class="font-medium">EPSS 점수</p>
+                                <p class="text-sm text-slate-500">정보 없음</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+            
+            <!-- Right Column: AI Analysis -->
+            <div class="lg:col-span-2 bg-white p-6 md:p-8 rounded-lg shadow-md border border-slate-200">
+                <div class="flex items-center gap-3 mb-6">
+                    <h2 class="text-2xl font-bold text-slate-800">취약점 요약</h2>
+                </div>
+                
+                <div class="markdown-content text-slate-700 leading-relaxed">
                     {{ comprehensive_summary_html|safe }}
                 </div>
             </div>
         </div>
 
-        <div class="lg:col-span-1 space-y-8">
-            <div class="bg-white shadow-md rounded-lg">
-                <div class="p-4 font-bold text-slate-700 text-lg bg-slate-50 border-b border-slate-200 rounded-t-lg">
-                    보안 등급
-                </div>
-                <div class="p-6">
-                    <div class="bg-blue-50 border-l-4 border-blue-500 text-blue-800 p-4 rounded-r-lg">
-                        <p class="font-bold text-lg">Impact: <span class="font-mono">{{ severity }}</span></p>
-                        <p class="mt-1">CVSS v3 Score: <span class="font-mono">{{ cvss3_score }}</span></p>
-                    </div>
-                </div>
+        <!-- Affected Packages Table -->
+        <div class="mt-8 bg-white p-6 md:p-8 rounded-lg shadow-md border border-slate-200">
+            <h2 class="text-xl font-bold text-slate-800 mb-4">영향받는 패키지 및 해결 상태</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-slate-200">
+                    <thead class="bg-slate-50">
+                        <tr>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-bold text-slate-600 uppercase tracking-wider">제품명</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-bold text-slate-600 uppercase tracking-wider">패키지명</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-bold text-slate-600 uppercase tracking-wider">해결 상태</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-bold text-slate-600 uppercase tracking-wider">관련 RHSA</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-slate-200">
+                        {% if grouped_packages %}
+                            {% for product_name, packages in grouped_packages.items() %}
+                                {% for pkg in packages %}
+                                <tr>
+                                    {% if loop.first %}
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-800 font-semibold" rowspan="{{ packages|length }}">{{ product_name }}</td>
+                                    {% endif %}
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-slate-600 font-mono">{{ pkg.package }}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                                        {% if pkg.advisory %}
+                                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">해결됨 (Patched)</span>
+                                        {% else %}
+                                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-slate-100 text-slate-800">정보 없음</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-blue-600">
+                                        {% if pkg.advisory %}
+                                            <a href="https://access.redhat.com/errata/{{ pkg.advisory }}" target="_blank" class="font-semibold hover:underline">{{ pkg.advisory }}</a>
+                                        {% elif all_rhsa_ids %}
+                                            <div class="flex flex-col gap-1">
+                                            {% for rhsa_id in all_rhsa_ids %}
+                                                <a href="https://access.redhat.com/errata/{{ rhsa_id }}" target="_blank" class="text-xs text-slate-500 hover:text-blue-600 hover:underline">{{ rhsa_id }}</a>
+                                            {% endfor %}
+                                            </div>
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            {% endfor %}
+                        {% else %}
+                            <tr>
+                                <td colspan="4" class="px-6 py-4 text-center text-slate-500">영향받는 패키지 정보가 없습니다.</td>
+                            </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
             </div>
-             <div class="bg-white shadow-md rounded-lg">
-                <div class="p-4 font-bold text-slate-700 text-lg bg-slate-50 border-b border-slate-200 rounded-t-lg">
-                    상세 정보
-                </div>
-                <div class="p-6 text-sm text-slate-600">
-                    {% if bugzilla %}
-                    <p><strong>Bugzilla:</strong> <a href="{{ bugzilla.url }}" target="_blank" class="text-blue-600 hover:underline">{{ bugzilla.id }}</a></p>
-                    {% endif %}
-                    {% if cwe %}
-                    <p class="mt-2"><strong>CWE:</strong> {{ cwe }}</p>
-                    {% endif %}
-                </div>
-            </div>
         </div>
+
+        <!-- Footer -->
+        <footer class="text-center text-sm text-slate-500 mt-12 py-4">
+            <p>AIBox Security Analysis &copy; {{ current_year }}. All Rights Reserved.</p>
+            <p>이 리포트는 AI에 의해 자동 생성되었으며, 정보의 정확성을 보장하지 않습니다. 최종 판단은 사용자의 책임입니다.</p>
+        </footer>
     </div>
-    
-    <div class="bg-white shadow-md rounded-lg mt-8">
-        <div class="p-4 font-bold text-slate-700 text-lg bg-slate-50 border-b border-slate-200 rounded-t-lg">
-            영향받는 패키지 상태 (Package State)
-        </div>
-        <div class="max-h-96 overflow-y-auto">
-            {% if package_state %}
-            <table class="table-auto w-full">
-                <thead class="bg-slate-100 text-slate-600 uppercase text-sm leading-normal sticky top-0">
-                    <tr>
-                        <th class="py-3 px-6 text-left">Product Name</th>
-                        <th class="py-3 px-6 text-left">Package Name</th>
-                        <th class="py-3 px-6 text-center">Fix State</th>
-                    </tr>
-                </thead>
-                <tbody class="text-gray-600 text-sm font-light">
-                    {% for pkg in package_state %}
-                    <tr class="border-b border-gray-200 hover:bg-gray-100">
-                        <td class="py-3 px-6 text-left whitespace-nowrap">{{ pkg.product_name }}</td>
-                        <td class="py-3 px-6 text-left">{{ pkg.package_name }}</td>
-                        <td class="py-3 px-6 text-center">
-                            <span class="px-2 py-1 rounded-full text-xs font-semibold
-                                {%- if 'Will not' in pkg.fix_state %} bg-red-100 text-red-700
-                                {%- elif 'Affected' in pkg.fix_state %} bg-yellow-100 text-yellow-800
-                                {%- else %} bg-green-100 text-green-700
-                                {%- endif %}">
-                                {{ pkg.fix_state }}
-                            </span>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            {% else %}
-            <p class="p-4 text-center">패키지 정보가 없습니다.</p>
-            {% endif %}
-        </div>
-    </div>
-</div>
+</body>
+</html>

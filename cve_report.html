@@ -100,14 +100,16 @@
             if (!response.ok) {
                 // 서버에서 에러가 발생한 경우, 응답 텍스트를 파싱하여 에러 메시지를 표시합니다.
                 let errorMessage = `서버 오류 발생 (HTTP ${response.status}): 리포트 생성에 실패했습니다.`;
+                let errorDetails = '';
                 try {
                     const errorJson = JSON.parse(resultText);
-                    errorMessage = errorJson.error || errorMessage;
+                    errorMessage = `오류: ${errorJson.error || '알 수 없는 오류'}`;
+                    errorDetails = errorJson.details ? `<pre class="mt-2 text-left bg-slate-100 p-2 rounded text-sm">${errorJson.details}</pre>` : '';
                 } catch (e) {
+                    errorDetails = `<br><pre class="mt-2 text-left bg-slate-100 p-2 rounded">${resultText.substring(0, 500)}</pre>`;
                     // 응답이 JSON이 아닐 수 있으므로, 원본 텍스트를 일부 보여줍니다.
-                    errorMessage += `<br><pre class="mt-2 text-left bg-slate-100 p-2 rounded">${resultText.substring(0, 500)}</pre>`;
                 }
-                 showError(errorMessage);
+                 showError(errorMessage + errorDetails);
             } else {
                 // 성공 시, 받은 HTML을 리포트 영역에 표시합니다.
                 reportOutput.innerHTML = resultText;
@@ -136,24 +138,14 @@
             return;
         }
 
-        // 전체 HTML 문서를 구성하여 다운로드합니다.
-        const fullHtml = `
-            <!DOCTYPE html>
-            <html lang="ko">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>${cveId} - 보안 분석 리포트</title>
-                <script src="https://cdn.tailwindcss.com"><\/script>
-                 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
-                <style>
-                    body { font-family: 'Noto Sans KR', sans-serif; }
-                </style>
-            </head>
-            <body class="bg-gray-100 p-8">
-                ${reportHtml}
-            </body>
-            </html>`;
+        // [사용자 요청 수정] 현재 페이지의 전체 HTML 구조를 그대로 복제하여 저장합니다.
+        // 이렇게 하면 원본과 동일한 디자인(배경, 레이아웃 등)이 유지됩니다.
+        const docClone = document.documentElement.cloneNode(true);
+        // 복제된 문서에서 불필요한 제어판 부분을 제거합니다.
+        docClone.querySelector('.bg-white.p-6.rounded-lg.shadow-md.mb-8').remove();
+        // [사용자 요청] 복제된 문서에서 페이지 헤더 부분도 제거합니다.
+        docClone.querySelector('header').remove();
+        const fullHtml = '<!DOCTYPE html>\n' + docClone.outerHTML;
 
         const blob = new Blob([fullHtml], { type: 'text/html' });
         const link = document.createElement('a');

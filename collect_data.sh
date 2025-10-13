@@ -128,6 +128,40 @@ fi
 log_info "Successfully fetched and saved ${COUNT} CVEs to ${OUTPUT_FILE}"
 log_info "--- Initial CVE list collection finished successfully ---"
 
+# --- [사용자 요청] CISA KEV(Known Exploited Vulnerabilities) 데이터 수집 ---
+log_info "\n--- Starting CISA KEV data collection ---"
+
+CISA_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+CISA_OUTPUT_FILE="${OUTPUT_DIR}/cisa_kev.json"
+
+log_info "Fetching CISA KEV data from: ${CISA_URL}"
+
+CISA_CURL_COMMAND="/usr/bin/curl -s -w \"\n%{http_code}\" -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' --connect-timeout 15 --max-time 60"
+if [ -n "${PROXY_SERVER}" ]; then
+    log_info "Using proxy server for CISA KEV fetch: ${PROXY_SERVER}"
+    CISA_CURL_COMMAND="${CISA_CURL_COMMAND} --proxy ${PROXY_SERVER}"
+fi
+CISA_CURL_COMMAND="${CISA_CURL_COMMAND} ${CISA_URL}"
+
+CISA_HTTP_RESPONSE=$(eval ${CISA_CURL_COMMAND})
+CISA_HTTP_BODY=$(echo "$CISA_HTTP_RESPONSE" | sed '$d')
+CISA_HTTP_CODE=$(echo "$CISA_HTTP_RESPONSE" | tail -n1)
+
+log_info "CISA KEV fetch finished with HTTP status code: ${CISA_HTTP_CODE}"
+
+if [ "${CISA_HTTP_CODE}" -eq 200 ] && [ -n "${CISA_HTTP_BODY}" ]; then
+    echo "${CISA_HTTP_BODY}" | /usr/bin/jq '.' > "${CISA_OUTPUT_FILE}"
+    if [ -s "${CISA_OUTPUT_FILE}" ]; then
+        KEV_COUNT=$(/usr/bin/jq '.vulnerabilities | length' "${CISA_OUTPUT_FILE}")
+        log_info "Successfully fetched and saved ${KEV_COUNT} KEV entries to ${CISA_OUTPUT_FILE}"
+    else
+        log_error "CISA KEV file was created but is empty after jq processing."
+    fi
+else
+    log_error "Failed to fetch CISA KEV data. HTTP Code: ${CISA_HTTP_CODE}. The file will not be updated."
+fi
+log_info "--- CISA KEV data collection finished ---"
+
 
 # --- [수정] CVE 상세 정보를 개별 파일로 저장하는 로직 ---
 log_info "\n--- Starting CVE detail collection based on ${OUTPUT_FILE} ---"

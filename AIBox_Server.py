@@ -1033,7 +1033,7 @@ def api_generate_cve_report():
 
         # 스크립트 실행에 필요한 인자 구성
         # 서버 자신을 가리키는 URL을 동적으로 생성하여 전달
-        server_url_for_script = f"http://127.0.0.1:{CONFIG.get('port', 5000)}"
+        server_url_for_script = f"http://127.0.0.1:{CONFIG.get('port', 5000)}/AIBox/api/cve/analyze"
         command = [
             python_interpreter,
             script_path,
@@ -1042,7 +1042,18 @@ def api_generate_cve_report():
         ]
 
         # 스크립트를 실행하고 표준 출력을 캡처합니다.
-        process = subprocess.run(command, capture_output=True, text=True, check=True, timeout=300, encoding='utf-8')
+        # [수정] check=False로 설정하여 스크립트가 0이 아닌 코드로 종료되어도 CalledProcessError를 발생시키지 않도록 합니다.
+        # 대신, 반환 코드를 직접 확인하여 오류를 처리합니다.
+        # [핵심 수정] 서버의 프록시 설정을 포함한 전체 환경 변수를 하위 프로세스에 전달합니다.
+        # 이렇게 하면 create_cve_report.py가 외부 CISA API 등에 정상적으로 접속할 수 있습니다.
+        process_env = os.environ.copy()
+        
+        process = subprocess.run(
+            command, capture_output=True, text=True, timeout=300, encoding='utf-8', env=process_env
+        )
+        if process.returncode != 0:
+            logging.error(f"리포트 생성 스크립트 실행 실패 (CVE: {cve_id}):\n{process.stderr}")
+            return jsonify({"error": "리포트 생성 중 오류가 발생했습니다.", "details": process.stderr}), 500
         html_report = process.stdout
         return Response(html_report, mimetype='text/html')
 
@@ -1050,7 +1061,7 @@ def api_generate_cve_report():
         logging.error(f"리포트 생성 스크립트 실행 실패 (CVE: {cve_id}):\n{e.stderr}")
         return jsonify({"error": "리포트 생성 중 오류가 발생했습니다.", "details": e.stderr}), 500
     except Exception as e:
-        logging.error(f"리포트 생성 중 예외 발생 (CVE: {cve_id}): {e}", exc_info=True)
+        logging.error(f"리포트 생성 API 처리 중 예외 발생 (CVE: {cve_id}): {e}", exc_info=True)
         return jsonify({"error": "서버 내부 오류가 발생했습니다.", "details": str(e)}), 500
 
 @app.route('/AIBox/api/upload', methods=['POST'])
