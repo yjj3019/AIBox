@@ -199,18 +199,44 @@ def main():
     # 'Red Hat Enterprise Linux {major}.{minor} for SAP Solutions' 와 같은 패턴을 처리하기 위한 정규식
     target_product_pattern = re.compile(r'^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$')
 
+    # [사용자 요청] 'affected_release' (패치된 제품)와 'package_state' (영향받는 모든 제품) 정보를 통합합니다.
     grouped_packages = {}
+
+    # 1. 'package_state'에서 'Affected' 상태인 제품 정보를 먼저 수집합니다.
+    if cve_data.get('package_state'):
+        for state in cve_data['package_state']:
+            product_name = state.get('product_name', 'Unknown Product')
+            # 지정된 제품이거나, 패턴에 맞는 경우에만 데이터를 포함합니다.
+            if state.get('fix_state') == 'Affected' and (product_name in TARGET_PRODUCTS_EXACT or target_product_pattern.match(product_name)):
+                if product_name not in grouped_packages:
+                    grouped_packages[product_name] = []
+                
+                # 'package_state'에는 패키지 버전 정보가 없으므로, 기본 정보만 추가합니다.
+                # 'advisory' 키가 없는 것으로 패치되지 않았음을 구분합니다.
+                grouped_packages[product_name].append({
+                    'package': state.get('package_name', 'N/A'),
+                    'advisory': None # 아직 패치되지 않음
+                })
+
+    # 2. 'affected_release'에서 패치 정보를 가져와 기존 정보에 병합/추가합니다.
     if cve_data.get('affected_release'):
-        # 패키지 이름으로 먼저 정렬하여 일관된 순서를 보장합니다.
-        sorted_releases = sorted(cve_data['affected_release'], key=lambda p: p.get('package', ''))
-        for release in sorted_releases:
+        for release in cve_data['affected_release']:
             product_name = release.get('product_name', 'Unknown Product')
-            # 정확히 일치하거나, 패턴에 맞는 경우에만 데이터를 포함합니다.
-            if product_name in TARGET_PRODUCTS_EXACT or target_product_pattern.match(product_name):
+            if product_name in grouped_packages:
+                # 이미 'Affected'로 등록된 제품의 경우, 패치 정보를 업데이트합니다.
+                # 'package_state'의 패키지 이름(예: 'kernel')과 'affected_release'의 패키지 이름(예: 'kernel-0:...')을 비교합니다.
+                for pkg_info in grouped_packages[product_name]:
+                    if pkg_info['package'] in release.get('package', ''):
+                        pkg_info.update(release) # 패키지 버전, RHSA 등 상세 정보 업데이트
+            elif product_name in TARGET_PRODUCTS_EXACT or target_product_pattern.match(product_name):
+                # 'package_state'에 없었지만 'affected_release'에 있는 경우 (예: EUS)
                 if product_name not in grouped_packages:
                     grouped_packages[product_name] = []
                 grouped_packages[product_name].append(release)
     
+    # 최종적으로 제품 이름과 패키지 이름으로 정렬합니다.
+    for product in grouped_packages:
+        grouped_packages[product].sort(key=lambda p: p.get('package', ''))
     grouped_packages = dict(sorted(grouped_packages.items()))
     
     # [사용자 요청] security.py를 참고하여 CVE에 연결된 모든 RHSA ID를 추출합니다.
