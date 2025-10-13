@@ -1,0 +1,86 @@
+<!-- 
+    이 파일은 create_cve_report.py 스크립트가 리포트 내용을 채울 때 사용하는 Jinja2 템플릿입니다.
+    사용자에게 직접 보여지는 cve_report.html 파일과는 다른 용도입니다.
+-->
+<div id="report-container">
+    <div class="mb-8 p-6 bg-white rounded-lg shadow-md border-l-4 border-blue-600">
+        <h2 class="text-2xl md:text-3xl font-bold text-slate-900">{{ cve_id }} - {{ report_title }}</h2>
+        <p class="text-slate-500 mt-2">공개일: {{ public_date_str }}</p>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div class="lg:col-span-2 space-y-8">
+            <div class="bg-white shadow-md rounded-lg p-6">
+                <h3 class="text-xl font-bold text-slate-800 mb-4">AI 종합 분석</h3>
+                <div class="prose max-w-none text-slate-700">
+                    {{ comprehensive_summary_html|safe }}
+                </div>
+            </div>
+        </div>
+
+        <div class="lg:col-span-1 space-y-8">
+            <div class="bg-white shadow-md rounded-lg">
+                <div class="p-4 font-bold text-slate-700 text-lg bg-slate-50 border-b border-slate-200 rounded-t-lg">
+                    보안 등급
+                </div>
+                <div class="p-6">
+                    <div class="bg-blue-50 border-l-4 border-blue-500 text-blue-800 p-4 rounded-r-lg">
+                        <p class="font-bold text-lg">Impact: <span class="font-mono">{{ severity }}</span></p>
+                        <p class="mt-1">CVSS v3 Score: <span class="font-mono">{{ cvss3_score }}</span></p>
+                    </div>
+                </div>
+            </div>
+             <div class="bg-white shadow-md rounded-lg">
+                <div class="p-4 font-bold text-slate-700 text-lg bg-slate-50 border-b border-slate-200 rounded-t-lg">
+                    상세 정보
+                </div>
+                <div class="p-6 text-sm text-slate-600">
+                    {% if bugzilla %}
+                    <p><strong>Bugzilla:</strong> <a href="{{ bugzilla.url }}" target="_blank" class="text-blue-600 hover:underline">{{ bugzilla.id }}</a></p>
+                    {% endif %}
+                    {% if cwe %}
+                    <p class="mt-2"><strong>CWE:</strong> {{ cwe }}</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="bg-white shadow-md rounded-lg mt-8">
+        <div class="p-4 font-bold text-slate-700 text-lg bg-slate-50 border-b border-slate-200 rounded-t-lg">
+            영향받는 패키지 상태 (Package State)
+        </div>
+        <div class="max-h-96 overflow-y-auto">
+            {% if package_state %}
+            <table class="table-auto w-full">
+                <thead class="bg-slate-100 text-slate-600 uppercase text-sm leading-normal sticky top-0">
+                    <tr>
+                        <th class="py-3 px-6 text-left">Product Name</th>
+                        <th class="py-3 px-6 text-left">Package Name</th>
+                        <th class="py-3 px-6 text-center">Fix State</th>
+                    </tr>
+                </thead>
+                <tbody class="text-gray-600 text-sm font-light">
+                    {% for pkg in package_state %}
+                    <tr class="border-b border-gray-200 hover:bg-gray-100">
+                        <td class="py-3 px-6 text-left whitespace-nowrap">{{ pkg.product_name }}</td>
+                        <td class="py-3 px-6 text-left">{{ pkg.package_name }}</td>
+                        <td class="py-3 px-6 text-center">
+                            <span class="px-2 py-1 rounded-full text-xs font-semibold
+                                {%- if 'Will not' in pkg.fix_state %} bg-red-100 text-red-700
+                                {%- elif 'Affected' in pkg.fix_state %} bg-yellow-100 text-yellow-800
+                                {%- else %} bg-green-100 text-green-700
+                                {%- endif %}">
+                                {{ pkg.fix_state }}
+                            </span>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="p-4 text-center">패키지 정보가 없습니다.</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
