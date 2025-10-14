@@ -74,15 +74,18 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
         
         # [BUG FIX] AI 서버가 JSON 객체 또는 순수 텍스트를 반환하는 모든 경우에 대응합니다.
         try:
-            # 1. JSON 응답을 먼저 시도합니다.
+            # 1. 응답이 비어있는지 먼저 확인합니다.
+            if not response.content:
+                logging.warning("AI 서버가 빈 응답을 반환했습니다.")
+                return "### AI 분석 실패\n- AI 서버가 빈 응답을 반환했습니다."
+            
+            # 2. JSON 응답을 먼저 시도합니다.
             response_json = loads(response.content)
-            # 2. 'raw_response' 키 또는 다른 키에서 텍스트를 찾습니다.
-            #    이것은 AIBox_Server.py가 JSON 파싱에 실패하고 원본 응답을 반환하는 경우를 처리합니다.
             if isinstance(response_json, dict):
                 return response_json.get('raw_response') or response_json.get('analysis_report') or dumps(response_json, indent=True)
             return dumps(response_json, indent=True)
         except (json.JSONDecodeError, orjson.JSONDecodeError):
-            # 3. JSON 파싱에 실패하면, 응답을 순수 텍스트로 간주하고 처리합니다.
+            # 3. JSON 파싱에 실패하면, 응답을 순수 텍스트로 간주하고 처리합니다. (AttributeError 방지)
             #    이것이 문제의 근본 원인을 해결하는 부분입니다.
             logging.warning("AI 서버 응답이 JSON 형식이 아닙니다. 순수 텍스트로 처리합니다.")
             return response.text.strip()

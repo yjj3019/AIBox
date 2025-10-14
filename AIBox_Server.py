@@ -29,6 +29,7 @@ import atexit
 import re
 from datetime import datetime, timedelta
 import copy
+import psutil
 import shutil
 import hashlib
 from diskcache import Cache
@@ -49,6 +50,14 @@ try:
     import tiktoken
     IS_TIKTOKEN_AVAILABLE = True
 except ImportError:
+    IS_TIKTOKEN_AVAILABLE = False
+
+# [사용자 요청] 서버 측 Excel 생성을 위해 openpyxl 라이브러리 추가
+try:
+    from openpyxl.writer.excel import save_virtual_workbook
+    IS_OPENPYXL_AVAILABLE = True
+except ImportError:
+    IS_OPENPYXL_AVAILABLE = False
     IS_TIKTOKEN_AVAILABLE = False
 
 # --- 로깅 및 Flask 앱 설정 ---
@@ -286,6 +295,23 @@ def cleanup_old_analysis_statuses():
                 del ANALYSIS_STATUS[key]
             logging.info(f"오래된 분석 상태 {len(keys_to_delete)}개를 정리했습니다.")
 
+def log_server_status():
+    """[신규] 서버의 현재 부하 상태를 주기적으로 로깅합니다."""
+    with ANALYSIS_LOCK:
+        running_analyses = sum(1 for status in ANALYSIS_STATUS.values() if status['status'] == 'running')
+    
+    # psutil을 사용하여 현재 프로세스의 메모리 사용량 확인
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    mem_usage_mb = mem_info.rss / (1024 * 1024)
+
+    logging.info(
+        f"[SERVER STATUS] Active Threads: {threading.active_count()}, "
+        f"Running Analyses: {running_analyses}, "
+        f"LLM Concurrency: {MAX_CONCURRENT_LLM_REQUESTS - llm_semaphore._value}/{MAX_CONCURRENT_LLM_REQUESTS}, "
+        f"Memory Usage: {mem_usage_mb:.2f} MB"
+    )
+
 def resolve_chat_endpoint(llm_url, token):
     if llm_url.endswith(('/v1/chat/completions', '/api/chat')): return llm_url
     headers = {'Content-Type': 'application/json'}
@@ -325,31 +351,6 @@ def make_request_generic(method, url, **kwargs):
         logging.error(f"Generic request failed for {url}: {e}")
         return None
 
-def _parse_llm_json_response(llm_response_str: str):
-    try:
-        # [BUG FIX] LLM 응답이 문자열이 아닌 경우를 처리합니다.
-        if not isinstance(llm_response_str, str) or not llm_response_str.strip():
-            raise ValueError("LLM 응답이 비어 있거나 문자열이 아닙니다.")
-
-        # [BUG FIX] re.DOTALL 플래그를 사용하여 여러 줄에 걸친 JSON 블록을 찾습니다.
-        match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```', llm_response_str, re.DOTALL)
-        if match:
-            json_str = match.group(1)
-        else:
-            # 코드 블록이 없는 경우, 응답에서 첫 '{' 또는 '[' 부터 마지막 '}' 또는 ']' 까지를 JSON으로 간주합니다.
-            start = llm_response_str.find('{')
-            if start == -1: start = llm_response_str.find('[')
-            end = llm_response_str.rfind('}')
-            if end == -1: end = llm_response_str.rfind(']')
-            if start != -1 and end != -1:
-                json_str = llm_response_str[start:end+1]
-            else:
-                raise ValueError(f"응답에서 유효한 JSON 형식(객체 또는 배열)을 찾을 수 없습니다.")
-
-        return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"LLM 응답 JSON 파싱 실패: {e}\n응답 내용: {llm_response_str[:500]}")
-
 def get_cache_key(system_message, user_message):
     """요청 내용을 기반으로 고유한 캐시 키를 생성합니다."""
     return hashlib.sha256((system_message + user_message).encode('utf-8')).hexdigest()
@@ -371,110 +372,30 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
         llm_logger.info(f"[CACHE HIT] Returning cached response for key: {cache_key}")
         return cached_response
 
-    # 2. Cache Miss: LLMChunker를 사용하여 데이터 분할 및 분석
-    logging.info(f"[CACHE MISS] LLM 서버에 분석을 요청합니다. (Key: {cache_key[:10]}...)") # noqa: E501
-    chunker = LLMChunker()
-    base_prompt_tokens = chunker.get_token_count(system_message)
-    
-    # 사용자 메시지를 JSON 데이터로 파싱 시도
+    # 2. Cache Miss: LLM 호출
+    logging.info(f"[CACHE MISS] LLM 서버에 분석을 요청합니다. (Key: {cache_key[:10]}...)")
+    raw_response_str = _call_llm_single_blocking(system_message, user_message, max_tokens, cache_key)
+
+    # 3. LLM 응답 파싱 및 객체 변환
+    # [BUG FIX] LLM 응답 파싱 실패 시, 클라이언트가 AttributeError를 일으키지 않도록
+    #           항상 일관된 JSON 객체 형식으로 오류를 반환합니다.
     try:
-        # [BUG FIX] re.DOTALL을 사용하여 여러 줄의 JSON을 포함한 프롬프트도 파싱 가능하도록 수정
-        match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```', user_message, re.DOTALL) # noqa: E501
-        if match:
-            json_str = match.group(1)
-            data_to_chunk = json.loads(json_str)
-            # 프롬프트에서 JSON 부분을 제외한 나머지 텍스트
-            user_prompt_template = user_message.replace(match.group(0), '{data_chunk}') # noqa: E501
-        else:
-            data_to_chunk = user_message
-            user_prompt_template = '{data_chunk}'
-    except (json.JSONDecodeError, TypeError):
-        data_to_chunk = user_message
-        user_prompt_template = '{data_chunk}'
-
-    chunks = list(chunker.split_data(data_to_chunk, base_prompt_tokens))
-    
-    if len(chunks) == 1:
-        # 청크가 하나뿐이면 바로 호출
-        final_content = _call_llm_single_blocking(system_message, user_message, max_tokens, cache_key)
-    else:
-        logging.info(f"요청 데이터가 너무 커서 {len(chunks)}개의 묶음(chunk)으로 분할하여 분석합니다.")
-        
-        # [BUG FIX] NameError: name 'summaries' is not defined 오류를 해결하기 위해 summaries 리스트를 초기화합니다.
-        summaries = [None] * len(chunks)
-        
-        # [BUG FIX & 개선] 잘못된 재귀 호출을 수정하고, 각 청크 요약도 JSON 객체로 받도록 합니다.
-        # 각 청크를 요약하기 위해 _call_llm_single_blocking 함수를 병렬로 호출합니다.
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_REQUESTS) as executor:
-            # 각 청크에 대한 요약 프롬프트 생성
-            chunk_prompts = [user_prompt_template.format(data_chunk=json.dumps(chunk, ensure_ascii=False, default=str)) for chunk in chunks]
-            # 요약용 시스템 메시지
-            summarization_system_message = "You are an assistant that summarizes data. Please extract only the most critical and abnormal points from the following data chunk."
-
-            future_to_chunk_index = {executor.submit(_call_llm_single_blocking, summarization_system_message, prompt): i for i, prompt in enumerate(chunk_prompts)}
-            
-            # 결과를 순서대로 수집
-            temp_summaries = [None] * len(chunks)
-            for future in as_completed(future_to_chunk_index):
-                index = future_to_chunk_index[future]
-                try:
-                    summary = future.result()
-                    temp_summaries[index] = f"Summary of chunk {index+1}:\n{summary}"
-                except Exception as e:
-                    logging.error(f"Chunk {index+1} 요약 중 오류 발생: {e}")
-                    temp_summaries[index] = f"Summary of chunk {index+1}: FAILED ({e})"
-            # [BUG FIX] 이미 실패 처리된 요약을 덮어쓰지 않도록, 성공한 요약만 업데이트합니다.
-            for i, summary in enumerate(temp_summaries):
-                if summary is not None:
-                    summaries[i] = summary
-        
-        # [핵심 개선] 재귀적 요약(Recursive Summarization) 로직 도입
-        # 최종 분석 프롬프트가 너무 클 경우, 요약본 자체를 다시 청킹하여 분석합니다.
-        final_user_message = f"The data was too large and was split into chunks. Here are the summaries of each chunk:\n\n{''.join(summaries)}\n\nBased on these summaries, please provide a final comprehensive analysis following the original user request format."
-        
-        final_prompt_tokens = chunker.get_token_count(system_message + final_user_message)
-        
-        if final_prompt_tokens > chunker.max_tokens:
-            logging.warning(f"최종 분석 프롬프트({final_prompt_tokens} 토큰)가 너무 큽니다. 요약본을 다시 분할하여 분석합니다.")
-            # call_llm_blocking 함수를 재귀적으로 호출하여 요약본들을 다시 요약하고 종합합니다.
-            # 이 때, 시스템 메시지는 동일하게 유지하고, 사용자 메시지로 요약본들의 묶음을 전달합니다.
-            # 이렇게 하면 아무리 큰 데이터라도 최종적으로 하나의 분석 결과로 종합될 수 있습니다.
-            return call_llm_blocking(system_message, final_user_message, max_tokens)
-        else:
-            final_content = _call_llm_single_blocking(system_message, final_user_message, max_tokens, cache_key + "_final")
-
-    # [구조적 오류 수정] _call_llm_single_blocking이 문자열을 반환하므로, 여기서 JSON 객체로 파싱합니다.
-    # 이 함수는 항상 파싱된 객체를 반환하도록 보장합니다.
-    try:
-        final_object = _parse_llm_json_response(final_content)
+        # [BUG FIX] LLM이 생성한 JSON 문자열 내의 이스케이프되지 않은 줄 바꿈 문자를 보정합니다.
+        corrected_str = _correct_json_string(raw_response_str)
+        final_object = _parse_llm_json_response(corrected_str)
+        # [BUG FIX] 파싱은 성공했으나 결과가 문자열인 경우, 이를 JSON 객체로 감싸줍니다.
+        if isinstance(final_object, str):
+            final_object = {"analysis_report": final_object}
     except ValueError as e:
         logging.error(f"최종 LLM 응답 파싱 실패: {e}")
-        final_object = {"error": "Final LLM response parsing failed", "details": str(e), "raw_response": final_content}
-        
-    # 3. 성공적인 응답(객체)을 캐시에 저장
+        final_object = {"error": "Final LLM response parsing failed", "details": str(e), "raw_response": raw_response_str}
+
+    # 4. 성공적인 응답(객체)을 캐시에 저장
     if isinstance(final_object, dict) and 'error' not in final_object:
         cache.set(cache_key, final_object, expire=cache_ttl_seconds)
         logging.info(f"[CACHE SET] 새로운 응답을 캐시에 저장합니다. (Key: {cache_key[:10]}...)")
 
     return final_object
-
-def _correct_json_string(text: str) -> str:
-    """
-    [신규] LLM이 생성한 JSON 문자열 내의 이스케이프되지 않은 줄 바꿈 문자를 보정합니다.
-    문자열 리터럴 내부에 있는 줄 바꿈 문자(\n)만 \\n으로 치환합니다.
-    """
-    in_string = False
-    escaped_text = ""
-    for i, char in enumerate(text):
-        if char == '"':
-            # 문자열 리터럴의 시작 또는 끝을 토글합니다. (이스케이프된 따옴표는 무시)
-            if i == 0 or text[i-1] != '\\':
-                in_string = not in_string
-        elif char == '\n' and in_string:
-            escaped_text += '\\n' # 문자열 내의 줄 바꿈 문자를 이스케이프합니다.
-            continue
-        escaped_text += char
-    return escaped_text
 
 def _call_llm_single_blocking(system_message, user_message, max_tokens=16384, cache_key=None):
     """단일 LLM 호출을 처리하는 내부 블로킹 함수."""
@@ -517,12 +438,64 @@ def _call_llm_single_blocking(system_message, user_message, max_tokens=16384, ca
         logging.error(f"LLM server connection or processing failed: {e}")
         return json.dumps({"error": "LLM server connection failed.", "details": str(e)})
 
+def _correct_json_string(text: str) -> str:
+    """
+    [신규] LLM이 생성한 JSON 문자열 내의 이스케이프되지 않은 줄 바꿈 문자를 보정합니다.
+    문자열 리터럴 내부에 있는 줄 바꿈 문자(\n)만 \\n으로 치환합니다.
+    """
+    in_string = False
+    escaped_text = ""
+    for i, char in enumerate(text):
+        if char == '"':
+            # 문자열 리터럴의 시작 또는 끝을 토글합니다. (이스케이프된 따옴표는 무시)
+            if i == 0 or text[i-1] != '\\':
+                in_string = not in_string
+        elif char == '\n' and in_string:
+            escaped_text += '\\n' # 문자열 내의 줄 바꿈 문자를 이스케이프합니다.
+            continue
+        escaped_text += char
+    return escaped_text
+
+def _parse_llm_json_response(llm_response_str: str):
+    """
+    [신규] LLM 응답 문자열에서 JSON 객체를 안정적으로 파싱합니다.
+    - JSON 코드 블록(```json ... ```)을 처리합니다.
+    - 코드 블록이 없는 경우, 문자열에서 유효한 JSON 부분을 찾습니다.
+    """
+    try:
+        # [BUG FIX] LLM 응답이 문자열이 아닌 경우를 처리합니다.
+        if not isinstance(llm_response_str, str) or not llm_response_str.strip():
+            raise ValueError("LLM 응답이 비어 있거나 문자열이 아닙니다.")
+
+        # [BUG FIX] re.DOTALL 플래그를 사용하여 여러 줄에 걸친 JSON 블록을 찾습니다.
+        match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```', llm_response_str, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+        else:
+            # 코드 블록이 없는 경우, 응답에서 첫 '{' 또는 '[' 부터 마지막 '}' 또는 ']' 까지를 JSON으로 간주합니다.
+            start = llm_response_str.find('{')
+            if start == -1: start = llm_response_str.find('[')
+            end = llm_response_str.rfind('}')
+            if end == -1: end = llm_response_str.rfind(']')
+            if start != -1 and end != -1:
+                json_str = llm_response_str[start:end+1]
+            else:
+                raise ValueError(f"응답에서 유효한 JSON 형식(객체 또는 배열)을 찾을 수 없습니다.")
+
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM 응답 JSON 파싱 실패: {e}\n응답 내용: {llm_response_str[:500]}")
+
 def call_llm_stream(system_message, user_message):
     """
     [효율성 개선] LLM 스트리밍 호출 함수에 캐싱 기능 추가.
     - Cache Miss: 실제 LLM API를 호출하고, 스트리밍하면서 전체 응답을 캐시에 저장합니다.
     - Cache Hit: 캐시된 전체 응답을 가져와, 실제 스트리밍처럼 보이도록 작은 조각으로 나누어 전송합니다.
     """
+    # [개선] LLM 동시 요청이 꽉 찼을 경우 대기 상태임을 로깅합니다.
+    if llm_semaphore.get_value() == 0:
+        logging.info(f"[LLM QUEUE] LLM 동시 요청이 최대치({MAX_CONCURRENT_LLM_REQUESTS})에 도달하여 대기합니다...")
+
     # [사용자 요청] 세마포를 사용하여 동시 LLM 요청 수를 제어합니다.
     with llm_semaphore:
         request_id = str(uuid.uuid4())[:8]
@@ -642,7 +615,8 @@ def setup_scheduler():
     logger.addHandler(handler)
     try:
         scheduler.start()
-        scheduler.add_job(cleanup_old_analysis_statuses, 'interval', seconds=ANALYSIS_CLEANUP_INTERVAL_SECONDS, id='cleanup_analysis_status_job')
+        scheduler.add_job(cleanup_old_analysis_statuses, 'interval', seconds=ANALYSIS_CLEANUP_INTERVAL_SECONDS, id='cleanup_analysis_status_job', replace_existing=True)
+        scheduler.add_job(log_server_status, 'interval', minutes=1, id='log_server_status_job', replace_existing=True) # [신규] 1분마다 서버 상태 로깅
         logging.info(f"Loaded {sync_jobs_from_file()} scheduled jobs from file.")
     except Exception as e: logging.error(f"Failed to start APScheduler: {e}", exc_info=True)
     atexit.register(lambda: scheduler.shutdown())
@@ -660,6 +634,7 @@ def run_scheduled_script(script_path):
         if stdout: log.info(f"[stdout]:\n{stdout.strip()}")
         if stderr: log.warning(f"[stderr]:\n{stderr.strip()}")
     except Exception as e: log.error(f"Exception during script execution '{script_path}': {e}", exc_info=True)
+
 
 def sync_jobs_from_file():
     schedule_file = CONFIG.get("schedule_file")
@@ -870,39 +845,28 @@ def api_scheduler_logs():
 @app.route('/AIBox/api/reports', methods=['GET', 'DELETE'])
 def api_reports():
     if request.method == 'DELETE':
+        # [기능 복원] 개별 리포트 삭제 기능 로직을 복원합니다.
         filename = request.args.get('file')
         if not filename:
             return jsonify({"error": "File parameter is missing"}), 400
 
-        # [핵심 개선] 단일 파일이 아닌, 분석과 관련된 모든 파일(html, json 등)을 삭제합니다.
         if filename.startswith('report-') and filename.endswith('.html'):
             try:
-                # 'report-hostname.html'에서 'hostname'을 추출합니다.
                 hostname = filename[len('report-'):-len('.html')]
                 output_folder = app.config['OUTPUT_FOLDER']
                 
-                # [개선] 호스트네임을 포함하는 모든 관련 파일을 찾습니다.
-                # 예: report-{hostname}.html, metadata-{hostname}.json, sar_gui_disk-{hostname}.html, popup_cpu_{hostname}.html 등
-                files_to_delete = [f for f in os.listdir(output_folder) if f.endswith(f"_{hostname}.html") or f.endswith(f"-{hostname}.html") or f.endswith(f"-{hostname}.json")]
+                # 호스트네임을 포함하는 모든 관련 파일(html, json 등)을 찾습니다.
+                files_to_delete = [f for f in os.listdir(output_folder) if hostname in f]
                 
-                deleted_count = 0
                 for f_to_delete in files_to_delete:
-                    # secure_filename은 슬래시 등을 제거하므로 여기서는 사용하지 않습니다.
                     file_path = os.path.join(output_folder, f_to_delete)
                     if os.path.exists(file_path):
-                        try:
-                            os.remove(file_path)
-                            deleted_count += 1
-                        except OSError as e:
-                            logging.error(f"파일 삭제 중 오류 발생 '{file_path}': {e}")
+                        os.remove(file_path)
                 
-                logging.info(f"리포트 '{hostname}'와 관련된 파일 {deleted_count}개를 삭제했습니다.")
-                return jsonify({"success": True, "message": f"{deleted_count}개의 관련 파일이 삭제되었습니다."})
+                return jsonify({"success": True, "message": f"{len(files_to_delete)}개의 관련 파일이 삭제되었습니다."})
             except Exception as e:
-                logging.error(f"리포트 관련 파일 삭제 중 오류 발생: {e}", exc_info=True)
-                return jsonify({"error": "파일 삭제 중 서버 오류가 발생했습니다."}), 500
-        
-        return jsonify({"error": "잘못된 파일 이름 형식입니다. 'report-{hostname}.html' 형태의 파일만 삭제할 수 있습니다."}), 400
+                return jsonify({"error": f"파일 삭제 중 오류 발생: {e}"}), 500
+        return jsonify({"error": "잘못된 파일 이름 형식입니다."}), 400
     else: # GET
         try:
             reports = sorted([
@@ -992,27 +956,64 @@ def api_cve_analyze():
             system_message = "You are an RHEL security analyst. Return only a single, valid JSON object."
         
         # [핵심 개선] 대용량 JSON 응답을 처리하기 위해 스트리밍 방식으로 LLM을 호출하고, 그 결과를 그대로 클라이언트에 스트리밍합니다.
-        # 이는 서버의 메모리 부담을 줄이고, 타임아웃 문제를 방지합니다.
-        response_stream = call_llm_stream(system_message, user_message=prompt)
+        # [BUG FIX] 요청에 'stream' 플래그가 있는지 확인하여 블로킹/스트리밍 호출을 동적으로 결정합니다.
+        # cve_report_generator.py와 같이 단일 응답을 기대하는 클라이언트와의 호환성을 보장합니다.
+        if cve_data.get('stream', False):
+            # 스트리밍 요청 처리
+            response_stream = call_llm_stream(system_message, user_message=prompt)
+            full_response_str = "".join(list(response_stream))
+            try:
+                parsed_json = json.loads(full_response_str)
+                return jsonify(parsed_json)
+            except json.JSONDecodeError:
+                match = re.search(r'```(json)?\s*(\{.*\}|\[.*\])\s*```', full_response_str, re.DOTALL)
+                if match:
+                    return Response(match.group(2), mimetype='application/json; charset=utf-8')
+                return jsonify({"raw_response": full_response_str, "error": "LLM response was not in a valid JSON format."})
+        else:
+            # 블로킹 요청 처리
+            response_obj = call_llm_blocking(system_message, user_message=prompt)
+            return jsonify(response_obj)
         
-        # [개선] 스트리밍 응답을 조립하여 JSON 유효성을 검사하고, 실패 시 코드 블록을 추출합니다.
-        full_response_str = "".join(list(response_stream))
-        try:
-            # 먼저 전체 응답이 유효한 JSON인지 확인
-            parsed_json = json.loads(full_response_str)
-            return jsonify(parsed_json)
-        except json.JSONDecodeError:
-            # JSON 파싱 실패 시, 마크다운 코드 블록에서 JSON 추출 시도
-            match = re.search(r'```(json)?\s*(\[.*\]|\{.*\})\s*```', full_response_str, re.DOTALL)
-            if match:
-                json_str = match.group(2)
-                # 추출된 JSON 문자열을 클라이언트에 직접 반환
-                return Response(json_str, mimetype='application/json; charset=utf-8')
-            # 그래도 실패하면 원본 텍스트를 오류와 함께 반환
-            return jsonify({"raw_response": full_response_str, "error": "LLM response was not in a valid JSON format."})
     except Exception as e:
         logging.error(f"CVE analysis error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+@app.route('/AIBox/api/cve/export-excel', methods=['GET'])
+def api_export_cve_excel():
+    """[신규] cve_report_generator.py가 생성한 최종 CVE 목록을 읽어 Excel 파일을 생성하고 다운로드합니다."""
+    if not IS_OPENPYXL_AVAILABLE:
+        return "Excel export functionality is disabled because 'openpyxl' library is not installed.", 501
+
+    final_list_path = os.path.join(OUTPUT_FOLDER, 'final_cve_list.json')
+    if not os.path.exists(final_list_path):
+        return "The analysis data file (final_cve_list.json) was not found. Please generate the report first.", 404
+
+    try:
+        # cve_report_generator.py를 임포트하여 Excel 생성 함수를 직접 호출
+        # 이렇게 하면 코드 중복을 피하고 로직을 중앙에서 관리할 수 있습니다.
+        import cve_report_generator
+
+        with open(final_list_path, 'r', encoding='utf-8') as f:
+            cve_list = json.load(f)
+        
+        workbook = cve_report_generator.create_excel_report(cve_list)
+        if not workbook:
+            return "Failed to create Excel workbook.", 500
+
+        # 메모리 상의 워크북을 바이트 스트림으로 변환
+        virtual_workbook_data = save_virtual_workbook(workbook)
+        
+        filename = f"RHEL_Vulnerability_Report_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        
+        return Response(
+            virtual_workbook_data,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition': f'attachment;filename={filename}'}
+        )
+    except Exception as e:
+        logging.error(f"Excel export error: {e}", exc_info=True)
+        return "An internal error occurred while generating the Excel file.", 500
 
 @app.route('/AIBox/api/cve/generate-report', methods=['POST'])
 def api_generate_cve_report():
@@ -1151,6 +1152,7 @@ if __name__ == '__main__':
     # [제안 반영] argparse 대신 환경 변수에서 비밀번호를 로드합니다.
     CONFIG['password'] = os.getenv('AIBOX_PASSWORD')
     if not CONFIG.get('password'):
+        logging.info("[3/8] AIBOX_PASSWORD 환경 변수가 설정되지 않았습니다.")
         logging.error("FATAL: Password is not set. Please set the AIBOX_PASSWORD environment variable.")
         sys.exit(1)
     
