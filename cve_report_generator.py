@@ -7,6 +7,7 @@ import requests
 import sys
 import re
 import time
+import argparse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
@@ -52,6 +53,28 @@ TARGET_PRODUCT_PATTERNS = [
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
+def collect_cve_ids_from_custom_file(file_path):
+    """--cve-file 옵션으로 제공된 파일에서 CVE ID 목록을 읽습니다."""
+    logging.info(f"사용자 지정 파일에서 CVE 목록 수집을 시작합니다: {file_path}")
+    if not os.path.exists(file_path):
+        logging.error(f"오류: CVE 파일 '{file_path}'를 찾을 수 없습니다.")
+        return []
+
+    cve_ids = set()
+    cve_pattern = re.compile(r'^(CVE-\d{4}-\d{4,})$')
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                clean_line = line.strip()
+                if match := cve_pattern.match(clean_line):
+                    cve_ids.add(match.group(1))
+    except Exception as e:
+        logging.error(f"'{file_path}' 파일 처리 중 오류 발생: {e}")
+        return []
+    
+    logging.info(f"파일에서 {len(cve_ids)}개의 유효한 CVE ID를 발견했습니다.")
+    return sorted(list(cve_ids), reverse=True)
+
 def collect_cve_ids_from_file():
     logging.info(f"데이터 파일에서 CVE 목록 수집을 시작합니다: {CVE_DATA_FILE}")
     try:
@@ -81,21 +104,21 @@ def fetch_cve_details(cve_id):
         if response.status_code == 200:
             data = response.json()
             if 'name' not in data: data['name'] = cve_id
-            return data
+            return data, cve_id
     except requests.RequestException:
         pass # Red Hat 서버에서 재시도
-
+    
     try:
         response = requests.get(REDHAT_CVE_URL.format(cve_id=cve_id), timeout=20)
         if response.status_code == 200:
             data = response.json()
-            if 'name' not in data: data['name'] = cve_id
-            return data
+            if 'name' not in data: data['name'] = cve_id # type: ignore
+            return data, cve_id
     except requests.RequestException as e:
         logging.error(f"[{cve_id}] 모든 소스에서 정보 조회 실패: {e}")
-    return None
+    return None, cve_id
 
-def process_cve_data(cve_data):
+def process_cve_data(cve_data, skip_filtering=False):
     if not cve_data: return None
     cve_id = cve_data.get('name', 'N/A')
     
@@ -104,24 +127,26 @@ def process_cve_data(cve_data):
     all_releases = cve_data.get('affected_release', [])
     for release in all_releases:
         product_name = release.get('product_name', 'Unknown Product')
+        # --cve-file 옵션 사용 시 필터링을 건너뜁니다.
+        if not skip_filtering:
+            
+            is_target_product = any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS)
+            if not is_target_product:
+                continue
 
-        is_target_product = any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS)
-        if not is_target_product:
-            continue
-
-        package = release.get('package', '')
-        if 'kpatch-patch' in package or 'kernel-rt' in package: continue
-        
-        is_not_affected = any(
-            s.get('product_name') == product_name and s.get('fix_state') == 'Not affected'
-            for s in cve_data.get('package_state', [])
-        )
-        if is_not_affected: continue
+            package = release.get('package', '')
+            if 'kpatch-patch' in package or 'kernel-rt' in package: continue
+            
+            is_not_affected = any(
+                s.get('product_name') == product_name and s.get('fix_state') == 'Not affected'
+                for s in cve_data.get('package_state', [])
+            )
+            if is_not_affected: continue
         
         advisory = release.get('advisory', 'N/A')
         if product_name not in filtered_releases: filtered_releases[product_name] = {}
         if advisory not in filtered_releases[product_name]: filtered_releases[product_name][advisory] = []
-        filtered_releases[product_name][advisory].append(package)
+        filtered_releases[product_name][advisory].append(release.get('package', ''))
 
     if not filtered_releases: 
         return None
@@ -244,7 +269,7 @@ def get_korean_summaries_with_llm(cve_list):
     return cve_list
 
 
-def generate_interactive_html_report(cve_list):
+def generate_interactive_html_report(cve_list, custom_report_path=None):
     logging.info("HTML 리포트 생성을 시작합니다.")
 
     table_rows_html = ""
@@ -252,6 +277,15 @@ def generate_interactive_html_report(cve_list):
 
     for cve in cve_list:
         flat_releases = []
+        # [요청사항] CVE 정보가 없는 경우 처리
+        if cve.get('error'):
+            table_rows_html += f"""
+            <tr>
+                <td><a href="https://access.redhat.com/security/cve/{cve['cve_id']}" target="_blank">{cve['cve_id']}</a></td>
+                <td colspan="7" style="text-align: center; color: #777;">{cve['error']}</td>
+            </tr>
+            """
+            continue
         if cve.get('affected_releases'):
             for product, advisories in cve.get('affected_releases', {}).items():
                 for advisory, packages in advisories.items():
@@ -477,12 +511,13 @@ def generate_interactive_html_report(cve_list):
     </body>
     </html>
     """
+    report_path = custom_report_path if custom_report_path else REPORT_FILE_PATH
 
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        with open(REPORT_FILE_PATH, 'w', encoding='utf-8') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             f.write(html_template)
-        logging.info(f"성공: HTML 리포트가 '{REPORT_FILE_PATH}'에 저장되었습니다.")
+        logging.info(f"성공: HTML 리포트가 '{report_path}'에 저장되었습니다.")
     except IOError as e:
         logging.error(f"오류: HTML 리포트 파일 저장 실패: {e}")
 
@@ -554,7 +589,15 @@ def create_excel_report(cve_list):
 def main():
     logging.info("===== Red Hat 취약점 분석 스크립트(v29, security.py 로직 적용)를 시작합니다. =====")
     
-    cve_ids_to_fetch = collect_cve_ids_from_file()
+    parser = argparse.ArgumentParser(description="Red Hat CVE 분석 리포트 생성기")
+    parser.add_argument('--cve-file', help='분석할 CVE ID 목록이 포함된 텍스트 파일 경로')
+    args = parser.parse_args()
+
+    if args.cve_file:
+        cve_ids_to_fetch = collect_cve_ids_from_custom_file(args.cve_file)
+    else:
+        cve_ids_to_fetch = collect_cve_ids_from_file()
+
     if not cve_ids_to_fetch:
         logging.warning("분석할 CVE가 없습니다. 종료합니다.")
         return
@@ -563,19 +606,38 @@ def main():
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         f_to_cve = {executor.submit(fetch_cve_details, cid): cid for cid in cve_ids_to_fetch}
         for f in as_completed(f_to_cve):
-            data = f.result()
-            if data: all_cve_details.append(data)
+            data, cve_id = f.result()
+            if data:
+                all_cve_details.append(data)
+            else:
+                # [요청사항] CVE 정보 조회 실패 시, 기본 구조를 생성하여 리포트에 포함
+                all_cve_details.append({'cve_id': cve_id, 'error': 'CVE 정보 영향 없음(Red Hat)'})
     
-    processed_cves = [p for p in [process_cve_data(d) for d in all_cve_details] if p]
+    processed_cves = []
+    for d in all_cve_details:
+        if d.get('error'):
+            processed_cves.append(d)
+            continue
+        # --cve-file 옵션 사용 시 필터링 건너뛰기
+        processed = process_cve_data(d, skip_filtering=bool(args.cve_file))
+        if processed:
+            processed_cves.append(processed)
+
     if not processed_cves:
         logging.warning("필터링 후 리포트에 포함할 CVE가 없습니다.")
-        generate_interactive_html_report([])
+        report_path = None
+        if args.cve_file:
+            date_str = datetime.now().strftime('%Y%m%d')
+            report_path = os.path.join(OUTPUT_DIR, f'rhel_vulnerability_report_{date_str}.html')
+        generate_interactive_html_report([], custom_report_path=report_path)
         return
         
     logging.info(f"데이터 정제 완료. 분석 대상 CVE는 총 {len(processed_cves)}개 입니다.")
 
     # [NEW] AI 분석 및 국문 요약 생성 (security.py의 안정적인 단일 요청 방식 적용)
-    final_cve_list = get_korean_summaries_with_llm(processed_cves)
+    final_cve_list = get_korean_summaries_with_llm([cve for cve in processed_cves if not cve.get('error')])
+    # 에러가 발생한 CVE들을 최종 목록에 다시 추가
+    final_cve_list.extend([cve for cve in processed_cves if cve.get('error')])
     
     # [개선] 생성된 최종 CVE 목록을 파일로 저장하여 서버가 사용할 수 있도록 함
     try:
@@ -585,7 +647,13 @@ def main():
     except IOError as e:
         logging.error(f"최종 CVE 목록 파일 저장 실패: {e}")
 
-    generate_interactive_html_report(final_cve_list)
+    # [요청사항] --cve-file 사용 시 파일명에 날짜 추가
+    report_path = None
+    if args.cve_file:
+        date_str = datetime.now().strftime('%Y%m%d')
+        report_path = os.path.join(OUTPUT_DIR, f'rhel_vulnerability_report_{date_str}.html')
+
+    generate_interactive_html_report(final_cve_list, custom_report_path=report_path)
 
     logging.info("===== 모든 작업이 완료되었습니다. =====")
 

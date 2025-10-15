@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 # -*- coding: utf-8 -*-
 # ==============================================================================
 # Unified AI Server (v8.2 - Expert Prompt & Full Feature Restoration)
@@ -52,12 +52,19 @@ try:
 except ImportError:
     IS_TIKTOKEN_AVAILABLE = False
 
+# [BUG FIX] psutil이 없을 경우 서버가 시작되지 않는 문제를 해결하기 위해 선택적 임포트로 변경합니다.
+try:
+    import psutil
+    IS_PSUTIL_AVAILABLE = True
+except ImportError:
+    IS_TIKTOKEN_AVAILABLE = False
+
 # [사용자 요청] 서버 측 Excel 생성을 위해 openpyxl 라이브러리 추가
 try:
     from openpyxl.writer.excel import save_virtual_workbook
     IS_OPENPYXL_AVAILABLE = True
 except ImportError:
-    IS_OPENPYXL_AVAILABLE = False
+    IS_OPENPYXL_AVAILABLE = False    
     IS_TIKTOKEN_AVAILABLE = False
 
 # --- 로깅 및 Flask 앱 설정 ---
@@ -67,7 +74,13 @@ class HealthCheckFilter(logging.Filter):
 
 log = logging.getLogger('werkzeug')
 log.addFilter(HealthCheckFilter())
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# [BUG FIX] 기본 로거에 UTF-8 인코딩을 설정하여 한글 깨짐 문제를 해결합니다.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)] # UTF-8을 지원하는 스트림으로 출력
+)
 
 # [신규] LLM 상호작용 로깅을 위한 설정
 LLM_LOG_DIR = "/data/iso/AIBox/log"
@@ -114,6 +127,10 @@ ANALYSIS_CLEANUP_INTERVAL_SECONDS = 3600 # 1시간마다 오래된 상태 정리
 # os.cpu_count()를 기반으로 설정하되, 최소 1개, 최대 4개로 제한합니다.
 MAX_CONCURRENT_LLM_REQUESTS = max(1, min((os.cpu_count() or 1) // 2, 4))
 llm_semaphore = threading.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
+
+# [신규] LLM 상태 및 서킷 브레이커를 위한 전역 변수
+LLM_HEALTH_STATUS = {"status": "unknown", "last_checked": None}
+LLM_STATUS_LOCK = Lock()
 
 CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
@@ -216,31 +233,41 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
             "--output", output_dir,
             file_path
         ]
-        
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
 
         with ANALYSIS_LOCK:
             ANALYSIS_STATUS[log_key]["status"] = "running"
             ANALYSIS_STATUS[log_key]["log"].append("분석 프로세스를 시작합니다...")
 
-        for line in iter(process.stdout.readline, ''):
-            line = line.strip()
-            if not line: continue
-            with ANALYSIS_LOCK:
-                # [개선] sos_analyzer.py의 표준화된 로그 포맷("[STEP]")을 파싱하여 상태 업데이트
-                if "[STEP] EXTRACTING" in line:
-                    ANALYSIS_STATUS[log_key]["status"] = "extracting"
-                elif "[STEP] PARSING" in line:
-                    ANALYSIS_STATUS[log_key]["status"] = "parsing"
-                elif "[STEP] ANALYZING" in line:
-                    ANALYSIS_STATUS[log_key]["status"] = "analyzing"
-                elif "[STEP] GENERATING_REPORT" in line:
-                    ANALYSIS_STATUS[log_key]["status"] = "generating_report"
-                
-                ANALYSIS_STATUS[log_key]["log"].append(line)
+        # [BUG FIX] stdout과 stderr을 통합하여 실시간으로 처리합니다.
+        # 이렇게 하면 경고(warning) 메시지가 stderr로 출력되어도 로그에 즉시 기록되어
+        # 'warnings.warn('와 같은 불완전한 로그로 분석이 실패하는 문제를 방지합니다.
+        process = subprocess.Popen(
+            command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, # stderr을 stdout으로 리디렉션
+            text=True, 
+            encoding='utf-8', 
+            errors='replace'
+        )
+
+        if process.stdout:
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if not line: continue
+                with ANALYSIS_LOCK:
+                    # [개선] sos_analyzer.py의 표준화된 로그 포맷("[STEP]")을 파싱하여 상태 업데이트
+                    if "[STEP] EXTRACTING" in line:
+                        ANALYSIS_STATUS[log_key]["status"] = "extracting"
+                    elif "[STEP] PARSING" in line:
+                        ANALYSIS_STATUS[log_key]["status"] = "parsing"
+                    elif "[STEP] ANALYZING" in line:
+                        ANALYSIS_STATUS[log_key]["status"] = "analyzing"
+                    elif "[STEP] GENERATING_REPORT" in line:
+                        ANALYSIS_STATUS[log_key]["status"] = "generating_report"
+                    
+                    ANALYSIS_STATUS[log_key]["log"].append(line)
         
         process.wait()
-        stderr_output = process.stderr.read().strip()
 
         with ANALYSIS_LOCK:
             # [핵심 개선] 분석 프로세스의 성공/실패를 더 명확하게 판단합니다.
@@ -259,10 +286,12 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
                     ANALYSIS_STATUS[log_key]["report_file"] = os.path.basename(report_full_path)
             else:
                 ANALYSIS_STATUS[log_key]["status"] = "failed"
-                ANALYSIS_STATUS[log_key]["log"].append(f"분석 실패 (종료 코드: {process.returncode}).")
-                if stderr_output:
-                    ANALYSIS_STATUS[log_key]["log"].append("--- ERROR LOG ---")
-                    ANALYSIS_STATUS[log_key]["log"].extend(stderr_output.split('\n'))
+                # [사용자 요청] 분석 실패 시, 마지막 로그를 함께 기록하여 원인 파악을 돕습니다.
+                last_log_line = ANALYSIS_STATUS[log_key]["log"][-1] if ANALYSIS_STATUS[log_key]["log"] else "로그 없음"
+                fail_message = (
+                    f"분석 실패 (종료 코드: {process.returncode}). 최종 로그: {last_log_line}"
+                )
+                ANALYSIS_STATUS[log_key]["log"].append(fail_message)
 
     except Exception as e:
         with ANALYSIS_LOCK:
@@ -300,16 +329,51 @@ def log_server_status():
     with ANALYSIS_LOCK:
         running_analyses = sum(1 for status in ANALYSIS_STATUS.values() if status['status'] == 'running')
     
-    # psutil을 사용하여 현재 프로세스의 메모리 사용량 확인
-    process = psutil.Process(os.getpid())
-    mem_info = process.memory_info()
-    mem_usage_mb = mem_info.rss / (1024 * 1024)
-
-    logging.info(
+    status_log = (
         f"[SERVER STATUS] Active Threads: {threading.active_count()}, "
         f"Running Analyses: {running_analyses}, "
-        f"LLM Concurrency: {MAX_CONCURRENT_LLM_REQUESTS - llm_semaphore._value}/{MAX_CONCURRENT_LLM_REQUESTS}, "
-        f"Memory Usage: {mem_usage_mb:.2f} MB"
+        f"LLM Concurrency: {MAX_CONCURRENT_LLM_REQUESTS - llm_semaphore._value}/{MAX_CONCURRENT_LLM_REQUESTS}"
+    )
+
+    # psutil이 설치된 경우에만 메모리 사용량 정보를 추가합니다.
+    if IS_PSUTIL_AVAILABLE:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        mem_usage_mb = mem_info.rss / (1024 * 1024)
+        status_log += f", Memory Usage: {mem_usage_mb:.2f} MB"
+
+    logging.info(status_log)
+
+def check_llm_health():
+    """
+    [신규] 백그라운드에서 LLM 백엔드의 실제 상태를 주기적으로 확인합니다.
+    litellm의 /health/readiness 엔드포인트를 사용하여 DB 연결 및 모델 응답성을 모두 확인합니다.
+    """
+    global LLM_HEALTH_STATUS
+    
+    # litellm의 readiness 엔드포인트는 모델 응답성까지 확인합니다.
+    health_url = CONFIG['llm_url'].replace('/v1/chat/completions', '/health/readiness')
+    
+    status = "unhealthy"
+    try:
+        # 내부 통신이므로 프록시를 사용하지 않고, 타임아웃을 짧게 설정합니다.
+        response = requests.get(health_url, timeout=10, proxies={'http': None, 'https': None})
+        if response.status_code == 200:
+            status = "healthy"
+        else:
+            logging.warning(f"LLM Health Check Failed: Status {response.status_code}, URL: {health_url}")
+    except requests.RequestException as e:
+        logging.error(f"LLM Health Check Error: {e}, URL: {health_url}")
+
+    with LLM_STATUS_LOCK:
+        LLM_HEALTH_STATUS = {
+            "status": status,
+            "last_checked": datetime.now().isoformat()
+        }
+    
+    # 상태 로깅 (상태가 변경될 때만 또는 주기적으로)
+    logging.info(
+        f"[HEALTH CHECK] LLM Backend Status: {status.upper()}"
     )
 
 def resolve_chat_endpoint(llm_url, token):
@@ -357,6 +421,40 @@ def get_cache_key(system_message, user_message):
 # [개선] diskcache 인스턴스를 전역적으로 생성합니다.
 cache = None # 전역 변수로 선언
 
+def _create_final_summary_prompt(summaries: List[str]) -> str:
+    """
+    [신규] 여러 개의 부분 요약본을 받아, 이를 종합하여 최종 분석을 요청하는 프롬프트를 생성합니다.
+    """
+    summaries_text = "\n\n".join(f"--- Chunk {i+1} Summary ---\n{summary}" for i, summary in enumerate(summaries))
+    return f"""[System Role]
+You are an expert AI tasked with synthesizing multiple partial analysis reports into a single, final, comprehensive report.
+
+[Task]
+The user has provided several summaries from different chunks of a larger dataset. Your job is to combine these summaries into one cohesive final analysis. You must return the result in the same format as the partial summaries (e.g., a single JSON object).
+
+[Partial Summaries]
+{summaries_text}
+
+[Final Analysis Request]
+Please synthesize the above summaries into a single, final JSON object. Do not add any explanatory text outside of the JSON structure.
+"""
+
+def _create_chunk_summary_prompt(chunk_data: str) -> str:
+    """
+    [신규] 데이터 청크(묶음)를 요약하기 위한 프롬프트를 생성합니다.
+    """
+    return f"""[System Role]
+You are an expert AI that analyzes a piece of a larger dataset and provides a summary.
+
+[Task]
+The user has provided a chunk of data. Analyze it and return a summary of your findings. The format of your response should be a single JSON object, as the final output will be constructed from these summaries.
+
+[Data Chunk to Summarize]
+```
+{chunk_data}
+```
+"""
+
 def call_llm_blocking(system_message, user_message, max_tokens=16384):
     """
     [개선] LLM을 호출하고 결과를 캐싱하는 블로킹 함수.
@@ -372,10 +470,43 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
         llm_logger.info(f"[CACHE HIT] Returning cached response for key: {cache_key}")
         return cached_response
 
-    # 2. Cache Miss: LLM 호출
+    # 2. Cache Miss: LLM 호출 (지능형 청킹 적용)
     logging.info(f"[CACHE MISS] LLM 서버에 분석을 요청합니다. (Key: {cache_key[:10]}...)")
-    raw_response_str = _call_llm_single_blocking(system_message, user_message, max_tokens, cache_key)
+    
+    llm_chunker = LLMChunker()
+    base_prompt_tokens = llm_chunker.get_token_count(system_message)
+    
+    # [핵심 개선] 사용자 메시지를 청크로 분할
+    chunks = list(llm_chunker.split_data(user_message, base_prompt_tokens))
+    
+    raw_response_str = ""
+    if len(chunks) == 1:
+        # 청크가 하나뿐이면 직접 호출
+        logging.info("데이터가 단일 청크에 적합하여 직접 LLM을 호출합니다.")
+        raw_response_str = _call_llm_single_blocking(system_message, user_message, max_tokens, cache_key)
+    else:
+        # 여러 청크로 분할된 경우, "Map-Reduce" 방식 적용
+        logging.info(f"데이터가 너무 커서 {len(chunks)}개의 청크로 분할하여 분석합니다 (Map-Reduce).")
+        
+        # Map 단계: 각 청크를 병렬로 요약
+        chunk_summaries = []
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_REQUESTS) as executor:
+            future_to_chunk = {
+                executor.submit(_call_llm_single_blocking, system_message, _create_chunk_summary_prompt(chunk)): chunk
+                for chunk in chunks
+            }
+            for future in as_completed(future_to_chunk):
+                try:
+                    summary = future.result()
+                    chunk_summaries.append(summary)
+                except Exception as e:
+                    logging.error(f"청크 요약 중 오류 발생: {e}")
 
+        # Reduce 단계: 요약본들을 모아 최종 분석 요청
+        logging.info("모든 청크 요약 완료. 최종 종합 분석을 요청합니다.")
+        final_prompt = _create_final_summary_prompt(chunk_summaries)
+        raw_response_str = _call_llm_single_blocking(system_message, final_prompt, max_tokens, cache_key)
+        
     # 3. LLM 응답 파싱 및 객체 변환
     # [BUG FIX] LLM 응답 파싱 실패 시, 클라이언트가 AttributeError를 일으키지 않도록
     #           항상 일관된 JSON 객체 형식으로 오류를 반환합니다.
@@ -399,44 +530,66 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
 
 def _call_llm_single_blocking(system_message, user_message, max_tokens=16384, cache_key=None):
     """단일 LLM 호출을 처리하는 내부 블로킹 함수."""
-    # [구조적 오류 수정] 이 함수는 이제 항상 문자열을 반환합니다. (성공 시 LLM 응답, 실패 시 오류 JSON 문자열)
+    # [개선] 요청별 고유 ID를 생성하여 로깅을 추적합니다.
+    request_id = str(uuid.uuid4())[:8]
+
     headers = {'Content-Type': 'application/json'}
     if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
     payload = {"model": CONFIG["model"], "messages": [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}], "max_tokens": max_tokens, "temperature": 0.1, "stream": False}
     
-    # [신규] LLM 요청 로깅
-    llm_logger.info("--- LLM Request (Blocking) ---")
-    llm_logger.info(f"System Message: {system_message}")
-    llm_logger.debug(f"User Message: {user_message}")
-    
-    # cache_misses.inc() # 메트릭 기능이 구현될 때까지 주석 처리
-    # [제안 반영] LLM 호출 타임아웃을 600초(10분)로 늘려 긴 분석 작업(예: CVE 순위 선정)을 지원합니다.
-    try:
-        response = requests.post(CONFIG["llm_url"], headers=headers, json=payload, timeout=600)
-        logging.info(f"[LLM RESP] Status Code: {response.status_code}")
-        response.raise_for_status()
-        result = response.json() 
-        content = result.get('choices', [{}])[0].get('message', {}).get('content') or result.get('message', {}).get('content')
-        if not content or not content.strip():
-            return json.dumps({"error": "LLM이 빈 응답을 반환했습니다."})
-        
-        # [신규] LLM 응답 로깅
-        llm_logger.debug(f"--- LLM Response (Blocking) ---\n{content}\n")
+    # [개선] 내부 LLM 서버 통신 시에는 프록시를 사용하지 않도록 명시적으로 설정합니다.
+    # 이는 시스템의 http_proxy 환경 변수로 인한 연결 오류를 방지합니다.
+    proxies = {'http': None, 'https': None}
 
-        # [구조적 오류 수정] 보정된 '문자열'을 반환합니다. 파싱은 상위 호출자에서 수행합니다.
-        # [BUG FIX] LLM이 생성한 JSON 문자열 내의 이스케이프되지 않은 줄 바꿈 문자를 보정합니다.
-        return content
-    except requests.exceptions.HTTPError as e:
-        error_details = f"LLM Server Error: {e}"
-        llm_logger.error(f"--- LLM Error (Blocking) ---\n{error_details}\n")
-        # [개선] LLM 서버가 500 오류를 반환할 때, 응답 본문을 로그에 포함하여 디버깅을 용이하게 합니다.
-        if e.response is not None:
-            error_details += f"\nLLM Response Body:\n{e.response.text}"
-        logging.error(error_details)        
-        return json.dumps({"error": "LLM server returned an error.", "details": str(e), "raw_response": e.response.text if e.response else ""})
-    except Exception as e:
-        logging.error(f"LLM server connection or processing failed: {e}")
-        return json.dumps({"error": "LLM server connection failed.", "details": str(e)})
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # [신규] LLM 요청 로깅
+            # [개선] 요청 ID를 포함하여 로그를 추적하기 쉽게 만듭니다.
+            log_prefix = f"[{request_id}]"
+            logging.info(f"{log_prefix} LLM 요청 (시도 {attempt + 1}/{max_retries})...")
+            llm_logger.info(f"{log_prefix} --- LLM Request (Blocking, Attempt {attempt + 1}/{max_retries}) ---")
+            llm_logger.info(f"{log_prefix} System Message: {system_message}")
+            llm_logger.debug(f"{log_prefix} User Message: {user_message}")
+            
+            # cache_misses.inc() # 메트릭 기능이 구현될 때까지 주석 처리
+            # [제안 반영] LLM 호출 타임아웃을 600초(10분)로 늘려 긴 분석 작업(예: CVE 순위 선정)을 지원합니다.
+            response = requests.post(CONFIG["llm_url"], headers=headers, json=payload, timeout=600, proxies=proxies)
+            logging.info(f"{log_prefix} [LLM RESP] Status Code: {response.status_code} (Attempt {attempt + 1})")
+            response.raise_for_status()
+            result = response.json() 
+            content = result.get('choices', [{}])[0].get('message', {}).get('content') or result.get('message', {}).get('content')
+            if not content or not content.strip():
+                return json.dumps({"error": "LLM이 빈 응답을 반환했습니다."})
+            
+            # [신규] LLM 응답 로깅
+            llm_logger.debug(f"{log_prefix} --- LLM Response (Blocking) ---\n{content}\n")
+            return content # 성공 시 즉시 반환
+
+        except requests.exceptions.HTTPError as e:
+            # 5xx 서버 오류에 대해서만 재시도합니다. 4xx 클라이언트 오류는 재시도해도 소용없습니다.
+            if e.response is not None and 500 <= e.response.status_code < 600:
+                logging.warning(f"{log_prefix} LLM 서버 오류(HTTP {e.response.status_code}) 발생. {2**attempt}초 후 재시도합니다... ({attempt + 1}/{max_retries})")
+                llm_logger.warning(f"{log_prefix} --- LLM HTTP Error (Attempt {attempt + 1}) ---\n{e}\nResponse: {e.response.text}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt) # Exponential backoff: 1, 2, 4초...
+                    continue
+            # 재시도 대상이 아니거나 모든 재시도 실패 시
+            error_details = f"LLM Server Error: {e}"
+            llm_logger.error(f"{log_prefix} --- LLM Error (Blocking) ---\n{error_details}\n")
+            if e.response is not None:
+                error_details += f"\nLLM Response Body:\n{e.response.text}"
+            logging.error(f"{log_prefix} {error_details}")
+            return json.dumps({"error": "LLM server returned an error.", "details": str(e), "raw_response": e.response.text if e.response else ""})
+        except Exception as e:
+            logging.error(f"{log_prefix} LLM server connection or processing failed: {e}")
+            llm_logger.error(f"{log_prefix} --- LLM Connection Error (Blocking) ---\n{e}\n")
+            # 마지막 시도에서 예외 발생 시 오류 반환
+            if attempt == max_retries - 1:
+                return json.dumps({"error": "LLM server connection failed.", "details": str(e)})
+    
+    # 모든 재시도가 실패한 경우 (루프가 정상적으로 끝난 경우)
+    return json.dumps({"error": "LLM 요청이 모든 재시도 후에도 실패했습니다."})
 
 def _correct_json_string(text: str) -> str:
     """
@@ -467,6 +620,11 @@ def _parse_llm_json_response(llm_response_str: str):
         if not isinstance(llm_response_str, str) or not llm_response_str.strip():
             raise ValueError("LLM 응답이 비어 있거나 문자열이 아닙니다.")
 
+        # [BUG FIX] LLM이 <think>...</think> 와 같은 불필요한 XML/HTML 태그를 반환하는 경우,
+        # 이를 제거하여 순수한 JSON만 남깁니다.
+        # re.DOTALL 플래그를 사용하여 여러 줄에 걸친 태그도 제거합니다.
+        llm_response_str = re.sub(r'<.*?>', '', llm_response_str, flags=re.DOTALL).strip()
+
         # [BUG FIX] re.DOTALL 플래그를 사용하여 여러 줄에 걸친 JSON 블록을 찾습니다.
         match = re.search(r'```(?:json)?\s*(\{.*\}|\[.*\])\s*```', llm_response_str, re.DOTALL)
         if match:
@@ -480,7 +638,9 @@ def _parse_llm_json_response(llm_response_str: str):
             if start != -1 and end != -1:
                 json_str = llm_response_str[start:end+1]
             else:
-                raise ValueError(f"응답에서 유효한 JSON 형식(객체 또는 배열)을 찾을 수 없습니다.")
+                # [BUG FIX] JSON 파싱에 실패하면, 원본 텍스트를 그대로 반환하여 클라이언트가 재처리할 수 있도록 합니다.
+                logging.warning(f"응답에서 유효한 JSON 형식을 찾지 못했습니다. 원본 텍스트를 반환합니다: {llm_response_str[:200]}")
+                return llm_response_str
 
         return json.loads(json_str)
     except json.JSONDecodeError as e:
@@ -495,6 +655,13 @@ def call_llm_stream(system_message, user_message):
     # [개선] LLM 동시 요청이 꽉 찼을 경우 대기 상태임을 로깅합니다.
     if llm_semaphore.get_value() == 0:
         logging.info(f"[LLM QUEUE] LLM 동시 요청이 최대치({MAX_CONCURRENT_LLM_REQUESTS})에 도달하여 대기합니다...")
+
+    # [신규] 서킷 브레이커: LLM 상태가 비정상이면 요청을 즉시 차단합니다.
+    with LLM_STATUS_LOCK:
+        if LLM_HEALTH_STATUS.get("status") == "unhealthy":
+            logging.warning(f"Circuit breaker is OPEN. Blocking LLM request to prevent further errors.")
+            # 클라이언트가 오류를 인지할 수 있도록 에러가 포함된 JSON 문자열을 반환합니다.
+            return json.dumps({"error": "LLM 서버가 현재 응답하지 않습니다. 잠시 후 다시 시도해주세요. (Circuit Breaker Open)"})
 
     # [사용자 요청] 세마포를 사용하여 동시 LLM 요청 수를 제어합니다.
     with llm_semaphore:
@@ -610,7 +777,11 @@ def setup_scheduler():
     if logger.hasHandlers():
         logger.handlers.clear()
     # [BUG FIX] 로그 포맷을 명시적으로 설정하여 시간, 레벨 등이 기록되도록 합니다.
-    handler = logging.handlers.RotatingFileHandler(CONFIG["scheduler_log_file"], maxBytes=10*1024*1024, backupCount=5) # [제안 반영] 로그 파일 크기를 10MB로 늘림
+    # [BUG FIX] RotatingFileHandler에 encoding='utf-8'을 추가하여 한글 깨짐 문제를 해결합니다.
+    handler = logging.handlers.RotatingFileHandler(
+        CONFIG["scheduler_log_file"], maxBytes=10*1024*1024, 
+        backupCount=5, encoding='utf-8'
+    )
     handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logger.addHandler(handler)
     try:
@@ -619,6 +790,7 @@ def setup_scheduler():
         scheduler.add_job(log_server_status, 'interval', minutes=1, id='log_server_status_job', replace_existing=True) # [신규] 1분마다 서버 상태 로깅
         logging.info(f"Loaded {sync_jobs_from_file()} scheduled jobs from file.")
     except Exception as e: logging.error(f"Failed to start APScheduler: {e}", exc_info=True)
+    scheduler.add_job(check_llm_health, 'interval', seconds=30, id='llm_health_check_job', replace_existing=True)
     atexit.register(lambda: scheduler.shutdown())
 
 def run_scheduled_script(script_path):
@@ -1108,9 +1280,9 @@ def api_upload_and_analyze():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Unified AI Server", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--llm-url', required=True, help='Full URL for LLM server API')
-    # [요청 반영] 서비스 시작 시 모든 서비스 로직에 대한 체크 및 로깅 추가
+    # Add checks and logging for all service logic at service startup
     logging.info("==========================================================")
-    logging.info("          AIBox 서버 시작 시퀀스를 시작합니다.          ")
+    logging.info("            Starting AIBox Server Sequence...           ")
     logging.info("==========================================================")
     parser.add_argument('--model', help='LLM model name')
     parser.add_argument('--list-models', action='store_true', help='List available models and exit')
@@ -1127,7 +1299,7 @@ if __name__ == '__main__':
     parser.add_argument('--base-url', default=os.getenv('AIBOX_BASE_URL'), help='External base URL for the server (e.g., http://aibo.example.com)')
     args = parser.parse_args()
 
-    logging.info("[1/8] 명령줄 인자 파싱 완료.")
+    logging.info("[1/8] Command-line arguments parsed.")
     def list_available_models(llm_url, token):
         print(f"Fetching models from {llm_url}...")
         models = get_available_models(llm_url, token)
@@ -1145,62 +1317,57 @@ if __name__ == '__main__':
     CONFIG.update(vars(args))
     # [개선] base_url이 설정되지 않았을 경우 경고 메시지를 표시합니다.
     if not CONFIG.get('base_url'):
-        logging.warning("`--base-url` 또는 `AIBOX_BASE_URL`이 설정되지 않았습니다. 백그라운드 작업 콜백에 문제가 발생할 수 있습니다.")
+        logging.warning("`--base-url` or `AIBOX_BASE_URL` is not set. This may cause issues with background job callbacks.")
 
-    logging.info("[2/8] 기본 설정(Config) 로드 완료.")
+    logging.info("[2/8] Default configuration loaded.")
     
     # [제안 반영] argparse 대신 환경 변수에서 비밀번호를 로드합니다.
     CONFIG['password'] = os.getenv('AIBOX_PASSWORD')
     if not CONFIG.get('password'):
-        logging.info("[3/8] AIBOX_PASSWORD 환경 변수가 설정되지 않았습니다.")
+        logging.info("[3/8] AIBOX_PASSWORD environment variable is not set.")
         logging.error("FATAL: Password is not set. Please set the AIBOX_PASSWORD environment variable.")
         sys.exit(1)
     
     # [사용자 요청] 세마포어 값 로깅
-    logging.info(f"LLM 동시 요청 수가 {MAX_CONCURRENT_LLM_REQUESTS}으로 제한됩니다.")
+    logging.info(f"Concurrent LLM requests are limited to {MAX_CONCURRENT_LLM_REQUESTS}.")
 
-    logging.info("[3/8] AIBOX_PASSWORD 환경 변수 확인 완료.")
-    logging.info("[3/8] 비밀번호(AIBOX_PASSWORD) 확인 완료.")
+    logging.info("[3/8] AIBOX_PASSWORD environment variable check complete.")
 
     # [개선] diskcache 인스턴스 초기화
     cache_size_bytes = int(args.cache_size_gb * (1024**3))
     cache = Cache(CACHE_FOLDER, size_limit=cache_size_bytes)
-    logging.info(f"[4/8] DiskCache 초기화 완료. 경로: {CACHE_FOLDER}, 최대 크기: {args.cache_size_gb} GB, TTL: {args.cache_ttl_days}일")
-    logging.info(f"[4/8] DiskCache 초기화 완료 (경로: {CACHE_FOLDER}, 크기: {args.cache_size_gb}GB, TTL: {args.cache_ttl_days}일).")
+    logging.info(f"[4/8] DiskCache initialized. Path: {CACHE_FOLDER}, Max Size: {args.cache_size_gb} GB, TTL: {args.cache_ttl_days} days")
 
     resolved_llm_url = resolve_chat_endpoint(CONFIG['llm_url'], CONFIG.get('token'))
     if resolved_llm_url: CONFIG['llm_url'] = resolved_llm_url
     else: logging.warning(f"Could not automatically determine API type for '{CONFIG['llm_url']}'.")
-    logging.info(f"[5/8] LLM 엔드포인트 확인 완료. 최종 URL: {CONFIG['llm_url']}")
-    logging.info(f"[5/8] LLM 엔드포인트 확인 완료 (URL: {CONFIG['llm_url']}).")
+    logging.info(f"[5/8] LLM endpoint check complete. Final URL: {CONFIG['llm_url']}")
 
     if not args.model:
-        logging.info("기본 모델이 지정되지 않았습니다. LLM 서버에서 사용 가능한 모델을 조회합니다...")
+        logging.info("Default model not specified. Querying available models from LLM server...")
         models = get_available_models(CONFIG['llm_url'], CONFIG.get('token'))
         if models:
             CONFIG['model'] = models[0]
-            logging.info(f" -> 사용 가능한 모델: {models}. 기본 모델로 '{CONFIG['model']}'을(를) 설정합니다.")
-            logging.info(f" -> 사용 가능 모델: {models}. 기본 모델로 '{CONFIG['model']}'을(를) 설정합니다.")
+            logging.info(f" -> Available models: {models}. Setting '{CONFIG['model']}' as the default model.")
         else:
-            logging.error("LLM 서버에서 사용 가능한 모델을 찾을 수 없습니다. --model 인자가 필요합니다.")
+            logging.error("Could not find available models from the LLM server. The --model argument is required.")
             parser.error("--model is required as no models could be auto-detected.")
 
     CONFIG["schedule_file"] = os.path.abspath(args.schedule_file)
     CONFIG["scheduler_log_file"] = os.path.abspath(args.scheduler_log_file)
 
     initialize_and_monitor_prompts()
-    logging.info(f"[6/8] 프롬프트 초기화 및 모니터링 시작 완료. ({PROMPTS_FILE})")
-    logging.info(f"[6/8] 프롬프트 초기화 및 모니터링 시작 완료 ({PROMPTS_FILE}).")
+    logging.info(f"[6/8] Prompt initialization and monitoring started. ({PROMPTS_FILE})")
     setup_scheduler()
-    logging.info(f"[7/8] 스케줄러 설정 완료. (DB: jobs.sqlite, 로그: {CONFIG['scheduler_log_file']})")
+    logging.info(f"[7/8] Scheduler setup complete. (DB: jobs.sqlite, Log: {CONFIG['scheduler_log_file']})")
 
     # [제안 반영] CORS 설정을 환경 변수에서 가져오도록 수정
     cors_origins = os.getenv('CORS_ORIGINS', '*').split(',')
     CORS(app, resources={r"/AIBox/api/*": {"origins": cors_origins}})
-    logging.info(f"[8/8] CORS 설정 완료. 허용된 오리진: {cors_origins}")
+    logging.info(f"[8/8] CORS setup complete. Allowed origins: {cors_origins}")
 
     logging.info("==========================================================")
-    logging.info(f"  AIBox 서버가 http://{args.host}:{args.port} 에서 시작됩니다.  ")
+    logging.info(f"  AIBox Server starting on http://{args.host}:{args.port}  ")
     logging.info("==========================================================")
     # [사용자 요청] 연결 한도를 늘려 "total open connections reached the connection limit" 오류를 방지합니다.
     serve(app, host=args.host, port=args.port, threads=16, connection_limit=args.connection_limit)

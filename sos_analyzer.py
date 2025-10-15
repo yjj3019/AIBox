@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 # -*- coding: utf-8 -*-
 # ==============================================================================
 # Smart sosreport Analyzer - The Truly Final & Stabilized Edition
@@ -120,6 +120,23 @@ class SosreportParser:
         self.device_map = self._create_device_map() # [개선] 장치명 매핑 정보 생성
         self.metadata = {'device_map': self.device_map} # [추가] 메타데이터에 장치 맵 추가
         self.dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
+        # [사용자 요청] HA 클러스터 및 DRBD 정보 파싱 로직 추가
+        self.ha_cluster_info = self._parse_ha_cluster_info()
+        self.drbd_info = self._parse_drbd_info()
+        if self.ha_cluster_info:
+            self.metadata['ha_cluster_info'] = self.ha_cluster_info
+        if self.drbd_info:
+            self.metadata['drbd_info'] = self.drbd_info
+
+        # [사용자 요청] 메타데이터에 호스트 이름 추가
+        hostname = self._read_file(['hostname'])
+        if hostname != 'N/A':
+            self.metadata['hostname'] = hostname
+
+        # [사용자 요청] 메타데이터에 OS 릴리스 정보 추가
+        os_release = self._read_file(['etc/redhat-release'])
+        if os_release != 'N/A':
+            self.metadata['os_release'] = os_release
         logging.info(f"  - 파서 초기화 완료. 분석 대상 경로: '{self.base_path}'")
 
     def _read_file(self, possible_paths: List[str], default: str = 'N/A') -> str:
@@ -159,8 +176,9 @@ class SosreportParser:
         if self.report_date is None:
             logging.warning(Color.warn("'date' 파일에서 날짜를 파싱하지 못했습니다. sosreport 디렉터리 이름에서 날짜 추출을 시도합니다."))
             try:
-                # sosreport-hostname-YYYY-MM-DD-xxxxxx 형식의 날짜를 찾습니다.
-                if match := re.search(r'(\d{4})-(\d{2})-(\d{2})', self.base_path.name):
+                # [BUG FIX] Python 3.8 미만 버전과의 호환성을 위해 할당 표현식(:=)을 사용하지 않도록 수정합니다.
+                match = re.search(r'(\d{4})-(\d{2})-(\d{2})', self.base_path.name)
+                if match:
                     year, month, day = map(int, match.groups())
                     self.report_date = datetime.datetime(year, month, day)
                     logging.info(f"  - 분석 기준 날짜를 'sosreport 디렉터리명' 기준으로 설정: {self.report_date.strftime('%Y-%m-%d')}")
@@ -175,7 +193,8 @@ class SosreportParser:
 
     def _initialize_cpu_cores(self):
         lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu'])
-        if match := re.search(r'^CPU\(s\):\s+(\d+)', lscpu_output, re.MULTILINE): self.cpu_cores_count = int(match.group(1))
+        match = re.search(r'^CPU\(s\):\s+(\d+)', lscpu_output, re.MULTILINE)
+        if match: self.cpu_cores_count = int(match.group(1))
 
     def _create_device_map(self) -> Dict[str, str]:
         """
@@ -198,7 +217,8 @@ class SosreportParser:
             for line in lsblk_content.split('\n')[1:]:
                 # [BUG FIX] 장치 이름에 하이픈(-)이 포함된 경우(예: rhel-root)를 처리하도록 정규식 수정
                 # NAME, MAJ:MIN, ... (장치 이름에 하이픈, 백틱, 파이프, 작은따옴표 포함 가능)
-                match = re.search(r'^([\w\-\`|\'\s]+)\s+(\d+:\d+)', line)
+                # [BUG FIX] Python 3.8 미만 버전과의 호환성을 위해 할당 표현식(:=)을 사용하지 않도록 수정합니다.
+                match = re.search(r'^([\w\-\`|\'\s]+)\s+(\d+:\d+)', line) # noqa: W605
                 if match:
                     name, maj_min = match.groups()
                     # dmsetup에서 이미 매핑된 정보가 아니라면 추가
@@ -207,6 +227,78 @@ class SosreportParser:
                         device_map[maj_min] = name.strip('|-`')
 
         return device_map
+
+    def _parse_ha_cluster_info(self) -> Dict[str, Any]:
+        """[신규] Pacemaker, Corosync 등 HA 클러스터 관련 정보를 파싱합니다."""
+        logging.info("  - HA 클러스터 정보 파싱 중...")
+        ha_info: Dict[str, Any] = {}
+
+        # 1. crm_report 또는 crm status 파싱
+        crm_report_content = self._read_file(['sos_commands/pacemaker/crm_report', 'sos_commands/pacemaker/crm_status'])
+        if crm_report_content != 'N/A':
+            ha_info['crm_report'] = crm_report_content
+            # 간단한 상태 정보 추출
+            if "OFFLINE" in crm_report_content:
+                ha_info['nodes_offline'] = re.findall(r'OFFLINE:\s*\[\s*([^\]]+)\s*\]', crm_report_content)
+            if "Failed Actions" in crm_report_content:
+                ha_info['failed_actions'] = True
+
+        # 2. cib.xml 파싱 (리소스 및 제약 조건)
+        cib_content = self._read_file(['cib.xml', 'var/lib/pacemaker/cib/cib.xml'])
+        if cib_content != 'N/A':
+            try:
+                root = ET.fromstring(cib_content)
+                ha_info['resources'] = [res.get('id') for res in root.findall(".//primitive")]
+                ha_info['constraints'] = {
+                    'location': [loc.get('id') for loc in root.findall(".//rsc_location")],
+                    'colocation': [co.get('id') for co in root.findall(".//rsc_colocation")],
+                    'order': [ord.get('id') for ord in root.findall(".//rsc_order")]
+                }
+            except ET.ParseError:
+                logging.warning("cib.xml 파싱에 실패했습니다.")
+
+        # 3. corosync.conf 파싱
+        corosync_conf_content = self._read_file(['etc/corosync/corosync.conf'])
+        if corosync_conf_content != 'N/A':
+            ha_info['corosync_config'] = corosync_conf_content
+
+        if ha_info:
+            logging.info(f"  - HA 클러스터 정보 파싱 완료: {list(ha_info.keys())}")
+        return ha_info
+
+    def _parse_drbd_info(self) -> Dict[str, Any]:
+        """[신규] DRBD 관련 정보를 파싱합니다."""
+        logging.info("  - DRBD 정보 파싱 중...")
+        drbd_info: Dict[str, Any] = {}
+
+        # 1. /proc/drbd 상태 파싱
+        proc_drbd_content = self._read_file(['proc/drbd'])
+        if proc_drbd_content != 'N/A':
+            drbd_info['proc_drbd_status'] = proc_drbd_content
+            resources = []
+            for line in proc_drbd_content.splitlines():
+                # " 0: cs:Connected ro:Primary/Secondary ds:UpToDate/UpToDate C r-----"
+                match = re.match(r'^\s*(\d+):\s*(cs:\S+)\s*(ro:\S+)\s*(ds:\S+)', line)
+                if match:
+                    res_id, cs, ro, ds = match.groups()
+                    resource_status = {'id': res_id, 'connection': cs, 'roles': ro, 'disk_states': ds}
+                    resources.append(resource_status)
+                    # Split-brain 감지
+                    if 'Primary/Primary' in ro or 'Secondary/Secondary' in ro:
+                        resource_status['warning'] = 'Potential Split-Brain detected in roles.'
+                    if 'Inconsistent' in ds:
+                        resource_status['warning'] = 'Inconsistent disk state detected.'
+            if resources:
+                drbd_info['resources'] = resources
+
+        # 2. drbd.conf 파싱
+        drbd_conf_content = self._read_file(['etc/drbd.conf'])
+        if drbd_conf_content != 'N/A':
+            drbd_info['drbd_config'] = drbd_conf_content
+
+        if drbd_info:
+            logging.info(f"  - DRBD 정보 파싱 완료: {list(drbd_info.keys())}")
+        return drbd_info
 
     def _safe_float(self, value: Any) -> float:
         """[개선] 입력값을 float으로 안전하게 변환합니다."""
@@ -220,16 +312,21 @@ class SosreportParser:
     def _parse_system_details(self) -> Dict[str, Any]:
         logging.info("  - [1/8] 시스템 기본 정보 파싱 중...")
         lscpu_output = self._read_file(['lscpu', 'sos_commands/processor/lscpu']); meminfo = self._read_file(['proc/meminfo']); dmidecode = self._read_file(['dmidecode', 'sos_commands/hardware/dmidecode'])
-        mem_total_match = re.search(r'MemTotal:\s+(\d+)\s+kB', meminfo); cpu_model_match = re.search(r'Model name:\s+(.+)', lscpu_output); model_match = re.search(r'Product Name:\s*(.*)', dmidecode)
+        mem_total_match = re.search(r'MemTotal:\s+(\d+)\s+kB', meminfo)
+        cpu_model_match = re.search(r'Model name:\s+(.+)', lscpu_output)
+        model_match = re.search(r'Product Name:\s*(.*)', dmidecode)
         cpu_str = f"{self.cpu_cores_count} x {cpu_model_match.group(1).strip()}" if self.cpu_cores_count > 0 and cpu_model_match else 'N/A'
-        uptime_content = self._read_file(['uptime', 'sos_commands/general/uptime']); uptime_str = "N/A"
-        if uptime_match := re.search(r'up\s+(.*?),\s*\d+\s+user', uptime_content): uptime_str = uptime_match.group(1).strip()
+        uptime_content = self._read_file(['uptime', 'sos_commands/general/uptime'])
+        uptime_str = "N/A"
+        uptime_match = re.search(r'up\s+(.*?),\s*\d+\s+user', uptime_content)
+        if uptime_match: uptime_str = uptime_match.group(1).strip()
         uname_content = self._read_file(['uname', 'sos_commands/kernel/uname_-a']); kernel_str = uname_content.split()[2] if len(uname_content.split()) >= 3 else uname_content
         
         # [사용자 요청 & xsos 참고] /proc/stat의 btime을 사용하여 부팅 시간을 epoch 초 형식으로 가져옵니다.
         proc_stat_content = self._read_file(['proc/stat'])
         boot_time_str = "N/A"
-        if btime_match := re.search(r'^btime\s+(\d+)', proc_stat_content, re.MULTILINE):
+        btime_match = re.search(r'^btime\s+(\d+)', proc_stat_content, re.MULTILINE)
+        if btime_match:
             try:
                 epoch_time = int(btime_match.group(1))
                 # 로컬 타임존을 사용하여 datetime 객체로 변환
@@ -290,16 +387,23 @@ class SosreportParser:
         netdev_content = self._read_file(['proc/net/dev'])
         for line in netdev_content.split('\n')[2:]:
             if ':' in line:
-                iface, stats = line.split(':', 1); iface, stat_values = iface.strip(), stats.split(); all_ifaces.add(iface)
+                iface, stats = line.split(':', 1)
+                iface, stat_values = iface.strip(), stats.split()
+                all_ifaces.add(iface)
                 if len(stat_values) == 16: details['netdev'].append({ 'iface': iface, 'rx_bytes': int(stat_values[0]),'rx_packets': int(stat_values[1]), 'rx_errs': int(stat_values[2]), 'rx_drop': int(stat_values[3]), 'tx_bytes': int(stat_values[8]), 'tx_packets': int(stat_values[9]),'tx_errs': int(stat_values[10]),'tx_drop': int(stat_values[11]) })
         ip_addr_content = self._read_file(['sos_commands/networking/ip_addr', 'sos_commands/networking/ip_-d_address'])
         for block in re.split(r'^\d+:\s+', ip_addr_content, flags=re.MULTILINE)[1:]:
             iface_data = {}
-            if match := re.match(r'([\w.-]+):', block): iface_name = match.group(1); iface_data['iface'] = iface_name; all_ifaces.add(iface_name)
+            match = re.match(r'([\w.-]+):', block)
+            if match:
+                iface_name = match.group(1); iface_data['iface'] = iface_name; all_ifaces.add(iface_name)
             else: continue
-            if match := re.search(r'state\s+(\w+)', block): iface_data['state'] = match.group(1).lower()
-            if match := re.search(r'link/\w+\s+([\da-fA-F:]+)', block): iface_data['mac'] = match.group(1)
-            if match := re.search(r'inet\s+([\d.]+/\d+)', block): iface_data['ipv4'] = match.group(1)
+            match = re.search(r'state\s+(\w+)', block)
+            if match: iface_data['state'] = match.group(1).lower()
+            match = re.search(r'link/\w+\s+([\da-fA-F:]+)', block)
+            if match: iface_data['mac'] = match.group(1)
+            match = re.search(r'inet\s+([\d.]+/\d+)', block)
+            if match: iface_data['ipv4'] = match.group(1)
             # [사용자 요청] 'lo' 인터페이스를 제외하고 UP 상태인 인터페이스만 수집합니다.
             if iface_name != 'lo' and iface_data.get('state') == 'up':
                 details['interfaces'].append(iface_data)
@@ -307,21 +411,30 @@ class SosreportParser:
         if bonding_dir.is_dir():
             for bond_file in bonding_dir.iterdir():
                 bond_content = bond_file.read_text(errors='ignore'); bond_info = {'device': bond_file.name, 'slaves_info': []}
-                if match := re.search(r'Bonding Mode:\s*(.*)', bond_content): bond_info['mode'] = match.group(1).strip()
-                if match := re.search(r'MII Status:\s*(.*)', bond_content): bond_info['mii_status'] = match.group(1).strip()
+                match = re.search(r'Bonding Mode:\s*(.*)', bond_content)
+                if match: bond_info['mode'] = match.group(1).strip()
+                match = re.search(r'MII Status:\s*(.*)', bond_content)
+                if match: bond_info['mii_status'] = match.group(1).strip()
                 for slave_block in bond_content.split('Slave Interface:')[1:]:
                     slave_info = {'name': slave_block.strip().split('\n')[0].strip()}
-                    if m := re.search(r'MII Status:\s*(.*)', slave_block): slave_info['mii_status'] = m.group(1).strip()
-                    if m := re.search(r'Speed:\s*(.*)', slave_block): slave_info['speed'] = m.group(1).strip()
+                    m = re.search(r'MII Status:\s*(.*)', slave_block)
+                    if m: slave_info['mii_status'] = m.group(1).strip()
+                    m = re.search(r'Speed:\s*(.*)', slave_block)
+                    if m: slave_info['speed'] = m.group(1).strip()
                     bond_info['slaves_info'].append(slave_info)
                 details['bonding'].append(bond_info)
         for iface_name in sorted(list(all_ifaces)):
             ethtool_i = self._read_file([f'sos_commands/networking/ethtool_-i_{iface_name}']); ethtool_main = self._read_file([f'sos_commands/networking/ethtool_{iface_name}']); ethtool_g = self._read_file([f'sos_commands/networking/ethtool_-g_{iface_name}']); iface_ethtool = {}
-            if m := re.search(r'driver:\s*(.*)', ethtool_i): iface_ethtool['driver'] = m.group(1).strip()
-            if m := re.search(r'firmware-version:\s*(.*)', ethtool_i): iface_ethtool['firmware'] = m.group(1).strip()
-            if m := re.search(r'Link detected:\s*(yes|no)', ethtool_main): iface_ethtool['link'] = m.group(1)
-            if m := re.search(r'Speed:\s*(.*)', ethtool_main): iface_ethtool['speed'] = m.group(1).strip()
-            if m := re.search(r'Duplex:\s*(.*)', ethtool_main): iface_ethtool['duplex'] = m.group(1).strip()
+            m = re.search(r'driver:\s*(.*)', ethtool_i)
+            if m: iface_ethtool['driver'] = m.group(1).strip()
+            m = re.search(r'firmware-version:\s*(.*)', ethtool_i)
+            if m: iface_ethtool['firmware'] = m.group(1).strip()
+            m = re.search(r'Link detected:\s*(yes|no)', ethtool_main)
+            if m: iface_ethtool['link'] = m.group(1)
+            m = re.search(r'Speed:\s*(.*)', ethtool_main)
+            if m: iface_ethtool['speed'] = m.group(1).strip()
+            m = re.search(r'Duplex:\s*(.*)', ethtool_main)
+            if m: iface_ethtool['duplex'] = m.group(1).strip()
             rx_max_match = re.search(r'RX:\s*(\d+)', ethtool_g)
             rx_now_match = re.search(r'Current hardware settings:[\s\S]*?RX:\s*(\d+)', ethtool_g)
             iface_ethtool['rx_ring'] = f"{rx_now_match.group(1)}/{rx_max_match.group(1)}" if rx_now_match and rx_max_match else 'N/A'
@@ -470,7 +583,7 @@ class SosreportParser:
             return []
 
         try:
-            content = self._run_sar_command(sar_binary_path, str(target_sar_file), option)
+            content = self._run_sar_command(sar_binary_path, target_sar_file, option)
         except Exception:
             return [] # 명령어 실행 실패 시 빈 리스트 반환
 
@@ -511,7 +624,7 @@ class SosreportParser:
 
         try:
             # [BUG FIX] 로케일에 따라 소수점이 쉼표(,)로 표시되는 경우를 처리하기 위해 decimal=',' 추가
-            df = pd.read_csv(data_io, sep=r'\s+', header=None, engine='python', decimal=',')
+            df = pd.read_csv(data_io, sep=r'\s+', header=None, engine='python', decimal=",")
             if df.empty:
                 return []
 
@@ -729,7 +842,7 @@ class SosreportParser:
         if not sar_section_data or not IS_PYTZ_AVAILABLE: return None
         closest_entry, min_delta = None, timedelta.max
         target_dt_utc = target_dt.astimezone(pytz.utc) if IS_PYTZ_AVAILABLE and target_dt.tzinfo else target_dt
-        for entry in sar_section_data:
+        for entry in sar_section_data: # noqa: E501
             try:
                 entry_dt = datetime.datetime.fromisoformat(entry['timestamp']); delta = abs(entry_dt - target_dt_utc)
                 if delta < min_delta: min_delta, closest_entry = delta, entry
@@ -741,7 +854,8 @@ class SosreportParser:
         log_content = self._read_file(['var/log/messages', 'var/log/syslog']); critical_events = []
         if log_content == 'N/A': return {"critical_log_events": []}
         for line in log_content.split('\n'):
-            if match := re.match(r'^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', line):
+            match = re.match(r'^([A-Za-z]{3}\s+\d{1-2}\s+\d{2}:\d{2}:\d{2})', line)
+            if match:
                 try: log_dt = datetime.datetime.strptime(f"{self.report_date.year} {match.group(1)}", '%Y %b %d %H:%M:%S')
                 except ValueError: continue
                 event_type, context = None, {}
@@ -757,11 +871,14 @@ class SosreportParser:
     def _analyze_performance_bottlenecks(self, sar_data: Dict) -> Dict:
         logging.info("  - [8/8] 성능 병목 현상 분석 중...")
         analysis = {}
-        if cpu_data := sar_data.get('cpu'):
+        cpu_data = sar_data.get('cpu')
+        if cpu_data:
             if high_iowait := [d for d in cpu_data if d.get('pct_iowait', 0) > 20]: analysis['io_bottleneck'] = f"CPU I/O Wait이 20%를 초과한 경우가 {len(high_iowait)}번 감지되었습니다."
-        if load_data := sar_data.get('load'):
+        load_data = sar_data.get('load')
+        if load_data:
             if self.cpu_cores_count > 0 and (high_load := [d for d in load_data if d.get('ldavg-5', 0) > self.cpu_cores_count * 1.5]): analysis['high_load_average'] = f"5분 평균 부하가 CPU 코어 수의 1.5배를 초과한 경우가 {len(high_load)}번 감지되었습니다."
-        if swap_data := sar_data.get('swap'):
+        swap_data = sar_data.get('swap')
+        if swap_data:
             if swap_data and (max_swap := max(d.get('pct_swpused',0) for d in swap_data)) > 10: analysis['swap_usage'] = f"최대 스왑 사용률이 {max_swap:.1f}%에 달했습니다."
         return analysis
 
@@ -788,6 +905,38 @@ class SosreportParser:
             (re.compile(r'0x[0-9a-fA-F]+'), '<HEX_ADDR>'), # 16진수 주소/값
             (re.compile(r'sd[a-z]\d*'), '<DEVICE>'), # 디스크 장치명 (sda, sdb1 등)
             (re.compile(r'session\s\d+'), 'session <SESSION_ID>'), # 세션 ID
+            # [사용자 요청] Pacemaker/Corosync 관련 패턴 추가
+            (re.compile(r'pengine-[0-9]+'), 'pengine-<PID>'),
+            (re.compile(r'cib-[0-9]+'), 'cib-<PID>'),
+            (re.compile(r'crmd-[0-9]+'), 'crmd-<PID>'),
+            (re.compile(r'pacemaker-schedulerd\[\d+\]'), 'pacemaker-schedulerd[<PID>]'),
+            (re.compile(r'pacemaker-controld\[\d+\]'), 'pacemaker-controld[<PID>]'),
+            (re.compile(r'pacemaker-execd\[\d+\]'), 'pacemaker-execd[<PID>]'),
+            (re.compile(r'stonith-ng-[0-9]+'), 'stonith-ng-<PID>'),
+            (re.compile(r'corosync\[\d+\]'), 'corosync[<PID>]'),
+            (re.compile(r'pacemakerd\[\d+\]'), 'pacemakerd[<PID>]'),
+            (re.compile(r'transition [0-9]+'), 'transition <ID>'),
+            # [사용자 요청] DRBD 관련 로그 패턴 추가
+            (re.compile(r'drbd\s+[\w_]+/\d+\s+drbd\d+'), 'drbd <RESOURCE>/<VOL> <DEVICE>'),
+            (re.compile(r'drbd\s+[\w_]+:'), 'drbd <RESOURCE>:'),
+            (re.compile(r'drbd\s+[\w_]+\s+[\w\d_]+:'), 'drbd <RESOURCE> <PEER_HOST>:'),
+            (re.compile(r'conn\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'conn(<STATE> -> <STATE>)'),
+            (re.compile(r'disk\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'disk(<STATE> -> <STATE>)'),
+            (re.compile(r'peer\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'peer(<STATE> -> <STATE>)'),
+            (re.compile(r'pdsk\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'pdsk(<STATE> -> <STATE>)'),
+            (re.compile(r'repl\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'repl(<STATE> -> <STATE>)'),
+            (re.compile(r'role\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'role(<STATE> -> <STATE>)'),
+            (re.compile(r'([0-9a-fA-F]{16}:){3}[0-9a-fA-F]{16}'), '<DRBD_UUID_CHAIN>'),
+            (re.compile(r'\b[0-9a-fA-F]{16}\b'), '<DRBD_UUID>'),
+            (re.compile(r'version\s\d+\s'), 'version <NUM> '),
+            (re.compile(r'capacity\s*==\s*\d+'), 'capacity == <NUM>'),
+            (re.compile(r'size\s*=\s*[\d.]+\s*\w+\s*\([\d.]+\s*\w+\)'), 'size = <SIZE>'),
+            (re.compile(r'agreed network protocol version\s+\d+'), 'agreed network protocol version <VERSION>'),
+            (re.compile(r'state change\s+\d+'), 'state change <ID>'),
+            (re.compile(r't=\d+'), 't=<TID>'),
+            (re.compile(r'call=\d+'), 'call=<CALL_ID>'),
+            # [사용자 요청] DRBD 관련 패턴 추가
+            (re.compile(r'drbd \d+'), 'drbd <RES_ID>'),
         ]
 
         # 1. 모든 로그 라인을 읽어 패턴화하고 빈도수 계산
@@ -820,7 +969,10 @@ class SosreportParser:
         # 2. 빈도수 기반으로 유의미한 로그 필터링
         smart_log_analysis = {}
         ANOMALY_THRESHOLD = 5
-        ERROR_KEYWORDS = re.compile(r'\b(error|failed|failure|critical|panic|denied|segfault)\b', re.IGNORECASE)
+        # [사용자 요청] HA 및 DRBD 관련 키워드 추가
+        ERROR_KEYWORDS = re.compile( # [개선] Pacemaker 오류를 더 잘 탐지하기 위해 키워드 추가
+            r'\b(error|failed|failure|critical|panic|denied|segfault|stonith|fencing|fence|split-brain|standby|primary|secondary|sync|failover|quorum|unfenced|inconsistent|timed out|target is busy|unexpected|couldn\'t)\b',
+            re.IGNORECASE)
 
         for (filename, pattern), count in all_patterns.items():
             # 희귀 패턴(Anomaly)이거나, 자주 발생하지만 오류 키워드를 포함하는 패턴(Error Storm)만 선택
@@ -969,8 +1121,9 @@ class HTMLReportGenerator:
         # [사용자 요청 반영] 루트('/') 파일시스템의 sar 장치명을 찾는 로직 개선
         # [수정] _find_representative_disk 함수를 호출하여 대표 디바이스를 찾습니다.
         root_device_name = self._find_representative_disk()
-        representative_disk_data = [d for d in disk_detail_data if d.get('DEV') == root_device_name] if root_device_name else [] # yapf: disable
-
+        representative_disk_data = []
+        if root_device_name:
+            representative_disk_data = [d for d in disk_detail_data if d.get('DEV') == root_device_name]
         if representative_disk_data:
             # [사용자 요청] dev{major}-{minor}를 문자 장치명으로 변환
             major, minor = root_device_name[3:].split('-')
@@ -1521,6 +1674,7 @@ class AIAnalyzer:
 
         return f"""[시스템 역할]
 당신은 20년 경력의 Red Hat Certified Architect(RHCA)이자 리눅스 성능 분석 전문가입니다. 주어진 시스템 데이터의 각 섹션별 요약본을 종합하여, 시스템의 상태를 진단하고 문제의 근본 원인을 찾아 구체적인 해결 방안을 제시해야 합니다.
+**특히, HA 클러스터(Pacemaker, Corosync) 및 DRBD 관련 데이터가 있는 경우, 클러스터의 안정성, 리소스 상태, 잠재적 위험(예: split-brain, 리소스 모니터링 실패, failover 문제)을 최우선으로 분석해야 합니다.**
 
 [분석 대상: 시스템 데이터 섹션별 요약]
 {summaries_text}
@@ -1528,20 +1682,65 @@ class AIAnalyzer:
 [출력 형식]
 위 요약본들을 종합적으로 분석하여, 다음의 키를 가진 단일 JSON 객체로만 반환하십시오. 다른 설명은 절대 추가하지 마세요.
 
-`summary` 필드는 다음의 마크다운 구조를 반드시 사용해야 합니다:
-**종합 평가 (Overall Assessment):** <시스템의 전반적인 상태에 대한 1~2 문장의 평가 (예: '양호', '주의', '심각') 및 핵심 근거>
-**주요 발견 사항 (Key Findings):**
+`summary` 필드는 다음의 마크다운 구조를 반드시 사용해야 합니다. 각 섹션은 '###' 헤더로 시작해야 합니다.
+### 종합 평가 (Overall Assessment)
+<시스템의 전반적인 상태에 대한 1~2 문장의 평가 (예: '양호', '주의', '심각') 및 핵심 근거>
+### 주요 발견 사항 (Key Findings)
 * <가장 중요한 발견점 1>
 * <가장 중요한 발견점 2>
-**최우선 권장 사항 (Top Priority Recommendation):** <가장 시급하게 조치해야 할 단 한 가지의 핵심 권장 사항>
+### 최우선 권장 사항 (Top Priority Recommendation)
+<가장 시급하게 조치해야 할 단 한 가지의 핵심 권장 사항>
 
 ```json
-{{
+{{{{
   "summary": "위의 마크다운 구조에 따라 시스템의 전반적인 상태, 주요 발견 사항, 핵심 권장 사항을 요약합니다.",
-  "critical_issues": ["시스템 안정성에 즉각적인 영향을 미치는 심각한 문제점 목록 (예: Kernel panic, OOM Killer 발생)"],
+  "critical_issues": ["시스템 안정성에 즉각적인 영향을 미치는 심각한 문제점 목록 (예: Kernel panic, OOM Killer 발생, 클러스터 장애, Split-brain)"],
   "warnings": ["주의가 필요하거나 잠재적인 문제로 발전할 수 있는 경고 사항 목록 (예: 높은 I/O 대기, 특정 로그의 반복적인 오류)"],
-  "recommendations": [ {{ "priority": "높음/중간/낮음", "category": "성능/안정성/보안/구성", "issue": "구체적인 문제점 기술", "solution": "문제 해결을 위한 구체적이고 실행 가능한 단계별 가이드 또는 명령어", "related_logs": ["분석의 근거가 된 특정 로그 메시지 (있는 경우)"] }} ]
-}}
+  "recommendations": [ {{{{ "priority": "높음/중간/낮음", "category": "성능/안정성/보안/구성", "issue": "구체적인 문제점 기술", "solution": "문제 해결을 위한 구체적이고 실행 가능한 단계별 가이드 또는 명령어", "related_logs": ["분석의 근거가 된 특정 로그 메시지 (있는 경우)"] }}}} ]
+}}}}
+```"""
+
+    def _create_final_analysis_prompt(self, summaries: Dict[str, str]) -> str:
+        """[신규] 개별 청크 요약본들을 종합하여 최종 분석을 위한 프롬프트를 생성합니다."""
+        summaries_text = "\n".join(f"- **{name}**: {summary}" for name, summary in summaries.items())
+
+        # [사용자 요청] AI의 역할을 RHEL 시스템 전반을 분석하는 최고 전문가로 재정의하고, HA/DRBD는 심층 분석의 한 부분으로 조정합니다.
+        return f"""[시스템 역할]
+당신은 20년 경력의 Red Hat Certified Architect(RHCA)이자, 고객에게 시스템 장애의 근본 원인을 보고하고 해결책을 제시하는 최고 수준의 기술 컨설턴트입니다. 당신의 분석은 단순한 사실 나열을 넘어, 각 데이터 간의 인과 관계를 추론하고, 비즈니스 영향까지 고려한 깊이 있는 통찰력을 제공해야 합니다.
+
+[분석 방법론]
+1.  **전체 시스템 상태 평가 (Holistic Review):** 먼저 CPU, 메모리, I/O, 네트워크 등 전반적인 시스템 성능 지표와 커널 로그(dmesg), 시스템 로그를 종합적으로 검토하여 시스템의 전반적인 건강 상태와 이상 징후를 파악합니다.
+2.  **고가용성(HA) 클러스터 심층 분석 (Deep Dive):** 만약 `ha_cluster_info` 또는 `drbd_info` 데이터가 있다면, 1단계에서 파악한 시스템 문제와 연관 지어 클러스터의 문제를 분석합니다.
+    *   **Pacemaker:** `Failed Actions`, `OFFLINE` 노드, `stonith` 로그를 분석하여 클러스터 불안정의 원인을 찾습니다. 리소스 모니터링 실패(`monitor error`, `Timed Out`)가 시스템의 다른 문제(예: I/O 병목)와 관련이 있는지 추론해야 합니다.
+    *   **DRBD:** `cs`(Connection State), `ro`(Roles), `ds`(Disk States)의 상태 변화를 추적합니다. `StandAlone` 또는 `Split-Brain` 상태가 감지되면, 그 원인이 네트워크 문제인지, 디스크 I/O 오류인지, 아니면 관리자의 수동 개입 때문인지 종합적으로 판단해야 합니다.
+3.  **근본 원인 추론 (Root Cause Analysis):** 각 데이터 조각을 독립적으로 보지 말고, "높은 I/O 대기(high iowait)가 디스크 응답 시간 지연을 초래했고, 이로 인해 DRBD 연결이 끊어지면서(StandAlone) 최종적으로 Pacemaker 리소스가 타임아웃 오류를 일으켰다"와 같이 문제의 원인과 결과를 연결하는 시나리오를 구성해야 합니다.
+4.  **고객 중심의 해결책 제시 (Customer-Centric Solution):**
+    *   **비즈니스 영향:** 발견된 문제가 비즈니스에 미치는 영향(예: 서비스 중단, 데이터 정합성 문제)을 명확히 설명합니다.
+    *   **우선순위:** 해결책에 대해 '긴급', '높음', '중간', '낮음'과 같은 명확한 우선순위를 부여합니다.
+    *   **재발 방지:** 단기적인 해결책뿐만 아니라, 근본적인 문제 해결과 재발 방지를 위한 중장기적인 개선 방안(예: 커널 파라미터 튜닝, 모니터링 강화)을 함께 제시합니다.
+
+[분석 대상: 시스템 데이터 섹션별 요약]
+{summaries_text}
+
+[출력 형식]
+위 요약본들을 종합적으로 분석하여, 다음의 키를 가진 단일 JSON 객체로만 반환하십시오. 다른 설명은 절대 추가하지 마세요.
+
+`summary` 필드는 다음의 마크다운 구조를 반드시 사용해야 합니다. 각 섹션은 '###' 헤더로 시작해야 합니다.
+### 종합 평가 (Overall Assessment)
+<시스템의 전반적인 상태에 대한 1~2 문장의 평가 (예: '양호', '주의', '심각') 및 핵심 근거>
+### 주요 발견 사항 (Key Findings)
+* <가장 중요한 발견점 1>
+* <가장 중요한 발견점 2>
+### 최우선 권장 사항 (Top Priority Recommendation)
+<가장 시급하게 조치해야 할 단 한 가지의 핵심 권장 사항>
+
+```json
+{{{{
+  "summary": "위의 마크다운 구조에 따라 시스템의 전반적인 상태, 주요 발견 사항, 핵심 권장 사항을 요약합니다.",
+  "critical_issues": ["시스템 안정성에 즉각적인 영향을 미치는 심각한 문제점 목록 (예: Kernel panic, OOM Killer 발생, 클러스터 장애, Split-brain)"],
+  "warnings": ["주의가 필요하거나 잠재적인 문제로 발전할 수 있는 경고 사항 목록 (예: 높은 I/O 대기, 특정 로그의 반복적인 오류)"],
+  "recommendations": [ {{{{ "priority": "높음/중간/낮음", "category": "성능/안정성/보안/구성", "issue": "구체적인 문제점 기술", "solution": "문제 해결을 위한 구체적이고 실행 가능한 단계별 가이드 또는 명령어", "related_logs": ["분석의 근거가 된 특정 로그 메시지 (있는 경우)"] }}}} ]
+}}}}
 ```"""
 
     def get_structured_analysis(self, metadata_path: Path, sar_data_path: Path, anonymize: bool = False) -> Dict[str, Any]:
@@ -1573,7 +1772,7 @@ class AIAnalyzer:
             # [핵심 개선] SAR 데이터에 대한 스마트 분석 수행
             # CPU 코어 수 파싱 (문자열 'x' 기준)
             cpu_info_str = metadata.get('system_info', {}).get('cpu', '1 x')
-            try:
+            try: # noqa: E501
                 cpu_cores = int(cpu_info_str.split('x')[0].strip())
             except (ValueError, IndexError):
                 cpu_cores = 1 # 파싱 실패 시 기본값
@@ -1584,6 +1783,9 @@ class AIAnalyzer:
             # 1. AI 분석에 필요한 핵심 데이터만 선별합니다.
             essential_data = {
                 "system_info": metadata.get("system_info"),
+                # [사용자 요청] HA 클러스터 및 DRBD 정보 추가
+                "ha_cluster_info": metadata.get("ha_cluster_info"),
+                "drbd_info": metadata.get("drbd_info"),
                 "performance_analysis": metadata.get("performance_analysis"),
                 "critical_log_events": metadata.get("critical_log_events"),
                 "smart_sar_analysis": smart_sar_results,
@@ -1865,10 +2067,26 @@ class AIAnalyzer:
                 enriched_advisory = {**cve_details_map[cve_id], **advisory}
                 enriched_final_cves.append(enriched_advisory)
 
-        # 최종 정렬 및 반환
-        enriched_final_cves.sort(key=lambda x: (x.get('severity') == 'critical', self._safe_float(x.get('cvss_score', 0.0))), reverse=True)
-        logging.info(Color.success(f"\nAI 종합 분석 완료. 최종 {len(enriched_final_cves)}개의 긴급 보안 위협을 선정했습니다."))
-        return enriched_final_cves[:20]
+        # [사용자 요청] 패키지당 하나의 CVE만 선정하도록 최종 필터링 로직 추가
+        final_report_cves = []
+        seen_packages = set()
+
+        # AI가 정렬한 순서대로 순회
+        for cve in enriched_final_cves:
+            # AI 분석 결과에서 패키지 이름을 가져옴
+            package_name = cve.get('package')
+            if not package_name:
+                continue
+
+            # 이미 이 패키지에 대한 CVE가 선정되지 않았다면
+            if package_name not in seen_packages:
+                final_report_cves.append(cve)
+                seen_packages.add(package_name)
+
+        # 최종 정렬 (심각도, CVSS 점수 순) 및 상위 20개 반환
+        final_report_cves.sort(key=lambda x: (x.get('severity') == 'critical', self._safe_float(x.get('cvss_score', 0.0))), reverse=True)
+        logging.info(Color.success(f"\nAI 종합 분석 완료. 최종 {len(final_report_cves)}개의 고유 패키지 기반 긴급 보안 위협을 선정했습니다."))
+        return final_report_cves[:20]
     
     def _add_installed_version_to_advisories(self, advisories: List[Dict], installed_packages: List[Dict]) -> List[Dict]:
         """[신규] AI가 선정한 보안 권고 목록에 실제 설치된 패키지 버전 정보를 추가합니다."""
@@ -1890,13 +2108,25 @@ class AIAnalyzer:
         # AI에게 전달할 데이터 형식에 맞게 입력 데이터를 가공합니다.
         cves_for_prompt = []
         for cve in cve_chunk:
+            # [BUG FIX] cve 객체가 None인 경우를 처리하여 TypeError를 방지합니다.
+            if not cve:
+                logging.warning("None 타입의 CVE 데이터가 감지되어 건너뜁니다.")
+                continue
+
+            # [BUG FIX] security.py의 안정적인 프롬프트 생성 로직을 적용하여 AI 분석 정확도를 높입니다.
+            # CVE 요약, CVSS 벡터, 영향받는 패키지 등 AI가 중요도를 판단하는 데 필수적인 정보를 추가합니다.
             cvss_score = (cve.get('cvss3', {}) or {}).get('cvss3_base_score') or cve.get('cvss3_score') or 'N/A'
+            cvss_vector = (cve.get('cvss3', {}) or {}).get('cvss3_vector') or 'N/A'
+            summary = " ".join(cve.get('details', [])) or cve.get('statement', '')
+            affected_packages = list(set(re.match(r'([^-\s]+)', p.get('package_name', '')).group(1) for p in cve.get('package_state', []) if p.get('fix_state') == 'Affected' and re.match(r'([^-\s]+)', p.get('package_name', ''))))
 
             cves_for_prompt.append({
                 "cve_id": cve.get('CVE', 'N/A'),
                 "severity": cve.get('threat_severity', 'N/A'),
                 "cvss_score": cvss_score,
-                "package_state": cve.get('package_state', [])
+                "cvss_vector": cvss_vector,
+                "summary": summary,
+                "affected_packages": affected_packages
             })
 
         prompt = f"""[시스템 역할]
@@ -1920,10 +2150,21 @@ class AIAnalyzer:
 ```"""
         response = self._make_request('cve/analyze', {"prompt": prompt})
         # AI 응답이 JSON 배열이 아닐 경우를 대비하여 안전하게 처리
-        if isinstance(response, list):
+        # [BUG FIX] AI가 JSON 객체(dict)로 응답하는 경우, 'raw_response'나 다른 키에서 CVE 목록을 추출하도록 수정합니다.
+        if isinstance(response, list): # 가장 이상적인 경우
             return response
-        elif isinstance(response, dict) and 'selected_cves' in response: # 혹시 모를 다른 형식
-            return response['selected_cves']
+        elif isinstance(response, dict):
+            # 1. 'selected_cves' 키 확인 (기존 호환성)
+            if 'selected_cves' in response and isinstance(response['selected_cves'], list):
+                return response['selected_cves']
+            # 2. 'raw_response' 키에서 정규식으로 CVE ID 추출 (가장 안정적인 폴백)
+            raw_text = response.get('raw_response', str(response))
+            extracted_cves = re.findall(r'CVE-\d{4}-\d{4,}', raw_text)
+            if extracted_cves:
+                logging.warning(f"AI 응답이 리스트가 아니었지만, 텍스트에서 {len(extracted_cves)}개의 CVE 목록을 추출했습니다.")
+                return extracted_cves
+        
+        logging.warning(f"AI 예선 분석에서 유효한 CVE 목록을 추출하지 못했습니다. 응답: {str(response)[:200]}")
         return []
 
     def _final_cve_analysis(self, cve_candidates: List[Dict], installed_package_full_names: set, metadata: Dict) -> List[Dict]:
@@ -2136,8 +2377,10 @@ def main(args: argparse.Namespace):
         logging.info(Color.success(f"\n모든 보고서 및 데이터 파일 생성이 완료되었습니다. 경로: {output_dir}"))
 
     except Exception as e:
+        # [BUG FIX] sys.exit(1)을 호출하면 서버가 오류의 원인을 알 수 없습니다.
+        # 대신, 오류 로그를 표준 출력으로 명확히 남겨 서버가 실패 원인을 파악하도록 합니다.
         logging.error(Color.error(f"치명적인 오류 발생: {e}"), exc_info=True)
-        sys.exit(1)
+        # sys.exit(1) # 이 부분을 제거합니다.
     finally:
         log_step("분석 프로세스 종료")
         if extract_path.exists(): 

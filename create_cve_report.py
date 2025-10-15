@@ -35,16 +35,49 @@ except ImportError:
 # 표준 에러(stderr)로 로그를 출력하여, 표준 출력(stdout)으로는 순수 HTML 결과만 나가도록 합니다.
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', stream=sys.stderr)
 
+# --- [신규] 필터링할 RHEL 제품 목록 (정규표현식 사용) ---
+TARGET_PRODUCT_PATTERNS = [
+    re.compile(r"^Red Hat Enterprise Linux 7$"),
+    re.compile(r"^Red Hat Enterprise Linux 7 Extended Lifecycle Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 8$"),
+    re.compile(r"^Red Hat Enterprise Linux 8\.\d+ Extended Update Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 8\.\d+ Extended Update Support Long-Life Add-On$"),
+    re.compile(r"^Red Hat Enterprise Linux 8\.\d+ Update Services for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux 9$"),
+    re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Extended Update Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Extended Update Support Long-Life Add-On$"),
+    re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Update Services for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux 10$"),
+    re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support Long-Life Add-On$"),
+    re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Update Services for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$")
+]
 # --- AI(LLM) 분석 함수 ---
 def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, server_url: str) -> str:
     """제공된 CVE 데이터를 기반으로 지정된 AIBox 서버를 호출하여 분석을 수행합니다."""
-    logging.info(f"'{cve_id}'에 대한 AI 분석을 시작합니다 (서버: {server_url})...")
-    
-    # [사용자 요청 반영] Red Hat 보안 전문가의 관점에서 체계적인 보고서를 생성하도록 프롬프트를 전면 개편합니다.
-    # AI가 웹 검색을 통해 최신 정보를 수집하고, 지정된 형식에 맞춰 상세 분석을 수행하도록 지시합니다.
-    prompt = f"""[시스템 역할]
-당신은 Red Hat의 최고 수준 보안 전문가입니다. 주어진 CVE 데이터와 **웹 검색을 통해 수집한 최신 정보를 바탕으로**, 아래의 상세한 가이드라인과 출력 형식에 맞춰 전문적인 보안 분석 보고서를 한국어로 작성하십시오.
-**모든 분석 내용은 핵심만 간결하게 요약해야 합니다.**
+    # [사용자 요청] LLM 응답 파싱 실패 시 3회 재시도 로직 추가
+    max_retries = 3
+    for attempt in range(max_retries):
+        logging.info(f"'{cve_id}'에 대한 AI 분석을 시작합니다 (시도 {attempt + 1}/{max_retries}, 서버: {server_url})...")
+        
+        # [요청사항 반영] 프롬프트에 포함할 제품 목록 문자열 생성
+        target_products_str = "\n".join([f"- `{p.pattern}`" for p in TARGET_PRODUCT_PATTERNS])
+
+        # [사용자 요청 반영] Red Hat 보안 전문가의 관점에서 체계적인 보고서를 생성하도록 프롬프트를 전면 개편합니다.
+        # AI가 웹 검색을 통해 최신 정보를 수집하고, 지정된 형식에 맞춰 상세 분석을 수행하도록 지시합니다.
+        prompt = f"""[시스템 역할]
+당신은 Red Hat의 최고 수준 보안 전문가이자, 복잡한 기술 내용을 명확하고 간결한 한국어로 전달하는 데 능숙한 IT 전문 번역가입니다. 주어진 CVE 데이터와 **웹 검색을 통해 수집한 최신 정보를 바탕으로**, 아래의 상세한 가이드라인과 출력 형식에 맞춰 전문적인 보안 분석 보고서를 한국어로 작성하십시오.
+
+[분석 대상 제품 목록]
+아래 목록에 해당하는 Red Hat Enterprise Linux 제품에 대해서만 분석을 집중하십시오.
+{target_products_str}
+
+[분석 가이드라인]
+1.  **정확성**: 제공된 JSON 데이터와 웹 검색 결과를 교차 검증하여 기술적으로 정확한 내용만 전달합니다.
+2.  **명확성**: 기술 용어는 한국 IT 환경에서 보편적으로 사용되는 용어를 채택하되, 비전문가도 이해할 수 있도록 쉽게 설명합니다.
+3.  **용어 선택**: 한국어로 번역 시 의미가 모호해질 수 있는 기술 용어는 원문(영어)을 그대로 사용하거나 병기하여 명확성을 유지합니다. (예: 'Orchestration'은 '오케스트레이션'으로 음차 표기)
+4.  **간결성**: 각 항목은 핵심 내용 위주로 간결하게 요약하여 작성합니다.
 
 [입력 데이터: CVE 정보]
 ```json
@@ -53,13 +86,13 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
 
 [출력 형식: 상세 분석 보고서 (Markdown)]
 ### 취약점 개요 (Vulnerability Summary)
-- CVE의 기술적 내용과 영향을 받는 소프트웨어를 명확하고 간결하게 설명합니다.
+- CVE의 기술적 내용을 설명하고, **[분석 대상 제품 목록]에 명시된 제품들 중에서** 이 취약점의 영향을 받는 소프트웨어만 명확하고 간결하게 설명합니다.
 
 ### 근본 원인 분석 (Root Cause Analysis)
 - 제공된 'cwe'와 상세 설명을 바탕으로 취약점이 발생하는 기술적 원인을 심층적으로 분석합니다.
 
 ### 잠재적 영향 (Impact Assessment)
-- 'cvss3' 데이터를 기반으로, 이 취약점이 악용될 경우 발생할 수 있는 비즈니스 및 보안 위험을 구체적으로 기술합니다. (예: 데이터 유출, 서비스 거부, 원격 코드 실행 등)
+- 'cvss3' 점수와 'EPSS' 점수를 기반으로, 이 취약점이 악용될 경우 발생할 수 있는 비즈니스 및 보안 위험을 구체적으로 기술합니다. (예: 데이터 유출, 서비스 거부, 원격 코드 실행 등)
 
 """
     # [요청 수정] AI 분석을 위한 엔드포인트를 명시적으로 지정합니다.
@@ -129,8 +162,13 @@ def fetch_cve_data(cve_id: str) -> dict:
 
 def fetch_external_threat_intel(cve_id: str) -> dict:
     """[사용자 요청 반영] 로컬 cisa_kev.json 파일에서 외부 위협 인텔리전스 정보를 수집합니다."""
-    logging.info(f"'{cve_id}'에 대한 외부 위협 인텔리전스 조회를 시작합니다...")
-    intel = {"cisa_kev": {"in_kev": False, "date_added": None}}
+    logging.info(f"'{cve_id}'에 대한 외부 위협 인텔리전스(CISA KEV, EPSS) 조회를 시작합니다...")
+    intel = {
+        "cisa_kev": {"in_kev": False, "date_added": None},
+        "epss": {"score": None, "percentile": None}
+    }
+
+    # 1. CISA KEV 정보 조회 (로컬 파일)
     kev_file_path = "/data/iso/AIBox/cisa_kev.json"
     try:
         with open(kev_file_path, 'rb') as f:
@@ -143,6 +181,28 @@ def fetch_external_threat_intel(cve_id: str) -> dict:
                 break
     except (FileNotFoundError, json.JSONDecodeError, orjson.JSONDecodeError) as e:
         logging.warning(f"로컬 CISA KEV 데이터({kev_file_path}) 조회 중 오류 발생: {e}")
+
+    # 2. EPSS 점수 조회 (외부 API)
+    epss_url = f"https://api.first.org/data/v1/epss?cve={cve_id}"
+    try:
+        # requests는 기본적으로 http_proxy, https_proxy 환경 변수를 사용합니다.
+        response = requests.get(epss_url, timeout=20)
+        if response.status_code == 200:
+            epss_data = response.json()
+            if epss_data.get("status") == "OK" and epss_data.get("data"):
+                for item in epss_data["data"]:
+                    if item.get("cve") == cve_id:
+                        intel["epss"]["score"] = item.get("epss")
+                        intel["epss"]["percentile"] = item.get("percentile")
+                        logging.info(f"-> EPSS API에서 '{cve_id}' 점수를 찾았습니다 (EPSS: {item.get('epss')}, Percentile: {item.get('percentile')}).")
+                        break
+            else:
+                logging.info(f"-> EPSS API에서 '{cve_id}' 정보를 찾을 수 없습니다.")
+        else:
+            logging.warning(f"EPSS API 조회 실패 (HTTP {response.status_code}).")
+    except requests.RequestException as e:
+        logging.warning(f"EPSS API 네트워크 오류: {e}")
+
     return intel
 
 # --- HTML 렌더링 함수 ---
@@ -182,25 +242,29 @@ def main():
     cve_data = fetch_cve_data(cve_id)
     
     if not cve_data:
-        logging.error(f"Red Hat Product Security에서 '{cve_id}' 정보를 찾지 못했습니다. 스크립트를 종료합니다.")
-        # [수정] 에러 발생 시 표준 에러로 메시지를 출력하고 0이 아닌 코드로 종료하여 호출 측에서 오류를 인지할 수 있도록 합니다.
-        sys.stderr.write(f"Error: Could not find CVE data for {cve_id} from Red Hat.\n")
-        sys.exit(1)
+        logging.warning(f"'{cve_id}'에 대한 정보를 로컬 서버와 Red Hat API에서 모두 찾을 수 없습니다. 기본 리포트를 생성합니다.")
+        # [요청 사항] CVE 정보가 없을 경우, 기본 컨텍스트를 생성하여 리포트를 출력합니다.
+        context = {
+            'cve_id': cve_id,
+            'report_title': f"{cve_id} 분석 리포트",
+            'public_date_str': 'N/A',
+            'severity': '정보 없음',
+            'cvss3_score': 'N/A',
+            'bugzilla': None,
+            'cwe': None,
+            'grouped_packages': {},
+            'all_rhsa_ids': [],
+            'comprehensive_summary': "### CVE 정보 없음\n\n요청하신 CVE ID에 대한 상세 정보를 Red Hat Product Security 데이터베이스에서 찾을 수 없습니다. CVE ID가 정확한지 확인하거나, 아직 Red Hat에서 분석/발표하지 않은 취약점일 수 있습니다.",
+            'external_intel': {"cisa_kev": {"in_kev": False, "date_added": None}, "epss": {"score": None, "percentile": None}},
+            'current_year': datetime.now().year
+        }
+        template_path = os.path.join(os.path.dirname(__file__), 'cve_report_template.html')
+        html_output = render_html_report(template_path, cve_id, context)
+        print(html_output)
+        return
 
-    # [사용자 요청 복원] 로컬 파일에서 외부 위협 인텔리전스 수집 및 AI 분석을 다시 활성화합니다.
     external_intel = fetch_external_threat_intel(cve_id)
     llm_summary = analyze_data_with_llm(cve_id, cve_data, external_intel, server_url)
-
-    # [사용자 요청] 지정된 제품 목록 및 패턴에 대해서만 'affected_release' 정보를 그룹화하고 정렬합니다.
-    TARGET_PRODUCTS_EXACT = {
-        "Red Hat Enterprise Linux 7",
-        "Red Hat Enterprise Linux 7 Extended Lifecycle Support",
-        "Red Hat Enterprise Linux 8",
-        "Red Hat Enterprise Linux 9",
-        "Red Hat Enterprise Linux 10"
-    }
-    # 'Red Hat Enterprise Linux {major}.{minor} for SAP Solutions' 와 같은 패턴을 처리하기 위한 정규식
-    target_product_pattern = re.compile(r'^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$')
 
     # [사용자 요청] 'affected_release' (패치된 제품)와 'package_state' (영향받는 모든 제품) 정보를 통합합니다.
     grouped_packages = {}
@@ -209,8 +273,7 @@ def main():
     if cve_data.get('package_state'):
         for state in cve_data['package_state']:
             product_name = state.get('product_name', 'Unknown Product')
-            # 지정된 제품이거나, 패턴에 맞는 경우에만 데이터를 포함합니다.
-            if state.get('fix_state') == 'Affected' and (product_name in TARGET_PRODUCTS_EXACT or target_product_pattern.match(product_name)):
+            if state.get('fix_state') == 'Affected' and any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
                 if product_name not in grouped_packages:
                     grouped_packages[product_name] = []
                 
@@ -231,7 +294,7 @@ def main():
                 for pkg_info in grouped_packages[product_name]:
                     if pkg_info['package'] in release.get('package', ''):
                         pkg_info.update(release) # 패키지 버전, RHSA 등 상세 정보 업데이트
-            elif product_name in TARGET_PRODUCTS_EXACT or target_product_pattern.match(product_name):
+            elif any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
                 # 'package_state'에 없었지만 'affected_release'에 있는 경우 (예: EUS)
                 if product_name not in grouped_packages:
                     grouped_packages[product_name] = []
@@ -243,7 +306,6 @@ def main():
     grouped_packages = dict(sorted(grouped_packages.items()))
     
     # [사용자 요청] security.py를 참고하여 CVE에 연결된 모든 RHSA ID를 추출합니다.
-    all_rhsa_ids = sorted([rhsa for rhsa in cve_data.get('advisories', []) if isinstance(rhsa, str) and rhsa.startswith("RHSA-")])
 
     context = {
         'cve_id': cve_id,
@@ -255,7 +317,7 @@ def main():
         'cwe': cve_data.get('CWE'),
         'package_state': cve_data.get('package_state'),
         'grouped_packages': grouped_packages, # 그룹화된 데이터를 컨텍스트에 추가
-        'all_rhsa_ids': all_rhsa_ids, # 전체 RHSA 목록을 컨텍스트에 추가
+        'all_rhsa_ids': sorted([rhsa for rhsa in cve_data.get('advisories', []) if isinstance(rhsa, str) and rhsa.startswith("RHSA-")]), # 전체 RHSA 목록을 컨텍스트에 추가
         'comprehensive_summary': llm_summary, # AI 분석 결과 추가
         'external_intel': external_intel # 외부 위협 정보 추가
     }

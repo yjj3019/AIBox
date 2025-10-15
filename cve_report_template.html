@@ -129,7 +129,7 @@
                             <div>
                                 <p class="font-medium">CISA KEV 등재</p>
                                 {% if external_intel.cisa_kev.in_kev %}
-                                <p class="text-sm text-red-600">실제 공격에 악용됨 ({{ external_intel.cisa_kev.date_added }})</p>
+                                <p class="text-sm text-red-600">실제 공격에 악용됨 (등재일: {{ external_intel.cisa_kev.date_added }})</p>
                                 {% else %}
                                 <p class="text-sm text-slate-500">해당 없음</p>
                                 {% endif %}
@@ -141,7 +141,13 @@
                             </span>
                             <div>
                                 <p class="font-medium">EPSS 점수</p>
+                                {% if external_intel.epss.score is not none %}
+                                <p class="text-sm text-slate-500">
+                                    점수: {{ "%.4f"|format(external_intel.epss.score) }} / 백분위: {{ "%.4f"|format(external_intel.epss.percentile) }}
+                                </p>
+                                {% else %}
                                 <p class="text-sm text-slate-500">정보 없음</p>
+                                {% endif %}
                             </div>
                         </div>
                     </div>

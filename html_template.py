@@ -10,6 +10,13 @@ import html
 import re
 from datetime import datetime
 
+# [개선] 마크다운 라이브러리를 사용하여 AI 분석 요약을 더 정교하게 HTML로 변환합니다.
+try:
+    from markdown import markdown
+    IS_MARKDOWN_AVAILABLE = True
+except ImportError:
+    IS_MARKDOWN_AVAILABLE = False
+
 def get_html_template(data):
     def h(text):
         return html.escape(str(text)) if text is not None else ''
@@ -21,6 +28,7 @@ def get_html_template(data):
         "cpu": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon"><path d="M9 21h6v-2H9v2zm.5-4.59L11 15V9h-1.5v4.51l-1.79-1.8-1.42 1.42L9.5 16.41zm6.29-1.8L13 16.41V11.5L14.5 10v6l1.79-1.79 1.42 1.42L14.5 18.41zM20 2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h4v-2H4V4h16v12h-4v2h4c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"></path></svg>',
         "disk": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"></path></svg>',
         "critical": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon"><path d="M12 2C6.47 2 2 6.47 2 12s4.47 10 10 10 10-4.47 10-10S17.53 2 12 2zm5 13.59L15.59 17 12 13.41 8.41 17 7 15.59 10.59 12 7 8.41 8.41 7 12 10.59 15.59 7 17 8.41 13.41 12 17 15.59z"></path></svg>',
+        "cluster": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon"><path d="M18.5 13.5c-1.93 0-3.5 1.57-3.5 3.5s1.57 3.5 3.5 3.5 3.5-1.57 3.5-3.5-1.57-3.5-3.5-3.5zm-13 0C3.57 13.5 2 15.07 2 17s1.57 3.5 3.5 3.5 3.5-1.57 3.5-3.5-1.57-3.5-3.5-3.5zm0-10C3.57 3.5 2 5.07 2 7s1.57 3.5 3.5 3.5 3.5-1.57 3.5-3.5S7.43 3.5 5.5 3.5zm13 0c-1.93 0-3.5 1.57-3.5 3.5s1.57 3.5 3.5 3.5 3.5-1.57 3.5-3.5-1.57-3.5-3.5-3.5z"></path></svg>',
         "warning": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"></path></svg>',
         "idea": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon"><path d="M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zM12 2C7.86 2 4.5 5.36 4.5 9.5c0 3.82 2.66 5.86 3.77 6.5h7.46c1.11-.64 3.77-2.68 3.77-6.5C19.5 5.36 16.14 2 12 2z"></path></svg>',
         "shield": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="icon"><path d="M12 2L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-3zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V13H5V6.3l7-3.11v10.8z"></path></svg>',
@@ -144,6 +152,25 @@ def get_html_template(data):
             rows.append(row_html)
         return "".join(rows)
 
+    def create_drbd_rows(drbd_resources):
+        """[신규] DRBD 리소스 정보를 HTML 행으로 생성합니다."""
+        if not drbd_resources: return "<tr><td colspan='5' style='text-align:center;'>DRBD 리소스 없음</td></tr>"
+        rows = []
+        for res in drbd_resources:
+            warning_style = 'style="background-color: #fffbe6;"' if 'warning' in res else ''
+            row_html = f"""
+                <tr {warning_style}>
+                    <td>{h(res.get('id'))}</td>
+                    <td>{h(res.get('connection'))}</td>
+                    <td>{h(res.get('roles'))}</td>
+                    <td>{h(res.get('disk_states'))}</td>
+                    <td>{h(res.get('warning', '정상'))}</td>
+                </tr>
+            """
+            rows.append(row_html)
+        return "".join(rows)
+
+
     def create_ethtool_rows(ethtool_data):
         if not ethtool_data: return "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
         return "".join(f"<tr><td>{h(iface)}</td><td>{h(d.get('driver'))}</td><td>{h(d.get('speed'))}</td><td>{h(d.get('duplex'))}</td><td>{'UP' if d.get('link') == 'yes' else 'DOWN'}</td><td>{h(d.get('rx_ring'))}</td></tr>" for iface, d in ethtool_data.items())
@@ -218,18 +245,24 @@ def get_html_template(data):
     graphs = data.get('graphs', {})
     network_details = data.get('network', {})
     kb_findings = ai_analysis.get('kb_findings', [])
+    ha_cluster_info = data.get('ha_cluster_info', {})
+    drbd_info = data.get('drbd_info', {})
     security_audit_findings = ai_analysis.get('security_audit_findings', [])
     process_stats = data.get('processes', {})
     security_news = data.get('security_advisories', [])
     
     summary_raw = ai_analysis.get('summary', '분석 결과 없음')
-    # [개선] 전문가 프롬프트에 맞춰 마크다운 형식의 요약을 HTML로 변환 (더 정교한 방식)
-    summary_html = h(summary_raw)
-    summary_html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', summary_html)  # Bold
-    # 여러 줄에 걸친 리스트 항목을 하나의 <ul>로 감싸기
-    summary_html = re.sub(r'(\* (?:.|\n)*?)(?=\n\n|\Z)', lambda m: f"<ul>{m.group(1)}</ul>", summary_html, flags=re.DOTALL)
-    summary_html = re.sub(r'\* (.*?)\n', r'<li>\1</li>\n', summary_html)
-    summary_html = summary_html.replace('\n', '<br>')
+    # [핵심 개선] markdown 라이브러리를 사용하여 AI 요약을 HTML로 변환합니다.
+    if IS_MARKDOWN_AVAILABLE:
+        # 'tables' 확장 기능을 활성화하여 마크다운 테이블도 지원합니다.
+        summary_html = markdown(summary_raw, extensions=['tables', 'fenced_code'])
+    else:
+        # 라이브러리가 없을 경우, 기존의 간단한 정규식 기반 변환을 유지합니다.
+        summary_html = h(summary_raw)
+        summary_html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', summary_html)
+        summary_html = re.sub(r'((?:\* .*(?:\n|$))+)', r'<ul>\g<1></ul>', summary_html)
+        summary_html = re.sub(r'\* (.*?)\n', r'<li>\1</li>\n', summary_html)
+        summary_html = summary_html.replace('\n', '<br>')
 
     return f"""
     <!DOCTYPE html>
@@ -276,6 +309,12 @@ def get_html_template(data):
             .validation-box {{ margin-top: 0.8rem; padding: 0.5rem 0.8rem; background-color: #f0f2f5; border-radius: 4px; font-size: 0.9em; }}
             .validation-box code {{ background-color: transparent; padding: 0; }}
             .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
+            /* [사용자 요청] 푸터 텍스트를 중앙에 정렬하고 여백을 추가합니다. */
+            footer {{
+                text-align: center;
+                padding: 2rem 0;
+                color: #7f8c8d;
+            }}
         </style>
         <script>
             function openGraphPopup(filename) {{
@@ -320,6 +359,21 @@ def get_html_template(data):
                     <tbody>{create_recommendation_rows(ai_analysis.get('recommendations', []))}</tbody>
                 </table></div>
             </div>
+
+            <div class="report-card" {'style="display:none;"' if not ha_cluster_info and not drbd_info else ''}>
+                <div class="card-header">{svg_icons['cluster']} HA 클러스터 및 DRBD 정보</div>
+                <div class="card-body">
+                    {'<h3>Pacemaker/Corosync 정보</h3><pre><code>' + h(ha_cluster_info.get('crm_report', '데이터 없음')) + '</code></pre>' if ha_cluster_info else ''}
+                    {f'''<h3>DRBD 상태</h3>
+                    <table class="data-table">
+                        <thead><tr><th>ID</th><th>Connection</th><th>Roles</th><th>Disk States</th><th>Warning</th></tr></thead>
+                        <tbody>{create_drbd_rows(drbd_info.get('resources', []))}</tbody>
+                    </table>
+                    ''' if drbd_info else ''}
+                    {'<h3>DRBD 설정 (/etc/drbd.conf)</h3><pre><code>' + h(drbd_info.get('drbd_config', '데이터 없음')) + '</code></pre>' if drbd_info.get('drbd_config') else ''}
+                </div>
+            </div>
+
 
             <div class="report-card" {'style="display:none;"' if not security_audit_findings else ''}>
                 <div class="card-header">{svg_icons['shield']} 보안 감사 결과</div>

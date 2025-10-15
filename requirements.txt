@@ -11,3 +11,4 @@ SQLAlchemy
 gunicorn
 diskcache
 python-dateutil
+Markdown
