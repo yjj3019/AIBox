@@ -157,12 +157,14 @@ def process_cve_data(cve_data, skip_filtering=False):
     affected_package_names = set()
     if isinstance(cve_data.get('affected_release'), list):
         for release in cve_data['affected_release']:
+            # [BUG FIX] TARGET_PRODUCT_PATTERNS에 해당하는 제품의 패키지만 고려합니다.
+            product_name = release.get('product_name', 'Unknown Product')
+            if not any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
+                continue
+
             full_pkg_name = release.get('package')
             if not full_pkg_name: continue
             
-            # [BUG FIX] 패키지 이름 추출 로직 개선
-            # 'open-vm-tools-12.1.5-2.el8'와 같이 이름에 하이픈이 포함된 경우를 올바르게 처리합니다.
-            # 마지막의 '-버전-릴리즈' 부분을 제외한 앞부분 전체를 패키지 이름으로 간주합니다.
             match = re.match(r'^(.*)-[^-]+-[^-]+$', full_pkg_name)
             if match:
                 base_pkg_name = match.group(1).rsplit('-', 1)[0] if ':' in match.group(1) else match.group(1)

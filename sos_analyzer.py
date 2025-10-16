@@ -2301,6 +2301,7 @@ def main(args: argparse.Namespace):
             # [사용자 요청] AI가 선정한 보안 위협 목록에 설치된 패키지 버전 정보를 추가합니다.
             advisories_with_version = ai_analyzer._add_installed_version_to_advisories(security_advisories, metadata.get('installed_packages', []))
             metadata['security_advisories'] = advisories_with_version
+        logging.info(f"  -> AI 시스템 분석 완료. {len(structured_analysis.get('recommendations', []))}개의 권장사항과 {len(advisories_with_version)}개의 보안 권고를 받았습니다.")
 
         logging.info(Color.success("모든 AI 분석 작업 완료."))
 
@@ -2315,7 +2316,7 @@ def main(args: argparse.Namespace):
         kb_findings = kb.analyze(metadata)
         structured_analysis['kb_findings'] = kb_findings
         logging.info(Color.success("로컬 감사 및 진단 완료."))
-            
+
         logging.info("[STEP] GENERATING_REPORT: 최종 보고서 생성을 시작합니다.")
         log_step("5단계: 최종 보고서 생성")
         reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date, parser.device_map)

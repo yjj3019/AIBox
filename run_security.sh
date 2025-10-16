@@ -14,8 +14,9 @@ function send(){
         tee -a $BACKUPLOG
 }
 
-# no proxy
-export no_proxy="localhost, 127.0.0.1, 172.21.135.113"
+# [해결] AIBox 서버가 외부 LLM 백엔드(172.21.135.113)와 통신할 때 프록시를 사용하지 않도록
+# no_proxy 환경 변수에 LLM 서버의 IP를 추가합니다.
+export no_proxy="localhost,127.0.0.1,172.21.135.113"
 
 
 # --- 스크립트 설명 ---

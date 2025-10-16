@@ -255,7 +255,7 @@ def get_html_template(data):
     # [핵심 개선] markdown 라이브러리를 사용하여 AI 요약을 HTML로 변환합니다.
     if IS_MARKDOWN_AVAILABLE:
         # 'tables' 확장 기능을 활성화하여 마크다운 테이블도 지원합니다.
-        summary_html = markdown(summary_raw, extensions=['tables', 'fenced_code'])
+        summary_html = markdown(summary_raw, extensions=['tables', 'fenced_code', 'nl2br'])
     else:
         # 라이브러리가 없을 경우, 기존의 간단한 정규식 기반 변환을 유지합니다.
         summary_html = h(summary_raw)
@@ -295,11 +295,11 @@ def get_html_template(data):
                 padding: 8px 16px; border-radius: 6px; cursor: pointer;
                 font-weight: 500; font-size: 0.9rem; transition: all 0.2s ease;
             }}
-            .details-button:hover {{ background-color: #e9ecef; border-color: #ced4da; }}
+            .details-button:hover {{ background-color: #e9ecef; }}
             .progress-bar-container {{ height: 12px; width: 100%; background-color: var(--light-gray); border-radius: 6px; overflow:hidden;}}
             .progress-bar {{ height: 100%; border-radius: 6px; }}
             .priority-badge {{ padding: 0.25em 0.6em; border-radius: 5px; font-size: 0.85em; color: white; font-weight: 600; }}
-            .priority-badge.high {{ background-color: var(--danger-color); }}
+            .priority-badge.high {{ background-color: var(--danger-color);}}
             .priority-badge.medium {{ background-color: var(--warning-color); }}
             .priority-badge.low {{ background-color: #7f8c8d; }}
             .tooltip {{ position: relative; display: inline-block; cursor: help; }}

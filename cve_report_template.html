@@ -118,32 +118,32 @@
                     </div>
                 </div>
 
-                <!-- [사용자 요청 복원] 외부 위협 인텔리전스 카드 -->
+                <!-- [수정] 외부 위협 인텔리전스 카드 -->
                 <div class="bg-white p-6 rounded-lg shadow-md border border-slate-200">
                     <h3 class="text-lg font-semibold text-slate-800 mb-4">외부 위협 인텔리전스</h3>
                     <div class="space-y-3">
                         <div class="flex items-center gap-3">
-                            <span class="w-8 h-8 rounded-full flex items-center justify-center {{ 'bg-red-100 text-red-700' if external_intel.cisa_kev.in_kev else 'bg-slate-100 text-slate-500' }}">
+                            <span class="w-8 h-8 rounded-full flex items-center justify-center {{ 'bg-red-100 text-red-700' if external_intel and external_intel.cisa_kev and external_intel.cisa_kev.in_kev else 'bg-slate-100 text-slate-500' }}">
                                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" /></svg>
                             </span>
                             <div>
                                 <p class="font-medium">CISA KEV 등재</p>
-                                {% if external_intel.cisa_kev.in_kev %}
-                                <p class="text-sm text-red-600">실제 공격에 악용됨 (등재일: {{ external_intel.cisa_kev.date_added }})</p>
+                                {% if external_intel and external_intel.cisa_kev and external_intel.cisa_kev.in_kev %}
+                                <p class="text-sm text-red-600">실제 공격에 악용됨 (등재일: {{ external_intel.cisa_kev.date_added if external_intel.cisa_kev.date_added else 'N/A' }})</p>
                                 {% else %}
                                 <p class="text-sm text-slate-500">해당 없음</p>
                                 {% endif %}
                             </div>
                         </div>
                         <div class="flex items-center gap-3">
-                            <span class="w-8 h-8 rounded-full flex items-center justify-center bg-slate-100 text-slate-500">
+                            <span class="w-8 h-8 rounded-full flex items-center justify-center {{ 'bg-amber-100 text-amber-700' if external_intel and external_intel.epss and external_intel.epss.score is not none else 'bg-slate-100 text-slate-500' }}">
                                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z" /></svg>
                             </span>
                             <div>
                                 <p class="font-medium">EPSS 점수</p>
-                                {% if external_intel.epss.score is not none %}
+                                {% if external_intel and external_intel.epss and external_intel.epss.score is not none %}
                                 <p class="text-sm text-slate-500">
-                                    점수: {{ "%.4f"|format(external_intel.epss.score) }} / 백분위: {{ "%.4f"|format(external_intel.epss.percentile) }}
+                                    점수: {{ "%.4f"|format(external_intel.epss.score|float) }} / 백분위: {{ "%.4f"|format(external_intel.epss.percentile|float) }}
                                 </p>
                                 {% else %}
                                 <p class="text-sm text-slate-500">정보 없음</p>

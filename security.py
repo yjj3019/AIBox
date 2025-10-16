@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 # -*- coding: utf-8 -*-
+import urllib3
 import requests
 # [개선] 표준 json 라이브러리보다 빠른 orjson을 사용하고, 없을 경우 표준 라이브러리로 대체합니다.
 # [BUG FIX] orjson이 있더라도, 예외 처리 등을 위해 표준 json 라이브러리를 항상 임포트합니다.
@@ -42,14 +43,22 @@ INSTALLED_PACKAGES = set() # [개선] sos_analyzer로부터 전달받을 설치�
 # 분석 대상으로 고려할 최소 CVSSv3 점수
 MIN_CVSS_SCORE = 7.0
 # [수정] 사용자가 요청한 분석 대상 RHEL 제품 목록
-TARGET_RHEL_PRODUCTS = [
-    "Red Hat Enterprise Linux 7",
-    "Red Hat Enterprise Linux 7 Extended Lifecycle Support",
-    "Red Hat Enterprise Linux 8",
-    "Red Hat Enterprise Linux 9",
-    "Red Hat Enterprise Linux 10",
-    "Red Hat Enterprise Linux for SAP Applications",
-    "Red Hat Enterprise Linux for SAP Solutions"
+TARGET_PRODUCT_PATTERNS = [
+    re.compile(r"^Red Hat Enterprise Linux 7$"),
+    re.compile(r"^Red Hat Enterprise Linux 7 Extended Lifecycle Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 8$"),
+    re.compile(r"^Red Hat Enterprise Linux 8\.\d+ Extended Update Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 8\.\d+ Extended Update Support Long-Life Add-On$"),
+    re.compile(r"^Red Hat Enterprise Linux 8\.\d+ Update Services for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux 9$"),
+    re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Extended Update Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Extended Update Support Long-Life Add-On$"),
+    re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Update Services for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux 10$"),
+    re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support$"),
+    re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support Long-Life Add-On$"),
+    re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Update Services for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$")
 ]
 
 # --- Global Configuration ---
@@ -97,11 +106,15 @@ def make_request(method, url, use_proxy=True, max_retries=3, **kwargs):
     for attempt in range(max_retries):
         try:
             # [개선] use_proxy=False일 때, requests 호출 시 프록시를 명시적으로 비활성화합니다.
-            if not use_proxy:
-                kwargs['proxies'] = {'http': None, 'https': None}
-            elif use_proxy and CONFIG['PROXIES']:
-                # 프록시를 사용해야 할 경우, 명시적으로 설정합니다.
+            if use_proxy and CONFIG.get('PROXIES'):
                 kwargs['proxies'] = CONFIG['PROXIES']
+            elif not use_proxy:
+                kwargs['proxies'] = {'http': None, 'https': None}
+
+            # [BUG FIX] 프록시 환경에서 발생할 수 있는 SSL 인증서 검증 오류를 방지하기 위해
+            # verify=False 옵션을 추가합니다. 이는 시스템이 프록시의 자체 서명 인증서를
+            # 신뢰하지 못할 때 발생합니다.
+            kwargs.setdefault('verify', False)
 
             # 기본 타임아웃을 30초로 설정합니다.
             kwargs.setdefault('timeout', 30)
@@ -124,6 +137,81 @@ def make_request(method, url, use_proxy=True, max_retries=3, **kwargs):
     logging.error(f"All {max_retries} retries failed for {method.upper()} request to {url}.")
     return None
 
+# [사용자 요청] verify=False 사용 시 발생하는 InsecureRequestWarning을 비활성화합니다.
+# 이는 내부 프록시 환경에서 흔히 발생하는 경고로, 로그를 깔끔하게 유지하기 위함입니다.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def fetch_external_threat_intel(cve_id: str) -> dict:
+    """[신규] CISA KEV 및 EPSS와 같은 외부 위협 인텔리전스 정보를 수집합니다."""
+    intel = {
+        "cisa_kev": {"in_kev": False, "date_added": None},
+        "epss": {"score": None, "percentile": None},
+        "has_poc": False # PoC 정보는 다른 소스에서 가져와야 할 수 있음
+    }
+
+    # 1. CISA KEV 정보 조회 (로컬 파일)
+    # [사용자 요청] cisa_kev.json 파일에서 CVE ID 등재 여부 확인
+    kev_file_path = "/data/iso/AIBox/cisa_kev.json" # AIBox_Server.py와 경로 통일
+    try:
+        with open(kev_file_path, 'rb') as f:
+            kev_data = orjson.loads(f.read()) if _JSON_LIB == "orjson" else _json_lib_std.load(f)
+        for vuln in kev_data.get("vulnerabilities", []):
+            if vuln.get("cveID") == cve_id:
+                intel["cisa_kev"]["in_kev"] = True
+                intel["cisa_kev"]["dueDate"] = vuln.get("dueDate")
+                logging.info(f"-> 로컬 KEV 파일에서 '{cve_id}'를 찾았습니다.")
+                break
+    except (FileNotFoundError, _json_lib_std.JSONDecodeError, IOError) as e:
+        logging.warning(f"로컬 CISA KEV 데이터({kev_file_path}) 조회 중 오류 발생: {e}")
+
+    # 2. EPSS 점수 조회 (외부 API)
+    # [사용자 요청] EPSS 점수 조회 시 로컬 캐시 우선 확인
+    local_epss_url = f"http://127.0.0.1:5000/AIBox/epss/{cve_id}"
+    logging.info(f"로컬 서버에서 '{cve_id}' EPSS 데이터 조회를 시도합니다...")
+    try:
+        # 로컬 통신이므로 프록시 비활성화
+        response = make_request('get', local_epss_url, use_proxy=False, timeout=10)
+        if response and response.status_code == 200:
+            logging.info(f"-> 로컬 서버에서 '{cve_id}' EPSS 데이터를 성공적으로 찾았습니다.")
+            epss_data = response.json()
+            intel["epss"]["score"] = epss_data.get("epss")
+            intel["epss"]["percentile"] = epss_data.get("percentile")
+            return intel # 로컬에서 찾았으므로 함수 종료
+        logging.warning(f"로컬 서버에 '{cve_id}' EPSS 정보가 없습니다. 외부 API 조회를 시도합니다.")
+    except Exception as e:
+        logging.warning(f"로컬 EPSS 서버 연결 실패: {e}. 외부 API 조회를 시도합니다.")
+
+    # 로컬 조회 실패 시 외부 EPSS API에서 조회
+    external_epss_url = f"https://api.first.org/data/v1/epss?cve={cve_id}"
+    logging.info(f"EPSS API에서 '{cve_id}' 데이터 조회를 시도합니다...")
+    response = make_request('get', external_epss_url, use_proxy=True, timeout=20)
+    if response and response.status_code == 200:
+        epss_response_data = response.json()
+        if epss_response_data.get("status") == "OK" and epss_response_data.get("data"):
+            epss_item = next((item for item in epss_response_data["data"] if item.get("cve") == cve_id), None)
+            if epss_item:
+                intel["epss"]["score"] = epss_item.get("epss")
+                intel["epss"]["percentile"] = epss_item.get("percentile")
+                logging.info(f"-> EPSS API에서 '{cve_id}' 점수를 찾았습니다 (EPSS: {epss_item.get('epss')}).")
+
+                # 서버에 파일 저장을 요청하는 API 호출
+                save_epss_url = f"http://127.0.0.1:5000/AIBox/api/cache/epss"
+                save_payload = {
+                    "cve_id": cve_id,
+                    "data": {"epss": intel["epss"]["score"], "percentile": intel["epss"]["percentile"]}
+                }
+                try:
+                    # 서버에 저장을 요청하고 응답을 기다리지 않음 (fire and forget)
+                    make_request('post', save_epss_url, use_proxy=False, json=save_payload, timeout=5)
+                    logging.info(f"-> '{cve_id}' EPSS 데이터를 로컬 서버에 저장하도록 요청했습니다.")
+                except Exception as save_e:
+                    logging.warning(f"-> 로컬 서버에 EPSS 데이터 저장 요청 실패: {save_e}")
+            else:
+                logging.info(f"-> EPSS API에서 '{cve_id}' 정보를 찾을 수 없습니다.")
+    elif response:
+        logging.warning(f"EPSS API 조회 실패 (HTTP {response.status_code}).")
+
+    return intel
 
 def fetch_redhat_cves(start_date):
     """Step 1: 로컬 파일에서 모든 CVE 목록을 가져옵니다. (JSON 파싱 강화)"""
@@ -236,7 +324,7 @@ def filter_cves_by_strict_criteria(all_cves):
         if isinstance(package_states, list):
             for state in package_states:
                 product_name = state.get('product_name')
-                if state.get('fix_state') == 'Affected' and product_name in TARGET_RHEL_PRODUCTS:
+                if state.get('fix_state') == 'Affected' and any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
                     affected_rhel_products.add(product_name)
                     pkg_name_match = re.match(r'([^-\s]+)', state.get('package_name', ''))
                     if pkg_name_match:
@@ -299,13 +387,20 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
     
     cves_for_prompt = []
     for cve in cves_chunk:
+        # [개선] 외부 위협 인텔리전스 정보를 프롬프트에 포함
         cvss3_score = cve.get('cvss3', {}).get('cvss3_base_score', 'N/A') if isinstance(cve.get('cvss3'), dict) else 'N/A'
         summary = extract_summary_from_cve(cve)
         cves_for_prompt.append({
             "cve_id": cve.get('CVE'),
             "severity": cve.get('severity', 'N/A'),
             "cvss_score": cvss3_score,
-            "summary": summary
+            "summary": summary,
+            "is_in_kev": cve.get('is_in_kev', False),
+            "has_poc": cve.get('has_poc', False),
+            "epss_details": {
+                "score": cve.get('epss_score'),
+                "percentile": cve.get('epss_percentile')
+            }
         })
 
     return f"""[시스템 역할]
@@ -346,26 +441,30 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
 
 def _create_preliminary_analysis_prompt(cves_chunk: list) -> str:
     """[신규] 예선 분석을 위한 프롬프트를 생성합니다. 각 묶음에서 상위 CVE를 선정합니다."""
-    cves_for_prompt = [
-        {
+    cves_for_prompt = []
+    for cve in cves_chunk:
+        threat_intel = cve.get('threat_intel', {})
+        cves_for_prompt.append({
             "cve_id": cve.get('CVE'),
             "severity": cve.get('severity', 'N/A'),
             "cvss_score": cve.get('cvss3', {}).get('cvss3_base_score', 'N/A'),
-            "affected_packages": cve.get('affected_package_names', [])
-        } for cve in cves_chunk
-    ]
+            "affected_packages": cve.get('affected_package_names', []),
+            "is_in_kev": threat_intel.get('cisa_kev', {}).get('in_kev', False),
+            "epss_score": threat_intel.get('epss', {}).get('score')
+        })
 
     return f"""[시스템 역할]
-당신은 Red Hat Enterprise Linux(RHEL) 시스템의 보안을 책임지는 최고 수준의 사이버 보안 분석가입니다.
+당신은 주어진 지침을 정확히 따르는, 출력을 제어하는 AI 어시스턴트입니다.
 
 [임무]
-아래에 제공된 CVE 목록 중에서, 가장 중요하고 시급하다고 판단되는 CVE ID를 선정하여 배열 형태로 반환하십시오.
+아래에 제공된 CVE 목록 중에서, 가장 중요하고 시급하다고 판단되는 CVE의 ID 목록을 **JSON 배열 형식으로만 반환**하십시오.
 
 [평가 기준]
-공격 벡터, 영향도, 패키지 중요도를 종합적으로 고려하여 실제 위협이 되는 CVE를 선정해야 합니다.
+**CISA KEV 등재 여부**와 **EPSS 점수**를 최우선으로 고려하고, 그 다음으로 CVSS 점수, 심각도, 패키지 중요도('kernel', 'glibc', 'openssh' 등)를 종합적으로 고려하여 실제 위협이 되는 CVE를 선정해야 합니다.
 
 [제한 조건]
-- **패키지별 대표 선정 (매우 중요):** 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중 가장 위험한 **단 하나의 CVE만** 대표로 선정해야 합니다.
+- **패키지별 대표 선정:** 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중 가장 위험한 **단 하나의 CVE만** 대표로 선정해야 합니다.
+- **출력 형식 엄수:** **반드시 JSON 배열 형식으로만 응답해야 합니다.** 다른 설명, 노트, 분석 과정 등은 절대 포함하지 마십시오.
 
 [입력 데이터: CVE 목록]
 ```json
@@ -383,6 +482,7 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
     
     cves_for_prompt = []
     for cve in cves_chunk:
+        threat_intel = cve.get('threat_intel', {})
         cvss3_score = cve.get('cvss3', {}).get('cvss3_base_score', 'N/A') if isinstance(cve.get('cvss3'), dict) else 'N/A'
         summary = extract_summary_from_cve(cve)
         cves_for_prompt.append({
@@ -390,7 +490,10 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
             "severity": cve.get('severity', 'N/A'),
             "cvss_score": cvss3_score,
             "summary": summary,
-            "affected_packages": cve.get('affected_package_names', [])
+            "affected_packages": cve.get('affected_package_names', []),
+            # [사용자 요청] 최종 분석 프롬프트에도 KEV 및 EPSS 정보를 포함하여 AI가 활용하도록 합니다.
+            "is_in_kev": threat_intel.get('cisa_kev', {}).get('in_kev', False),
+            "epss_score": threat_intel.get('epss', {}).get('score')
         })
 
     return f"""[시스템 역할]
@@ -398,11 +501,11 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
 
 [분석 가이드라인 및 웹 검색 활용]
 1.  **외부 정보 수집 (Web Search)**: 각 CVE에 대해 웹 검색을 수행하여 다음 정보를 수집합니다.
-    *   **한국 KISA/KrCERT 경보 발령 또는 등재 여부를 최우선으로 고려합니다.**
-    *   **CISA KEV (Known Exploited Vulnerabilities) 등재 여부**
-    *   **PoC (Proof-of-Concept) 코드 공개 여부** (예: Exploit-DB, GitHub)
-    *   **EPSS (Exploit Prediction Scoring System) 점수 및 백분위**
-2.  **우선순위 선정 및 최종 {TOP_CVE_COUNT}개 선택**: 위에서 수집한 정보를 바탕으로 우선순위를 선정합니다. 한국 KISA/KrCERT 등재 CVE 를 최우선으로 고려하고, CISA KEV 등재 CVE를 차선으로 고려합니다. 그 다음으로 **패키지 중요도('kernel', 'glibc', 'openssl', 'systemd', 'grub2', 'gcc', 'bash', 'pacemaker', 'corosync', 'openssh' 등)**, PoC 공개 여부, EPSS 백분위, CVSS 점수, 공격 심각도(RCE, 권한 상승) 순으로 종합 평가하여 가장 시급한 CVE부터 정렬합니다.
+    *   **한국 KISA/KrCERT 경보**: 한국 관련 기관의 경보 발령 여부 (최우선 고려)
+    *   **CISA KEV**: 실제 공격에 악용되었는지 여부
+    *   **PoC (Proof-of-Concept)**: 공개된 공격 코드가 있는지 여부
+    *   **EPSS (Exploit Prediction Scoring System)**: 향후 30일 내 공격 발생 가능성
+2.  **우선순위 선정 및 최종 {TOP_CVE_COUNT}개 선택**: **입력 데이터에 명시된 `is_in_kev`와 `epss_score` 정보를 최우선으로 고려**하고, 웹 검색 결과를 종합하여 우선순위를 선정합니다. (KISA/KrCERT 등재 > CISA KEV 등재 > PoC 공개 > 높은 EPSS 점수 > 높은 CVSS 점수 순으로 중요)
 3.  **패키지별 대표 선정 (매우 중요)**: 최종 리포트에 포함할 CVE를 선정할 때, 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중 가장 위험한 **단 하나의 CVE만** 대표로 선정하여 최종 목록에 포함시켜야 합니다.
 4.  **상세 분석**: 각 CVE에 대해 다음 항목을 분석하고 식별하십시오.
     *   **위협 태그(threat_tags)**: "RCE", "Privilege Escalation", "DoS" 등 위협 유형을 식별합니다. CISA KEV에 등재되었다면 **반드시 "Exploited in wild" 태그를 포함**해야 합니다. EPSS 점수가 0.2 이상이면 "High Exploit Probability" 태그를 추가하세요.
@@ -583,9 +686,14 @@ def _call_llm_for_batch_analysis(prompt: str) -> dict:
     try:
         response = make_request('post', api_url, use_proxy=False, json=payload, timeout=600, stream=True)
         
+        # [핵심 개선] AIBox 서버가 500 오류 등을 반환하여 응답이 'ok'가 아닌 경우,
+        # 빈 객체 대신 명시적인 오류 정보를 담은 객체를 반환하여 호출자가 실패를 인지하도록 합니다.
         if not response or not response.ok:
-            logging.error(f"Failed to get a valid response from AIBox server. Status: {response.status_code if response else 'N/A'}")
-            return {}
+            status_code = response.status_code if response else 'N/A'
+            error_text = response.text if response else "No response from server."
+            logging.error(f"AIBox 서버로부터 유효한 응답을 받지 못했습니다. 상태 코드: {status_code}")
+            # 호출한 쪽에서 오류를 인지할 수 있도록 'error' 키를 포함한 객체를 반환합니다.
+            return {"error": f"AIBox server returned status {status_code}", "details": error_text[:500]}
         
         # [BUG FIX] 스트리밍 응답을 처리할 때, 청크 단위로 디코딩하면 멀티바이트 문자가 깨질 수 있습니다.
         # response.text를 사용하여 requests 라이브러리가 인코딩을 올바르게 처리하도록 위임합니다.
@@ -623,47 +731,50 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
         CHUNK_SIZE = 5
         cve_chunks = [cves[i:i + CHUNK_SIZE] for i in range(0, len(cves), CHUNK_SIZE)]
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=6) as executor:
             future_to_chunk = {
                 executor.submit(_call_llm_for_batch_analysis, _create_preliminary_analysis_prompt(chunk)): chunk
                 for chunk in cve_chunks
             }
-            for i, future in enumerate(as_completed(future_to_chunk)):
-                chunk_num = i + 1
+            for i, future in enumerate(as_completed(future_to_chunk), 1):
                 chunk = future_to_chunk[future]
                 chunk_cve_ids = [cve.get('CVE') for cve in chunk if cve.get('CVE')]
-                logging.info(f"  - 예선 {chunk_num}/{len(cve_chunks)}번째 묶음 처리 중... (대상: {len(chunk_cve_ids)}개)")
+                # [BUG FIX] 병렬 처리 시 로그 순서가 섞이는 문제를 해결하기 위해, 작업 완료 시점에 로그를 기록합니다.
+                logging.info(f"  - 예선 {i}/{len(cve_chunks)}번째 묶음 처리 완료. (대상: {len(chunk_cve_ids)}개)")
                 try:
                     # AI 응답은 CVE ID의 리스트 형태일 것으로 기대
                     result = future.result()
+                    # [안정성 강화] AI 분석 요청이 실패했는지(error 키 존재) 확인합니다.
+                    if isinstance(result, dict) and 'error' in result:
+                        logging.error(f"    -> AI 분석 요청 실패: {result.get('details', result['error'])}")
+                        continue # 실패한 경우, 이 청크는 건너뛰고 다음으로 진행
                     
                     # [안정성 강화] AI 응답이 예상과 다른 형식일 경우를 대비한 처리
                     if isinstance(result, list):
                         logging.info(f"    -> AI가 {len(result)}개 선정: {', '.join(result[:5])}...")
                         preliminary_finalists_ids.update(result)
+
                     # [BUG FIX] AI가 예선 분석에서 실수로 결선 분석 형식(객체)의 응답을 보낸 경우 처리
                     elif isinstance(result, dict) and 'cve_analysis_results' in result:
                         cve_ids_from_dict = [item.get('cve_id') for item in result['cve_analysis_results'] if item.get('cve_id')]
                         logging.warning(f"    -> AI 응답이 객체 형식이었으나, 'cve_analysis_results' 키에서 {len(cve_ids_from_dict)}개의 CVE를 추출했습니다.")
                         preliminary_finalists_ids.update(cve_ids_from_dict)
                     else:
-                        # [BUG FIX] 응답이 유효한 JSON 배열이 아닐 경우, raw_response에서 직접 추출을 시도합니다.
-                        raw_text = result.get('raw_response', str(result))
-                        # CVE-XXXX-YYYY 형식의 모든 문자열을 찾습니다.
+                        # [오류 로깅 개선] AI 서버가 반환한 오류 객체에서 'details' 키의 내용을 로그에 명시적으로 기록합니다.
+                        error_details = result.get('details', str(result))
+                        raw_text = str(result)
                         extracted_cves = re.findall(r'CVE-\d{4}-\d{4,}', raw_text)
                         if extracted_cves:
                             logging.warning(f"    -> AI 응답이 리스트가 아니었지만, 텍스트에서 {len(extracted_cves)}개의 CVE 목록을 추출했습니다.")
                             preliminary_finalists_ids.update(extracted_cves)
                         else:
-                            logging.warning(f"    -> AI 응답이 예상과 다름 (리스트가 아님): {str(result)[:200]}...")
+                            logging.warning(f"    -> AI 응답이 예상과 다름 (리스트가 아님): {error_details[:250]}...")
                 except Exception as e:
                     logging.error(f"CVE 예선 분석 묶음 처리 중 오류 발생: {e}")
                 
-                # [사용자 요청] 다음 묶음 처리 전 대기하여 서버 부하를 조절합니다.
-                if chunk_num < len(cve_chunks):
-                    logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
-                    logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
-                    time.sleep(2)
+                # [사용자 요청] 선정된 CVE ID 목록을 로그에 출력합니다.
+                selected_ids_str = ", ".join(preliminary_finalists_ids)
+                logging.info(f"    -> 현재까지 선정된 예선 통과 CVE: {selected_ids_str}")
 
         finalists = [cve for cve in cves if cve.get('CVE') in preliminary_finalists_ids]
         logging.info(f"-> 예선 분석 완료. {len(finalists)}개의 CVE가 최종 분석 대상으로 선정되었습니다.")
@@ -686,17 +797,21 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
     finalist_chunks = [finalists[i:i + FINAL_CHUNK_SIZE] for i in range(0, len(finalists), FINAL_CHUNK_SIZE)] if finalists else []
 
     logging.info(f"  - 최종 후보 {len(finalists)}개를 {len(finalist_chunks)}개의 묶음으로 나누어 분석합니다.")
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_chunk = {executor.submit(_call_llm_for_batch_analysis, _create_final_analysis_prompt(chunk)): chunk for chunk in finalist_chunks}
-        for i, future in enumerate(as_completed(future_to_chunk)):
-            chunk_num = i + 1
+        for i, future in enumerate(as_completed(future_to_chunk), 1):
             chunk = future_to_chunk[future]
             chunk_cve_ids = [cve.get('CVE') for cve in chunk if cve.get('CVE')]
-            logging.info(f"  - 결선 {chunk_num}/{len(finalist_chunks)}번째 묶음 처리 중... (대상: {len(chunk_cve_ids)}개)")
+            # [BUG FIX] 병렬 처리 시 로그 순서가 섞이는 문제를 해결하기 위해, 작업 완료 시점에 로그를 기록합니다.
+            logging.info(f"  - 결선 {i}/{len(finalist_chunks)}번째 묶음 처리 완료. (대상: {len(chunk_cve_ids)}개)")
             try:
                 result = future.result()
                 cve_results = result.get("cve_analysis_results", [])
                 logging.info(f"    -> AI가 {len(cve_results)}개 분석 및 순위 선정 완료.")
+                # [사용자 요청] AI가 선정한 CVE ID 목록을 로그에 출력합니다.
+                if cve_results and isinstance(cve_results, list):
+                    selected_cve_ids = [item.get('cve_id', 'N/A') for item in cve_results]
+                    logging.info(f"    -> 선정된 CVE: {', '.join(selected_cve_ids)}")
                 
                 # [안정성 강화] cve_results가 리스트가 아닐 경우를 대비
                 if not isinstance(cve_results, list):
@@ -711,12 +826,6 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
             except Exception as e:
                 logging.error(f"CVE 결선 분석 묶음 처리 중 오류 발생: {e}")
 
-            # [사용자 요청] 다음 묶음 처리 전 대기하여 서버 부하를 조절합니다.
-            if chunk_num < len(finalist_chunks):
-                logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
-                logging.info(f"    -> 다음 묶음 처리 전 2초간 대기합니다...")
-                time.sleep(2)
-
     # [사용자 요청 수정] AI 분석이 하나라도 성공했다면, AI의 결과를 최종 결과로 사용합니다.
     # AI 분석이 완전히 실패했을 경우에만 점수 기반 폴백 분석을 수행합니다.
     if not analyzed_cves and finalists:
@@ -724,15 +833,18 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
         analyzed_cves = analyze_and_prioritize_manual(finalists)
     else:
         # AI가 일부만 분석한 경우, 분석되지 않은 나머지는 버리고 AI의 결과만 사용합니다.
-        analyzed_cve_ids_from_llm = {cve.get('cve_id') for cve in analyzed_cves}
-        unalyzed_count = len(finalists) - len(analyzed_cve_ids_from_llm)
-        if unalyzed_count > 0:
-            logging.warning(f"AI가 분석하지 않은 {unalyzed_count}개의 CVE는 최종 리포트에서 제외됩니다.")
+        analyzed_cve_ids_from_llm = {cve.get('cve_id') for cve in analyzed_cves if cve.get('cve_id')}
+        unalyzed_cves = [cve for cve in finalists if cve.get('CVE') not in analyzed_cve_ids_from_llm]
+        if unalyzed_cves:
+            logging.warning(f"AI가 분석하지 않은 {len(unalyzed_cves)}개의 CVE에 대해 점수 기반 폴백 분석 및 번역을 수행합니다.")
+            # [사용자 요청] AI가 분석하지 않은 CVE에 대해 수동 분석(번역 포함)을 수행하고 결과를 병합합니다.
+            fallback_analyzed_cves = analyze_and_prioritize_manual(unalyzed_cves)
+            analyzed_cves.extend(fallback_analyzed_cves)
         
 
     # [핵심 개선] "패키지당 1개" 규칙을 적용하되, 최종 CVE 개수가 TOP_CVE_COUNT에 근접하도록 보장하는 로직.
     # 1. AI가 분석한 CVE 목록 외에, 예선은 통과했으나 결선에서 밀린 CVE도 후보군으로 사용합니다.
-    analyzed_cve_ids = {cve.get("cve_id") for cve in analyzed_cves}
+    analyzed_cve_ids = {cve.get("cve_id") for cve in analyzed_cves if cve.get("cve_id")}
     fallback_cves = [cve for cve in finalists if cve.get("CVE") not in analyzed_cve_ids]
     
     final_cves = []
@@ -818,12 +930,24 @@ def analyze_and_prioritize_manual(cves):
     logging.info(f"-> Fallback: Translating summaries for top {len(top_cves)} CVEs using LLM...")
     
     # 번역할 CVE 목록 준비
-    cves_to_translate = []
-    for cve in top_cves:
-        english_summary = extract_summary_from_cve(cve)
-        if english_summary:
-            cves_to_translate.append({"cve_id": cve.get('CVE'), "summary": english_summary})
+    # [개선] 외부 위협 인텔리전스(CISA KEV, EPSS)를 병렬로 조회합니다.
+    with ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as executor:
+        future_to_cve = {executor.submit(fetch_external_threat_intel, cve.get('CVE')): cve for cve in top_cves}
+        for future in as_completed(future_to_cve):
+            cve = future_to_cve[future]
+            try:
+                intel = future.result()
+                cve['is_in_kev'] = intel.get('cisa_kev', {}).get('in_kev', False)
+                cve['has_poc'] = intel.get('has_poc', False) # fetch_external_threat_intel에 PoC 조회 로직 추가 필요
+                cve['epss_score'] = intel.get('epss', {}).get('score', 0.0)
+                cve['epss_percentile'] = intel.get('epss', {}).get('percentile', 0.0)
+            except Exception as e:
+                logging.error(f"Error fetching threat intel for {cve.get('CVE')}: {e}")
 
+    # [개선] 번역할 CVE 목록을 위협 인텔리전스 조회 후에 생성합니다.
+    cves_to_translate = [
+        {"cve_id": cve.get('CVE'), "summary": extract_summary_from_cve(cve)} for cve in top_cves if extract_summary_from_cve(cve)
+    ]
     if cves_to_translate:
         # LLM을 호출하여 일괄 번역
         translation_prompt = _create_batch_translation_prompt(cves_to_translate)
@@ -909,33 +1033,36 @@ def generate_executive_summary(top_cves):
             "severity": cve.get('severity', 'N/A'),
             "threat_tags": cve.get('threat_tags', []),
             "selection_reason": cve.get('selection_reason', ''),
-            "cvss_score": cve.get('cvss3', {}).get('cvss3_base_score', 'N/A')
+            "cvss_score": cve.get('cvss3', {}).get('cvss3_base_score', 'N/A'),
+            # [개선] Executive Summary 프롬프트에 외부 위협 인텔리전스 정보를 추가하여 AI가 활용하도록 합니다.
+            "is_in_kev": cve.get('threat_intel', {}).get('cisa_kev', {}).get('in_kev', False),
+            "epss_score": cve.get('threat_intel', {}).get('epss', {}).get('score')
         }
         for cve in top_cves
     ]
 
     current_date = datetime.now().strftime('%Y-%m-%d')
 
-    # [사용자 요청 반영] RHEL 보안 전문가 관점의 체계적인 보고서 생성을 위해 프롬프트를 개선합니다.
+    # [사용자 요청 반영] Executive Summary의 분석 품질을 높이기 위해 프롬프트를 전면 개편합니다.
     summary_prompt = f"""[시스템 역할]
-당신은 Red Hat Enterprise Linux(RHEL) 시스템의 보안을 책임지는 최고 수준의 보안 전문가입니다. 당신의 임무는 최종 선정된 CVE 목록을 종합적으로 평가하여, 기술적 근거에 기반한 명확하고 구조화된 Executive Summary를 작성하는 것입니다.
+당신은 C-Level 경영진에게 RHEL 시스템의 보안 상태를 보고하는 **수석 보안 아키텍트(Principal Security Architect)**입니다. 당신의 분석은 기술적 사실 나열을 넘어, 비즈니스에 미치는 영향을 중심으로 명확한 실행 계획과 전략적 권고를 제시해야 합니다. **모든 내용은 반드시 유려하고 자연스러운 한국어로 작성해야 합니다.**
 
 [컨텍스트]
 분석 대상은 RHEL 환경에서 발견된 주요 보안 위협 {len(summary_data)}개이며, 보고일은 {current_date}입니다.
 
 [임무]
-제공된 보안 위협 목록을 바탕으로, 아래 가이드라인에 따라 체계적인 **Executive Summary**를 Markdown 형식으로 작성하십시오.
+제공된 보안 위협 목록과 **입력 데이터에 포함된 `is_in_kev`, `epss_score`와 같은 외부 위협 인텔리전스**를 종합적으로 분석하여, 아래 가이드라인에 따라 체계적인 **Executive Summary**를 **Markdown 형식의 텍스트**로 작성하십시오.
 
 ## 분석 가이드라인
-1.  **종합 평가 (Overall Assessment)**: 현재 보안 상태에 대한 전반적인 평가(예: '심각', '주의 필요')와 그 핵심 근거를 제시하며 보고서를 시작하십시오.
+1.  **종합 평가 (Overall Assessment)**: 현재 보안 상태에 대한 전반적인 평가(예: '심각', '주의 필요', '양호')와 그 핵심 근거(예: '실제 공격에 악용되는 `Exploited in wild` 태그가 포함된 CVE가 다수 발견됨')를 제시하며 보고서를 시작하십시오.
 2.  **핵심 위협 상세 분석 (Key Threats Analysis)**:
-    *   가장 시급하고 비즈니스 영향이 큰 위협 1~2개를 선정합니다.
-    *   각 위협에 대해 **구체적인 공격 시나리오**와 **비즈니스 영향**(서비스 중단, 데이터 유출, 평판 하락 등)을 명확히 설명합니다.
-    *   가능하다면, 위협 간의 연관성(예: A 취약점으로 초기 침투 후 B 취약점으로 권한 상승)을 분석하여 공격 체인 관점의 위험도를 제시합니다.
+    *   가장 시급하고 비즈니스 영향이 큰 위협 **2~3개**를 선정합니다.
+    *   각 위협에 대해 **구체적인 공격 시나리오**와 **비즈니스 영향**(서비스 중단, 데이터 유출, 평판 하락 등)을 명확하게 설명합니다.
+    *   **[매우 중요]** 위협 간의 연관성(예: A 취약점으로 초기 침투 후 B 취약점으로 권한 상승)을 분석하여 **공격 체인(Attack Chain) 관점의 위험도**를 제시합니다.
 3.  **대응 전략 (Action Plan)**: 식별된 위협에 대한 대응 방안을 **표(테이블) 형식**으로 명확하게 제시합니다.
     *   **단기 조치 (Immediate Actions)**: 즉시 수행해야 할 패치, 임시 완화책, 긴급 차단 정책 등을 구체적으로 명시합니다.
     *   **중장기 전략 (Long-term Strategy)**: 근본적인 문제 해결을 위한 아키텍처 개선, 보안 강화 설정, 정기적인 취약점 관리 프로세스 도입 등을 제안합니다.
-4.  **결론 및 권고 (Conclusion & Recommendation)**: 전체 내용을 요약하고, 가장 시급하게 실행해야 할 조치를 다시 한번 강조하여 경영진의 의사결정을 돕습니다.
+4.  **결론 및 권고 (Conclusion & Recommendation)**: 전체 내용을 요약하고, **가장 시급하게 실행해야 할 조치 1~2가지**를 다시 한번 강조하여 경영진의 의사결정을 돕습니다.
 
 [입력 데이터: 상위 20개 보안 위협 목록]
 ```json
@@ -953,26 +1080,32 @@ Executive Summary 텍스트를 여기에 작성하십시오. (HTML 태그 없이
     response = make_request('post', api_url, use_proxy=False, json=payload, timeout=300)
 
     if response:
-        # [개선] AI 서버 응답이 JSON이 아닐 경우를 대비한 처리 강화
+        # [사용자 요청] AI 서버 응답이 JSON이거나 순수 텍스트(raw)인 모든 경우를 처리합니다.
         try:
             summary_json = response.json()
-            # [BUG FIX] 서버가 순수 텍스트를 raw_response 키에 담아 반환하는 경우를 최우선으로 처리합니다.
-            summary_text = summary_json.get('raw_response') or summary_json.get('executive_summary') or summary_json.get('analysis_text')
+            # 1. JSON 응답 처리: 여러 가능한 키를 확인하여 요약 텍스트를 추출합니다.
+            possible_keys = ['raw_response', 'executive_summary', 'analysis_text', 'analysis_report']
+            summary_text = next((summary_json.get(key) for key in possible_keys if summary_json.get(key)), None)
             if summary_text:
                 logging.info("Successfully extracted summary text from AI server's JSON response.")
-                # 'Executive Summary:' 같은 불필요한 접두사 제거
-                summary_text = re.sub(r'^\s*Executive Summary:\s*', '', summary_text, flags=re.IGNORECASE).strip()
-                return summary_text
             else:
-                # JSON은 유효하지만 필요한 키가 없는 경우
-                logging.warning(f"AI server returned a valid JSON but without expected keys: {summary_json}")
-        except _json_lib_std.JSONDecodeError:
-            # JSON 파싱 실패 시, 응답을 일반 텍스트로 간주하고 처리
+                # 1-1. JSON 응답에 요약 키는 없지만 'error' 키가 있는 경우
+                if 'error' in summary_json:
+                    error_details = summary_json.get('details', summary_json['error'])
+                    logging.error(f"AI 요약 생성 실패: {summary_json['error']} - Details: {error_details}")
+                    return f"### AI 요약 생성 실패\n\nAI 서버로부터 다음 오류를 수신했습니다:\n- {error_details}"
+                logging.warning(f"AI 서버가 예상치 못한 JSON 응답을 반환했습니다: {summary_json}")
+                # 1-2. 요약 키도, 오류 키도 없는 비정상적인 JSON 응답
+                return f"### AI 요약 처리 실패\n\nAI 서버로부터 예상치 못한 형식의 JSON 응답을 수신했습니다:\n```json\n{dumps_json(summary_json, indent=True)}\n```"
+        except (_json_lib_std.JSONDecodeError, orjson.JSONDecodeError):
+            # 2. 순수 텍스트(Raw) 응답 처리: JSON 파싱에 실패하면 응답을 일반 텍스트로 간주합니다.
             logging.warning("AI server response was not JSON. Processing as plain text.")
             summary_text = response.text.strip()
-            return summary_text
     else:
-        return "상위 취약점에 대한 요약 정보를 생성하지 못했습니다."
+        return "### AI 요약 생성 실패\n\nAI 서버로부터 응답을 받지 못했습니다. 서버 상태 및 네트워크 연결을 확인해 주세요."
+
+    # 모든 경우에 대해 불필요한 접두사를 제거하고 반환합니다.
+    return re.sub(r'^\s*Executive Summary:\s*', '', summary_text, flags=re.IGNORECASE).strip()
 
 def print_selection_reasons_to_console(cves):
     """상위 CVE의 선정 이유를 콘솔에 출력합니다."""
@@ -1001,8 +1134,8 @@ def markdown_to_html(md_text):
     if markdown:
         # 'markdown' 라이브러리를 사용하여 HTML로 변환합니다.
         # 'tables' 확장 기능을 활성화하여 Markdown 테이블을 올바르게 렌더링합니다.
-        # 'nl2br' 확장 기능은 개행 문자를 <br> 태그로 변환하여 줄바꿈을 유지합니다.
-        return markdown(md_text, extensions=['tables', 'nl2br'])
+        # 'nl2br' 확장 기능은 개행 문자를 <br> 태그로 변환하여 줄바꿈을 유지하고, 'tables' 확장 기능으로 표를 올바르게 렌더링합니다.
+        return markdown(md_text, extensions=['tables', 'nl2br', 'fenced_code'])
     else:
         # 라이브러리가 없는 경우, 기존의 단순 변환 로직을 유지합니다.
         # 이 경우, 테이블은 제대로 표시되지 않을 수 있습니다.
@@ -1038,10 +1171,29 @@ def generate_report(processed_cves, executive_summary):
         summary = html.escape(cve.get('concise_summary') or default_summary)
         
         # [요구사항 반영] 'Affected' 상태인 제품 목록을 추출하여 요약 정보에 추가
+        # [사용자 요청] affected_release와 package_state의 모든 제품명을 수집하여 중복 제거
+        # [사용자 요청] '영향 받는 제품' 선정 기준 강화
+        # 1. affected_release와 package_state(fix_state='Affected')에서 제품명 수집
+        # 2. TARGET_PRODUCT_PATTERNS와 일치하는 제품만 필터링
+        # 3. 중복 제거 후 정렬하여 출력
         affected_products_html = ""
-        affected_product_names = cve.get('affected_rhel_products', []) # [개선] 미리 추출된 정보 사용
-        if affected_product_names:
-            products_str = '<br>'.join(affected_product_names)
+        all_affected_products = set()
+
+        if isinstance(cve.get('affected_release'), list):
+            for release in cve['affected_release']:
+                product_name = release.get('product_name')
+                if product_name and any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
+                    all_affected_products.add(product_name)
+
+        if isinstance(cve.get('package_state'), list):
+            for state in cve['package_state']:
+                product_name = state.get('product_name')
+                if state.get('fix_state') == 'Affected' and product_name and any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
+                    all_affected_products.add(product_name)
+
+        if all_affected_products:
+            # 제품명을 정렬하여 일관된 순서로 표시
+            products_str = '<br>'.join(sorted(list(all_affected_products)))
             affected_products_html = f'<br><br><strong>영향 받는 제품:</strong><br>{products_str}'
 
         # [개선] 통합된 선정 이유와 리스크 평가를 가져옴
@@ -1061,13 +1213,30 @@ def generate_report(processed_cves, executive_summary):
             if len(affected_components) > 3: packages_html += f'<span class="threat-tag tag-pkg">...</span>'
         
         final_tags_html = f'<div class="summary-tags">{tags_html}{packages_html}</div>'
-        rhsa_ids = get_rhsa_ids_from_cve(cve)
-        # [개선] RHSA ID를 개별 태그로 만들어 가독성 향상
-        remediation_html = "".join([f'<span class="rhsa-tag"><a href="https://access.redhat.com/errata/{html.escape(rhsa_id)}" target="_blank">{html.escape(rhsa_id)}</a></span>' for rhsa_id in rhsa_ids])
-        if not rhsa_ids:
-            remediation_html = "발행 예정"
+        
+        # [사용자 요청] 조치 방안(RHSA)에 제품 정보 매핑 및 제품명 축약
+        rhsa_product_map = {}
+        if isinstance(cve.get('affected_release'), list):
+            for release in cve['affected_release']:
+                advisory = release.get('advisory')
+                product_name = release.get('product_name', '')
+                if advisory and advisory.startswith("RHSA"):
+                    # 제품명 축약 (예: "Red Hat Enterprise Linux 8..." -> "RHEL 8")
+                    short_product_name = re.sub(r'Red Hat Enterprise Linux (\d+).*', r'RHEL \1', product_name)
+                    if short_product_name not in rhsa_product_map.get(advisory, []):
+                        rhsa_product_map.setdefault(advisory, []).append(short_product_name)
+
+        remediation_html = ""
+        if rhsa_product_map:
+            # RHSA ID로 정렬하여 일관된 순서로 표시
+            sorted_rhsa = sorted(rhsa_product_map.keys())
+            for rhsa_id in sorted_rhsa:
+                # 제품 목록을 정렬하여 (RHEL 7, RHEL 8) 순서 보장
+                products = ", ".join(sorted(rhsa_product_map[rhsa_id]))
+                # 최종 HTML 생성 (예: RHSA-2025:12345 (RHEL 8, RHEL 9))
+                remediation_html += f'<div class="rhsa-item"><span class="rhsa-tag"><a href="https://access.redhat.com/errata/{html.escape(rhsa_id)}" target="_blank">{html.escape(rhsa_id)}</a></span> <span class="rhsa-product">({products})</span></div>'
         else:
-            remediation_html += "<br><small>해당 RHSA 최신 패키지로 업데이트하십시오.</small>"
+            remediation_html = "발행 예정"
         
         severity_icon, severity_class = ('🔥', 'severity-critical') if severity == 'critical' else ('⚠️', 'severity-important')
         rank_change_icon = {'up': '▲', 'down': '▼', 'same': '—', 'new': 'N'}.get(cve.get('rank_change'), '—')
@@ -1082,10 +1251,35 @@ def generate_report(processed_cves, executive_summary):
                 if score_str: cvss3_score = float(score_str)
              except (ValueError, TypeError): pass
 
+        # [사용자 요청] CISA, EPSS 정보 추가
+        threat_intel = cve.get('threat_intel', {})
+        cisa_kev_data = threat_intel.get('cisa_kev', {})
+        if cisa_kev_data.get('in_kev'):
+            cisa_info = cisa_kev_data.get('dueDate', '등재됨') # dueDate가 없으면 '등재됨'으로 표시
+        else:
+            cisa_info = "해당 없음"
+        
+        epss_score = threat_intel.get('epss', {}).get('score')
+        # [BUG FIX] epss_score가 숫자인 경우에만 포맷팅을 적용하여 ValueError를 방지합니다.
+        epss_info = "N/A"
+        if epss_score is not None:
+            try:
+                epss_info = f"{float(epss_score):.5f}"
+            except (ValueError, TypeError):
+                pass # 숫자로 변환할 수 없으면 "N/A" 유지
+        
+        score_details_html = f"""
+            <div class="score-details">
+                <span>CVSS: {cvss3_score if cvss3_score else 'N/A'}</span>
+                <span>CISA: {cisa_info}</span>
+                <span>EPSS: {epss_info}</span>
+            </div>
+        """
+
         table_rows_html += f"""<tr>
             <td class="center-align"><div class="rank-cell"><span class="rank-number">{rank}</span><span class="rank-change {rank_change_class}">{html.escape(rank_change_icon)}</span></div></td>
             <td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a><br><small>{public_date}</small></td>
-            <td class="center-align"><span class="{severity_class} severity-badge">{severity_icon} {str(severity).capitalize()}</span><br><small>CVSS: {cvss3_score}</small></td>
+            <td class="center-align"><span class="{severity_class} severity-badge">{severity_icon} {str(severity).capitalize()}</span>{score_details_html}</td>
             <td class="center-align">{days_in_rank}일</td>
             <td>{final_tags_html}{summary}{affected_products_html}</td>
             <td>{selection_reason}</td>
@@ -1176,13 +1370,15 @@ def generate_report(processed_cves, executive_summary):
     .tag-exploited{{ background-color: var(--danger-color); }}
     .tag-threat{{ background-color: #f57c00; }}
     .tag-pkg{{ background-color: var(--secondary-color); }}
-    .rhsa-tag {{
-        display: inline-block; background-color: var(--success-color); color: white;
-        padding: .2em .6em; margin-right: .5rem; margin-bottom: .4rem;
-        border-radius: 4px; font-size: .85rem; font-weight: 500;
-    }}
+    .rhsa-item {{ margin-bottom: 0.3rem; }}
+    .rhsa-tag {{ display: inline-block; background-color: var(--success-color); color: white; padding: .2em .6em; border-radius: 4px; font-size: .85rem; font-weight: 500; }}
     .rhsa-tag a {{ color: white; text-decoration: none; }}
     .rhsa-tag a:hover {{ text-decoration: underline; }}
+    .rhsa-product {{ font-size: 0.8rem; color: #6c757d; }}
+    .score-details {{
+        font-size: 0.8em; color: #6c757d; margin-top: 0.4rem;
+        display: flex; flex-direction: column; align-items: center; gap: 2px;
+    }}
     .button-container {{
         text-align: right;
         margin-top: 2rem;
@@ -1300,35 +1496,64 @@ def main():
     # 2. 과거 순위에만 있던 CVE를 후보군에 추가
     for cve_id in previous_ranks.keys():
         if cve_id not in candidate_cves_map:
+            # [개선] 과거 순위에만 있던 CVE가 후보군에 추가되었음을 로그로 명시합니다.
+            logging.info(f"  -> 과거 순위의 CVE '{cve_id}'를 분석 후보에 추가합니다.")
             candidate_cves_map[cve_id] = {'CVE': cve_id}
 
     logging.info(f"\n{Color.header(f'Step 2: {len(candidate_cves_map)}개 후보 CVE 상세 정보 조회')}...\n")
     all_cve_data = []
-    
-    # [안정성 강화] 1단계: 로컬 서버에서 먼저 병렬로 조회
+
+    # [안정성 강화] 1단계: 상세 정보와 외부 위협 인텔리전스를 병렬로 조회
     failed_cve_ids = []
     with ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as executor:
-        future_to_cve_id = {}
-        for cve_id in candidate_cves_map.keys():
-            local_url = f"http://127.0.0.1:5000/AIBox/cve/{cve_id}.json"
-            future = executor.submit(fetch_cve_details, local_url)
-            future_to_cve_id[future] = cve_id
+        # 각 CVE에 대해 상세 정보 조회와 외부 정보 조회를 동시에 제출
+        future_to_cve = {
+            executor.submit(fetch_cve_details, f"http://127.0.0.1:5000/AIBox/cve/{cve_id}.json"): (cve_id, 'details')
+            for cve_id in candidate_cves_map.keys()
+        }
+        future_to_cve.update({
+            executor.submit(fetch_external_threat_intel, cve_id): (cve_id, 'intel')
+            for cve_id in candidate_cves_map.keys()
+        })
 
-        for i, future in enumerate(as_completed(future_to_cve_id)):
-            cve_id = future_to_cve_id[future]
-            detailed_data = future.result()
+        processed_count = 0
+        for future in as_completed(future_to_cve):
+            cve_id, data_type = future_to_cve[future]
+            result_data = future.result()
 
-            if detailed_data:
-                merged_data = {**candidate_cves_map[cve_id], **detailed_data}
-                all_cve_data.append(merged_data)
-            else:
-                # 로컬 조회 실패 시, 폴백 목록에 추가
-                failed_cve_ids.append(cve_id)
-    logging.info(f"-> Fetched details for {len(all_cve_data)} CVEs from local cache/server.")
+            if result_data:
+                # 조회된 데이터를 기존 CVE 맵에 병합
+                candidate_cves_map[cve_id].update(result_data if data_type == 'details' else {'threat_intel': result_data})
+            elif data_type == 'details':
+                failed_cve_ids.append(cve_id) # 상세 정보 조회 실패 시에만 폴백
+            
+            # [개선] 진행률 로깅 (전체 작업의 절반이므로 2로 나눔)
+            processed_count += 1
+            logging.info(f"  -> 상세 정보 조회 진행률: {processed_count}/{len(future_to_cve)} ({cve_id}, {data_type})")
+
+    all_cve_data = list(candidate_cves_map.values())
+    logging.info(f"-> [완료] 총 {len(all_cve_data)}개 CVE에 대한 상세 정보 조회를 완료했습니다 (로컬 실패: {len(failed_cve_ids)}건).")
+
+    # [BUG FIX] 외부 위협 인텔리전스(CISA, EPSS) 조회 로직 추가
+    logging.info(f"\n{Color.header(f'Step 2.2: {len(all_cve_data)}개 CVE에 대한 외부 위협 인텔리전스 조회')}...\n")
+    with ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as executor:
+        processed_count = 0
+        future_to_cve = {executor.submit(fetch_external_threat_intel, cve.get('CVE')): cve for cve in all_cve_data if cve.get('CVE')}
+        for future in as_completed(future_to_cve):
+            cve = future_to_cve[future]
+            try:
+                intel = future.result()
+                cve['threat_intel'] = intel
+            except Exception as e:
+                logging.error(f"Error fetching threat intel for {cve.get('CVE')}: {e}")
+                cve['threat_intel'] = {} # 실패 시 빈 객체 할당
+            processed_count += 1
+            logging.info(f"  -> 외부 위협 정보 조회 진행률: {processed_count}/{len(future_to_cve)} ({cve.get('CVE')})")
+    logging.info("-> [완료] 외부 위협 인텔리전스 조회가 완료되었습니다.")
 
     # [안정성 강화] 2단계: 로컬 조회에 실패한 CVE들을 Red Hat 공식 사이트에서 다시 조회 (폴백)
     if failed_cve_ids:
-        logging.info(f"\n{Color.info(f'Step 2.1: 로컬 조회 실패 CVE ({len(failed_cve_ids)}개) 외부 API로 재시도')}...\n")
+        logging.info(f"\n{Color.info(f'Step 2.3: 로컬 조회 실패 CVE ({len(failed_cve_ids)}개) 외부 API로 재시도')}...\n")
         with ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as executor:
             future_to_cve_id = {}
             for cve_id in failed_cve_ids:
@@ -1343,7 +1568,7 @@ def main():
                     all_cve_data.append({**candidate_cves_map[cve_id], **detailed_data})
                 else:
                     logging.critical(f"Failed to fetch details for {cve_id} from all sources. It will be excluded from analysis.")
-        logging.info(f"-> Fetched details for an additional {len(failed_cve_ids)} CVEs from external Red Hat API.")
+        logging.info(f"-> [완료] 외부 Red Hat API를 통해 추가로 {len(failed_cve_ids)}개 CVE 정보를 수집했습니다.")
 
     cves_meeting_criteria = filter_cves_by_strict_criteria(all_cve_data)
 

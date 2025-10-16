@@ -64,17 +64,12 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
         # [요청사항 반영] 프롬프트에 포함할 제품 목록 문자열 생성
         target_products_str = "\n".join([f"- `{p.pattern}`" for p in TARGET_PRODUCT_PATTERNS])
 
-        # [BUG FIX] 외부 위협 인텔리전스 정보를 프롬프트에 포함하여 AI가 활용하도록 합니다.        
+        # [BUG FIX] 외부 위협 인텔리전스 정보를 프롬프트에 포함하여 AI가 활용하도록 합니다.
         external_intel_str = f"""
 [입력 데이터: 외부 위협 인텔리전스]
 ```json
 {dumps(external_data, indent=True)}
 ```"""
-        # [사용자 요청 반영] Red Hat 보안 전문가의 관점에서 체계적인 보고서를 생성하도록 프롬프트를 전면 개편합니다.
-        # AI가 웹 검색을 통해 최신 정보를 수집하고, 지정된 형식에 맞춰 상세 분석을 수행하도록 지시합니다.
-        prompt = f"""[시스템 역할]
-당신은 Red Hat의 최고 수준 보안 전문가이자, 복잡한 기술 내용을 명확하고 간결한 한국어로 전달하는 데 능숙한 IT 전문 번역가입니다. 주어진 CVE 데이터와 **웹 검색을 통해 수집한 최신 정보를 바탕으로**, 아래의 상세한 가이드라인과 출력 형식에 맞춰 전문적인 보안 분석 보고서를 한국어로 작성하십시오.
-
         # [사용자 요청 반영] Red Hat 보안 전문가의 관점에서 체계적인 보고서를 생성하도록 프롬프트를 전면 개편합니다.
         # AI가 웹 검색을 통해 최신 정보를 수집하고, 지정된 형식에 맞춰 상세 분석을 수행하도록 지시합니다.
         prompt = f"""[시스템 역할]

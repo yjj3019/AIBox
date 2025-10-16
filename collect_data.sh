@@ -16,6 +16,7 @@ PROXY_SERVER="http://30.30.30.27:8080"
 OUTPUT_DIR="/data/iso/AIBox"
 OUTPUT_FILE="${OUTPUT_DIR}/cve_data.json"
 CVE_DETAIL_DIR="${OUTPUT_DIR}/cve"
+EPSS_DIR="${OUTPUT_DIR}/epss" # [추가] EPSS 데이터 저장 디렉토리
 LOG_DIR="/data/iso/AIBox/log"
 # This script will now create its own detailed log
 LOG_FILE="${LOG_DIR}/collect_data_detailed.log"
@@ -170,6 +171,11 @@ log_info "\n--- Starting CVE detail collection based on ${OUTPUT_FILE} ---"
 log_info "Ensuring CVE detail directory exists: ${CVE_DETAIL_DIR}"
 mkdir -p "${CVE_DETAIL_DIR}"
 
+# [추가] EPSS 데이터를 저장할 디렉토리 생성
+log_info "Ensuring EPSS data directory exists: ${EPSS_DIR}"
+mkdir -p "${EPSS_DIR}"
+
+
 # 1. cve_data.json 파일에서 CVE ID 목록 추출
 CVE_IDS=$(/usr/bin/jq -r '.[].CVE' "${OUTPUT_FILE}")
 if [ -z "${CVE_IDS}" ]; then
@@ -182,6 +188,8 @@ log_info "Found ${TOTAL_CVES} CVEs to process for detail collection."
 
 CURRENT_CVE_NUM=0
 SUCCESS_COUNT=0
+EPSS_SUCCESS_COUNT=0 # [추가] EPSS 수집 성공 카운터
+
 for CVE_ID in ${CVE_IDS}; do
     CURRENT_CVE_NUM=$((CURRENT_CVE_NUM + 1))
     log_info "(${CURRENT_CVE_NUM}/${TOTAL_CVES}) Fetching details for ${CVE_ID}..."
@@ -206,9 +214,34 @@ for CVE_ID in ${CVE_IDS}; do
         SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     else
         log_error "Failed to fetch details for ${CVE_ID}. HTTP Code: ${DETAIL_HTTP_CODE}. Skipping."
+        # CVE 상세 정보 수집 실패 시 EPSS 수집도 건너뜁니다.
+        sleep 0.2
+        continue
     fi
+
+    # --- [추가] EPSS 데이터 수집 로직 ---
+    EPSS_API_URL="https://api.first.org/data/v1/epss?cve=${CVE_ID}"
+    EPSS_FILE_PATH="${EPSS_DIR}/${CVE_ID}"
+
+    EPSS_CURL_COMMAND="/usr/bin/curl -s -w \"\n%{http_code}\" -A 'Mozilla/5.0' --connect-timeout 15 --max-time 60"
+    if [ -n "${PROXY_SERVER}" ]; then
+        EPSS_CURL_COMMAND="${EPSS_CURL_COMMAND} --proxy ${PROXY_SERVER}"
+    fi
+    EPSS_CURL_COMMAND="${EPSS_CURL_COMMAND} ${EPSS_API_URL}"
+
+    EPSS_HTTP_RESPONSE=$(eval ${EPSS_CURL_COMMAND})
+    EPSS_HTTP_BODY=$(echo "$EPSS_HTTP_RESPONSE" | sed '$d')
+    EPSS_HTTP_CODE=$(echo "$EPSS_HTTP_RESPONSE" | tail -n1)
+
+    if [ "${EPSS_HTTP_CODE}" -eq 200 ] && [ -n "${EPSS_HTTP_BODY}" ]; then
+        echo "${EPSS_HTTP_BODY}" > "${EPSS_FILE_PATH}"
+        log_info " -> Successfully saved EPSS data to ${EPSS_FILE_PATH}"
+        EPSS_SUCCESS_COUNT=$((EPSS_SUCCESS_COUNT + 1))
+    fi
+
     sleep 0.2 # API 서버 부하를 줄이기 위한 짧은 대기
 done
 
-log_info "\nSuccessfully saved details for ${SUCCESS_COUNT} out of ${TOTAL_CVES} CVEs into '${CVE_DETAIL_DIR}' directory."
+log_info "\nSuccessfully saved details for ${SUCCESS_COUNT} out of ${TOTAL_CVES} CVEs into '${CVE_DETAIL_DIR}'."
+log_info "Successfully saved EPSS data for ${EPSS_SUCCESS_COUNT} CVEs into '${EPSS_DIR}'."
 log_info "--- CVE detail collection script finished successfully ---"
