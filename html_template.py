@@ -310,11 +310,12 @@ def get_html_template(data):
             .validation-box code {{ background-color: transparent; padding: 0; }}
             .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
             /* [사용자 요청] 푸터 텍스트를 중앙에 정렬하고 여백을 추가합니다. */
-            footer {{
-                text-align: center;
-                padding: 2rem 0;
-                color: #7f8c8d;
-            }}
+            footer {
+                text-align: center; /* 텍스트를 중앙에 정렬합니다. */
+                padding: 2rem 0;    /* 위아래로 여백을 추가합니다. */
+                margin-top: 2rem;   /* 본문과의 간격을 확보합니다. */
+                color: #7f8c8d;      /* 텍스트 색상을 지정합니다. */
+            }
         </style>
         <script>
             function openGraphPopup(filename) {{

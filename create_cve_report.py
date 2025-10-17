@@ -1,3 +1,8 @@
+#!/usr/bin/env python3.11
+# -*- coding: utf-8 -*-
+
+# 특정 조건의 cve 를 리스트 형태로 출력하는 소스
+
 import os
 import sys
 import json
@@ -75,11 +80,6 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
         prompt = f"""[시스템 역할]
 당신은 Red Hat의 최고 수준 보안 전문가이자, 복잡한 기술 내용을 명확하고 간결한 한국어로 전달하는 데 능숙한 IT 전문 번역가입니다. 주어진 CVE 데이터와 **웹 검색을 통해 수집한 최신 정보를 바탕으로**, 아래의 상세한 가이드라인과 출력 형식에 맞춰 전문적인 보안 분석 보고서를 한국어로 작성하십시오.
 
-        # [사용자 요청 반영] Red Hat 보안 전문가의 관점에서 체계적인 보고서를 생성하도록 프롬프트를 전면 개편합니다.
-        # AI가 웹 검색을 통해 최신 정보를 수집하고, 지정된 형식에 맞춰 상세 분석을 수행하도록 지시합니다.
-        prompt = f"""[시스템 역할]
-당신은 Red Hat의 최고 수준 보안 전문가이자, 복잡한 기술 내용을 명확하고 간결한 한국어로 전달하는 데 능숙한 IT 전문 번역가입니다. 주어진 CVE 데이터와 **웹 검색을 통해 수집한 최신 정보를 바탕으로**, 아래의 상세한 가이드라인과 출력 형식에 맞춰 전문적인 보안 분석 보고서를 한국어로 작성하십시오.
-
 [분석 대상 제품 목록]
 아래 목록에 해당하는 Red Hat Enterprise Linux 제품에 대해서만 분석을 집중하십시오.
 {target_products_str}
@@ -90,7 +90,8 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
 3.  **용어 선택**: 한국어로 번역 시 의미가 모호해질 수 있는 기술 용어는 원문(영어)을 그대로 사용하거나 병기하여 명확성을 유지합니다. (예: 'Orchestration'은 '오케스트레이션'으로 음차 표기)
 4.  **간결성**: 각 항목은 핵심 내용 위주로 간결하게 요약하여 작성합니다.
 
-[입력 데이터: CVE 정보]
+[분석 유형] security report
+[입력 데이터: CVE 정보] 
 ```json
 {dumps(cve_data, indent=True)}
 ```
@@ -180,7 +181,7 @@ def fetch_external_threat_intel(cve_id: str) -> dict:
     }
 
     # 1. CISA KEV 정보 조회 (로컬 파일)
-    kev_file_path = "/data/iso/AIBox/cisa_kev.json"
+    kev_file_path = "/data/iso/AIBox/data/cisa_kev.json"
     try:
         with open(kev_file_path, 'rb') as f:
             kev_data = loads(f.read())
@@ -361,7 +362,8 @@ def main():
         'comprehensive_summary': llm_summary, # AI 분석 결과 추가
         'external_intel': external_intel # 외부 위협 정보 추가
     }
-    context['current_year'] = datetime.now().year
+    # [사용자 요청] 템플릿에서 현재 시간을 사용할 수 있도록 컨텍스트에 추가
+    context['now'] = datetime.now
 
     # 템플릿 파일 경로를 이 스크립트가 위치한 디렉토리 기준으로 설정합니다.
     template_path = os.path.join(os.path.dirname(__file__), 'cve_report_template.html')

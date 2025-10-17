@@ -1,6 +1,8 @@
 #!/usr/bin/env python3.11
 # -*- coding: utf-8 -*-
 
+# cve 파일이 들어있는 txt 파일을 입력받아 그에 상응하는 cve 리포틀 만드는 소스
+
 import os
 import json
 import requests
@@ -121,45 +123,58 @@ def fetch_cve_details(cve_id):
 def process_cve_data(cve_data, skip_filtering=False):
     if not cve_data: return None
     cve_id = cve_data.get('name', 'N/A')
-    
+
+    # [사용자 요청] 필터링 규칙 설명을 위한 변수 초기화
+    filter_reason = "선정"
     filtered_releases = {}
-    
+
     all_releases = cve_data.get('affected_release', [])
-    for release in all_releases:
-        product_name = release.get('product_name', 'Unknown Product')
-        # --cve-file 옵션 사용 시 필터링을 건너뜁니다.
-        if not skip_filtering:
-            
-            is_target_product = any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS)
-            if not is_target_product:
-                continue
+    if not all_releases and not skip_filtering:
+        filter_reason = "영향받는 제품 없음"
+    else:
+        for release in all_releases:
+            product_name = release.get('product_name', 'Unknown Product')
+            # --cve-file 옵션 사용 시 필터링을 건너뜁니다.
+            if not skip_filtering:
+                is_target_product = any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS)
+                if not is_target_product:
+                    filter_reason = "분석 대상 제품 아님"
+                    continue
 
-            package = release.get('package', '')
-            if 'kpatch-patch' in package or 'kernel-rt' in package: continue
-            
-            is_not_affected = any(
-                s.get('product_name') == product_name and s.get('fix_state') == 'Not affected'
-                for s in cve_data.get('package_state', [])
-            )
-            if is_not_affected: continue
-        
-        advisory = release.get('advisory', 'N/A')
-        if product_name not in filtered_releases: filtered_releases[product_name] = {}
-        if advisory not in filtered_releases[product_name]: filtered_releases[product_name][advisory] = []
-        filtered_releases[product_name][advisory].append(release.get('package', ''))
+                package = release.get('package', '')
+                if 'kpatch-patch' in package or 'kernel-rt' in package:
+                    filter_reason = "라이브 커널 패치 또는 실시간 커널 제외"
+                    continue
 
-    if not filtered_releases: 
-        return None
-    
+                is_not_affected = any(
+                    s.get('product_name') == product_name and s.get('fix_state') == 'Not affected'
+                    for s in cve_data.get('package_state', [])
+                )
+                if is_not_affected:
+                    filter_reason = "패치 불필요(Not Affected)"
+                    continue
+
+            advisory = release.get('advisory', 'N/A')
+            if product_name not in filtered_releases: filtered_releases[product_name] = {}
+            if advisory not in filtered_releases[product_name]: filtered_releases[product_name][advisory] = []
+            filtered_releases[product_name][advisory].append(release.get('package', ''))
+
+        if not filtered_releases and filter_reason == "선정":
+            filter_reason = "관련 릴리즈 없음"
+
+    # 필터링되어 릴리즈 정보가 없다면, 필터링 이유를 포함하여 반환
+    if not filtered_releases and not skip_filtering:
+        return {'cve_id': cve_id, 'filter_reason': filter_reason}
+
     bugzilla_info = cve_data.get('bugzilla', {})
-    
+
     # [사용자 요청] 'affected_release' 필드를 기반으로 패키지 이름 추출
     affected_package_names = set()
     if isinstance(cve_data.get('affected_release'), list):
         for release in cve_data['affected_release']:
             # [BUG FIX] TARGET_PRODUCT_PATTERNS에 해당하는 제품의 패키지만 고려합니다.
             product_name = release.get('product_name', 'Unknown Product')
-            if not any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
+            if not skip_filtering and not any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
                 continue
 
             full_pkg_name = release.get('package')
@@ -180,7 +195,8 @@ def process_cve_data(cve_data, skip_filtering=False):
         'bugzilla_id': bugzilla_info.get('id'),
         'bugzilla_url': bugzilla_info.get('url'),
         'cwe_id': cve_data.get('cwe'),
-        'affected_package_names': sorted(list(affected_package_names))
+        'affected_package_names': sorted(list(affected_package_names)),
+        'filter_reason': filter_reason # [사용자 요청] 필터링 결과 추가
     }
 
 def get_korean_summaries_with_llm(cve_list):
@@ -200,7 +216,7 @@ def get_korean_summaries_with_llm(cve_list):
         # AI에게 전달할 데이터 형식에 맞게 입력 데이터를 가공
         cve_for_prompt = {
             "cve_id": cve_id,
-            "severity": cve.get('severity', 'N/A'),
+            "severity": cve.get('severity', 'N/A'), # type: ignore
             "cvss_score": cve.get('cvss3_score', 'N/A'),
             "summary": cve.get('summary_en', '')
         }
@@ -208,7 +224,7 @@ def get_korean_summaries_with_llm(cve_list):
         # security.py의 전문가 프롬프트를 적용
         prompt = {
             "task": "research_and_summarize_cve_deep_dive_in_korean",
-            "instructions": (
+            "prompt": ( # type: ignore
                 "You are a top-tier cybersecurity expert specializing in Red Hat Enterprise Linux (RHEL). "
                 "Your mission is to conduct a deep-dive analysis of the provided CVE. "
                 "You MUST perform a web search to gather the latest threat intelligence. "
@@ -217,19 +233,20 @@ def get_korean_summaries_with_llm(cve_list):
                 "\n1.  **Threat Intelligence Gathering (Web Search)**: Search for CISA KEV (Known Exploited Vulnerabilities) and PoC (Proof-of-Concept) code availability (e.g., Exploit-DB, GitHub)."
                 "\n2.  **Detailed Analysis**: Based on the gathered intelligence, provide:"
                 "\n    - **threat_tags**: Identify threat types like 'RCE', 'Privilege Escalation'. If it's in CISA KEV, you MUST include the 'Exploited in wild' tag. If a PoC is public, add 'PoC Available'."
-                "\n    - **concise_summary**: A 2-3 sentence summary in Korean for technical experts."
+                "\n    - **concise_summary**: A 2-3 sentence summary in Korean for technical experts." # type: ignore
                 "\n\n[Output Format]"
                 "\nReturn ONLY a single, valid JSON object with keys: 'threat_tags', 'concise_summary'."
             ),
-            "cve_data": cve_for_prompt
+            "cve_data": cve_for_prompt,
+            "model_selector": "deep_dive" # [수정] 서버가 reasoning_model을 선택하도록 키워드 추가
         }
         try:
-            response = requests.post(LLM_ANALYZE_URL, json=prompt, timeout=180, headers={'Content-Type': 'application/json'})
+            response = requests.post(LLM_ANALYZE_URL, json=prompt, timeout=180, headers={'Content-Type': 'application/json'}) # type: ignore
             if response.status_code == 200:
                 try:
                     result = response.json()
                     # [수정] 'selection_reason'을 제외한 구조화된 분석 결과를 반환
-                    if all(k in result for k in ['threat_tags', 'concise_summary']):
+                    if all(k in result for k in ['threat_tags', 'concise_summary']): # type: ignore
                         return cve_id, result
                 except json.JSONDecodeError:
                     logging.warning(f"[{cve_id}] LLM 응답이 JSON이 아님: {response.text[:100]}")
@@ -285,6 +302,16 @@ def generate_interactive_html_report(cve_list, custom_report_path=None):
             <tr>
                 <td><a href="https://access.redhat.com/security/cve/{cve['cve_id']}" target="_blank">{cve['cve_id']}</a></td>
                 <td colspan="7" style="text-align: center; color: #777;">{cve['error']}</td>
+            </tr>
+            """
+            continue
+
+        # [사용자 요청] 필터링된 CVE에 대한 설명 추가
+        if cve.get('filter_reason') and cve.get('filter_reason') != '선정':
+            table_rows_html += f"""
+            <tr>
+                <td><a href="https://access.redhat.com/security/cve/{cve['cve_id']}" target="_blank">{cve['cve_id']}</a></td>
+                <td colspan="7" style="text-align: center; color: #777;">{cve['filter_reason']}</td>
             </tr>
             """
             continue
@@ -493,7 +520,7 @@ def generate_interactive_html_report(cve_list, custom_report_path=None):
             <div class="report-header">
                 <h1>Red Hat Enterprise Linux 취약점 분석 리포트</h1>
                 <p>AI 기반 자동 요약 및 번역 | 최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            </div>
+            </div>            
             <div class="controls"><button id="export-btn">Excel로 저장</button></div>
             <table id="report-table">
                 <thead><tr>
@@ -617,11 +644,13 @@ def main():
     
     processed_cves = []
     for d in all_cve_details:
+        # [사용자 요청] 필터링 설명을 위해, 조회 실패 시에도 cve_id와 에러 메시지를 포함하여 전달
         if d.get('error'):
             processed_cves.append(d)
             continue
         # --cve-file 옵션 사용 시 필터링 건너뛰기
         processed = process_cve_data(d, skip_filtering=bool(args.cve_file))
+        # [사용자 요청] process_cve_data가 필터링되어 None을 반환하는 대신, 이유가 담긴 dict를 반환하도록 수정됨
         if processed:
             processed_cves.append(processed)
 
@@ -637,7 +666,10 @@ def main():
     logging.info(f"데이터 정제 완료. 분석 대상 CVE는 총 {len(processed_cves)}개 입니다.")
 
     # [NEW] AI 분석 및 국문 요약 생성 (security.py의 안정적인 단일 요청 방식 적용)
-    final_cve_list = get_korean_summaries_with_llm([cve for cve in processed_cves if not cve.get('error')])
+    # [사용자 요청] AI 분석 대상은 필터링을 통과한 CVE들로 한정
+    cves_for_ai_analysis = [cve for cve in processed_cves if not cve.get('error') and cve.get('filter_reason') == '선정']
+    final_cve_list = get_korean_summaries_with_llm(cves_for_ai_analysis)
+
     # 에러가 발생한 CVE들을 최종 목록에 다시 추가
     final_cve_list.extend([cve for cve in processed_cves if cve.get('error')])
     

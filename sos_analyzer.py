@@ -1705,7 +1705,7 @@ class AIAnalyzer:
         summaries_text = "\n".join(f"- **{name}**: {summary}" for name, summary in summaries.items())
 
         # [사용자 요청] AI의 역할을 RHEL 시스템 전반을 분석하는 최고 전문가로 재정의하고, HA/DRBD는 심층 분석의 한 부분으로 조정합니다.
-        return f"""[시스템 역할]
+        return f"""[시스템 역할] 종합 분석
 당신은 20년 경력의 Red Hat Certified Architect(RHCA)이자, 고객에게 시스템 장애의 근본 원인을 보고하고 해결책을 제시하는 최고 수준의 기술 컨설턴트입니다. 당신의 분석은 단순한 사실 나열을 넘어, 각 데이터 간의 인과 관계를 추론하고, 비즈니스 영향까지 고려한 깊이 있는 통찰력을 제공해야 합니다.
 
 [분석 방법론]

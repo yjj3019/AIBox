@@ -22,11 +22,36 @@ import html
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# [개선] Markdown 형식의 Executive Summary를 HTML로 변환하기 위해 라이브러리 추가
+# [개선 & 안정성 강화] Markdown 라이브러리가 없을 경우 자동으로 설치하는 로직 추가
 try:
     from markdown import markdown
 except ImportError:
-    markdown = None
+    logging.warning("The 'markdown' library is not installed. Attempting to install it now...")
+    try:
+        import subprocess
+        # [BUG FIX] pip가 시스템에 여러 버전 설치된 경우를 대비하여, 현재 스크립트를 실행하는
+        # 파이썬의 실행 파일(sys.executable)을 사용하여 정확한 pip를 호출합니다.
+        # 이렇게 하면 가상 환경 등에서도 올바르게 라이브러리를 설치할 수 있습니다.
+        # [BUG FIX] PermissionError: [Errno 13]를 방지하기 위해 --user 플래그를 추가하여
+        # 시스템 디렉토리가 아닌 사용자 디렉토리에 라이브러리를 설치하도록 합니다.
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "markdown"])
+        from markdown import markdown
+
+        # [BUG FIX] 'No module named markdown' 오류 해결
+        # pip install --user로 설치한 후, 현재 실행 중인 프로세스가 새 라이브-러리를 즉시 찾지 못하는 문제를 해결합니다.
+        # 1. 사용자 site-packages 경로를 sys.path에 추가합니다.
+        # 2. importlib를 사용하여 import 캐시를 무효화합니다.
+        import site
+        import importlib
+        # site.USER_SITE는 --user로 설치된 패키지의 경로입니다.
+        if site.USER_SITE not in sys.path:
+            sys.path.append(site.USER_SITE)
+        importlib.invalidate_caches()
+        logging.info("Successfully installed and imported the 'markdown' library.")
+    except Exception as e:
+        logging.error(f"Failed to auto-install 'markdown' library: {e}")
+        logging.error("Executive Summary will be rendered as plain text. Please install it manually using: pip install markdown")
+        markdown = None
 
 # --- Settings ---
 # 분석 기간 (일)
@@ -151,14 +176,14 @@ def fetch_external_threat_intel(cve_id: str) -> dict:
 
     # 1. CISA KEV 정보 조회 (로컬 파일)
     # [사용자 요청] cisa_kev.json 파일에서 CVE ID 등재 여부 확인
-    kev_file_path = "/data/iso/AIBox/cisa_kev.json" # AIBox_Server.py와 경로 통일
+    kev_file_path = "/data/iso/AIBox/data/cisa_kev.json" # AIBox_Server.py와 경로 통일
     try:
         with open(kev_file_path, 'rb') as f:
             kev_data = orjson.loads(f.read()) if _JSON_LIB == "orjson" else _json_lib_std.load(f)
         for vuln in kev_data.get("vulnerabilities", []):
             if vuln.get("cveID") == cve_id:
                 intel["cisa_kev"]["in_kev"] = True
-                intel["cisa_kev"]["dueDate"] = vuln.get("dueDate")
+                intel["cisa_kev"]["date_added"] = vuln.get("dateAdded")
                 logging.info(f"-> 로컬 KEV 파일에서 '{cve_id}'를 찾았습니다.")
                 break
     except (FileNotFoundError, _json_lib_std.JSONDecodeError, IOError) as e:
@@ -496,7 +521,7 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
             "epss_score": threat_intel.get('epss', {}).get('score')
         })
 
-    return f"""[시스템 역할]
+    return f"""[시스템 역할] deep_dive 종합 분석
 당신은 Red Hat Enterprise Linux(RHEL)의 보안 취약점을 분석하는 최고 수준의 사이버 보안 전문가입니다. 당신의 임무는 주어진 여러 개의 CVE 데이터 목록을 분석하여, 실제 위협이 되는 CVE의 우선순위를 선정하고 상세 분석을 수행하는 것입니다. **모든 분석 결과는 반드시 자연스러운 한국어로 작성해야 합니다.**
 
 [분석 가이드라인 및 웹 검색 활용]
@@ -513,7 +538,6 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
     *   **영향받는 핵심 컴포넌트(affected_components)**: 'kernel', 'glibc', 'openssl', 'systemd', 'grub2', 'gcc', 'bash', 'pacemaker', 'corosync', 'openssh' 등 RHEL 시스템의 핵심 컴포넌트를 식별합니다.
     *   **간결한 요약(concise_summary)**: 비전문가도 이해할 수 있도록 **한국어 2~3줄로** 요약합니다.
     *   **선정 이유(selection_reason)**: **웹 검색으로 찾은 CISA KEV, PoC, EPSS 정보를 핵심 근거로** 사용하여, RHEL 환경에서의 실질적인 위협 시나리오, 공격 난이도, 영향받는 서비스의 중요도를 종합하여 **한국어로 구체적으로 설명**합니다.
-
 [입력 데이터: CVE 목록]
 ```json
 {dumps_json(cves_for_prompt, indent=True)}
@@ -685,20 +709,25 @@ def _call_llm_for_batch_analysis(prompt: str) -> dict:
     # 타임아웃을 600초(10분)로 늘려 대규모 분석을 지원합니다.
     try:
         response = make_request('post', api_url, use_proxy=False, json=payload, timeout=600, stream=True)
-        
-        # [핵심 개선] AIBox 서버가 500 오류 등을 반환하여 응답이 'ok'가 아닌 경우,
-        # 빈 객체 대신 명시적인 오류 정보를 담은 객체를 반환하여 호출자가 실패를 인지하도록 합니다.
+
         if not response or not response.ok:
             status_code = response.status_code if response else 'N/A'
             error_text = response.text if response else "No response from server."
             logging.error(f"AIBox 서버로부터 유효한 응답을 받지 못했습니다. 상태 코드: {status_code}")
-            # 호출한 쪽에서 오류를 인지할 수 있도록 'error' 키를 포함한 객체를 반환합니다.
             return {"error": f"AIBox server returned status {status_code}", "details": error_text[:500]}
         
-        # [BUG FIX] 스트리밍 응답을 처리할 때, 청크 단위로 디코딩하면 멀티바이트 문자가 깨질 수 있습니다.
-        # response.text를 사용하여 requests 라이브러리가 인코딩을 올바르게 처리하도록 위임합니다.
-        # stream=True와 함께 사용하면, response.text는 여전히 스트리밍 방식으로 동작하여 메모리 효율성을 유지합니다.
-        full_response_str = response.text
+        # [핵심 수정] 스트리밍 응답을 처리합니다.
+        # 서버가 보내주는 데이터 조각(chunk)들을 순서대로 합쳐서 전체 응답을 만듭니다.
+        # 이 방식은 타임아웃 문제를 해결하고, 대용량 응답을 메모리 효율적으로 처리합니다.
+        # [BUG FIX] iter_content가 decode_unicode=True 임에도 bytes를 반환하는 경우에 대비하여
+        # 명시적으로 디코딩하여 TypeError를 방지합니다.
+        # 'must be str, not bytes' 오류를 해결합니다.
+        full_response_str = "".join(
+            chunk.decode('utf-8', errors='ignore') if isinstance(chunk, bytes) else chunk
+            for chunk in response.iter_content(chunk_size=8192, decode_unicode=True)
+            if chunk
+        )
+                
         if not full_response_str:
             logging.error("AIBox server returned an empty response body.")
             return {}
@@ -771,13 +800,10 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
                             logging.warning(f"    -> AI 응답이 예상과 다름 (리스트가 아님): {error_details[:250]}...")
                 except Exception as e:
                     logging.error(f"CVE 예선 분석 묶음 처리 중 오류 발생: {e}")
-                
-                # [사용자 요청] 선정된 CVE ID 목록을 로그에 출력합니다.
-                selected_ids_str = ", ".join(preliminary_finalists_ids)
-                logging.info(f"    -> 현재까지 선정된 예선 통과 CVE: {selected_ids_str}")
 
         finalists = [cve for cve in cves if cve.get('CVE') in preliminary_finalists_ids]
-        logging.info(f"-> 예선 분석 완료. {len(finalists)}개의 CVE가 최종 분석 대상으로 선정되었습니다.")
+        # [사용자 요청] 예선 통과 CVE 목록을 최종적으로 한 번만 출력합니다.
+        logging.info(f"-> 예선 분석 완료. 최종 선정된 예선 통과 CVE: {len(finalists)}개 - {', '.join(sorted(list(preliminary_finalists_ids)))}")
 
     # 2. 최종 후보군에 대해 결선 분석을 수행합니다.
     else: # CVE가 20개 이하이면 예선 없이 바로 결선으로 진행
@@ -1052,7 +1078,7 @@ def generate_executive_summary(top_cves):
 
 [임무]
 제공된 보안 위협 목록과 **입력 데이터에 포함된 `is_in_kev`, `epss_score`와 같은 외부 위협 인텔리전스**를 종합적으로 분석하여, 아래 가이드라인에 따라 체계적인 **Executive Summary**를 **Markdown 형식의 텍스트**로 작성하십시오.
-
+[분석 유형] Executive Summary
 ## 분석 가이드라인
 1.  **종합 평가 (Overall Assessment)**: 현재 보안 상태에 대한 전반적인 평가(예: '심각', '주의 필요', '양호')와 그 핵심 근거(예: '실제 공격에 악용되는 `Exploited in wild` 태그가 포함된 CVE가 다수 발견됨')를 제시하며 보고서를 시작하십시오.
 2.  **핵심 위협 상세 분석 (Key Threats Analysis)**:
@@ -1166,6 +1192,38 @@ def generate_report(processed_cves, executive_summary):
     for i, cve in enumerate(processed_cves):
         if not isinstance(cve, dict): continue
         rank, cve_id, severity = i + 1, cve.get('CVE', 'N/A'), cve.get('severity', 'N/A')
+
+        # [BUG FIX] RHSA 필터링 로직을 for 루프 안으로 이동하여 각 CVE에 대해 개별적으로 적용합니다.
+        rhsa_product_map = {}
+        if isinstance(cve.get('affected_release'), list):
+            for release in cve['affected_release']:
+                advisory = release.get('advisory')
+                product_name = release.get('product_name', '')
+                # [핵심 수정] TARGET_PRODUCT_PATTERNS에 해당하는 제품의 RHSA만 추가합니다.
+                if advisory and advisory.startswith("RHSA") and any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
+                    # [BUG FIX] re.sub에서 백레퍼런스를 사용하려면 백슬래시를 이스케이프해야 합니다.
+                    # r'RHEL \1' -> r'RHEL \\1'로 수정하여 'RHEL 9'와 같이 올바르게 출력되도록 합니다.
+                    short_product_name = re.sub(r'Red Hat Enterprise Linux (\d+).*', r'RHEL \\1', product_name)
+                    rhsa_product_map.setdefault(advisory, set()).add(short_product_name)
+
+        remediation_html = ""
+        if rhsa_product_map:
+            sorted_rhsa = sorted(rhsa_product_map.keys())
+            for rhsa_id in sorted_rhsa:
+                products = ", ".join(sorted(list(rhsa_product_map[rhsa_id])))
+                # [사용자 요청] RHSA와 제품 버전을 별도의 태그로 표시하여 시인성 향상
+                product_tags_html = "".join(
+                    f'<span class="rhsa-product-tag">{html.escape(p.strip())}</span>'
+                    for p in products.split(',')
+                )
+                remediation_html += f'<div class="rhsa-item"><span class="rhsa-id-tag"><a href="https://access.redhat.com/errata/{html.escape(rhsa_id)}" target="_blank">{html.escape(rhsa_id)}</a></span>{product_tags_html}</div>'
+        else:
+            remediation_html = "발행 예정"
+
+        # [BUG FIX] CISA/EPSS 정보 표시 로직을 for 루프 안으로 이동하여 각 CVE에 대해 개별적으로 적용합니다.
+        threat_intel = cve.get('threat_intel', {})
+        cisa_kev_data = threat_intel.get('cisa_kev', {})
+
         public_date = cve.get('public_date', 'N/A').split('T')[0]
         default_summary = " ".join(cve.get('details', [])) or '요약 정보 없음'
         summary = html.escape(cve.get('concise_summary') or default_summary)
@@ -1212,32 +1270,6 @@ def generate_report(processed_cves, executive_summary):
                 packages_html += f'<span class="threat-tag tag-pkg">{pkg}</span>'
             if len(affected_components) > 3: packages_html += f'<span class="threat-tag tag-pkg">...</span>'
         
-        final_tags_html = f'<div class="summary-tags">{tags_html}{packages_html}</div>'
-        
-        # [사용자 요청] 조치 방안(RHSA)에 제품 정보 매핑 및 제품명 축약
-        rhsa_product_map = {}
-        if isinstance(cve.get('affected_release'), list):
-            for release in cve['affected_release']:
-                advisory = release.get('advisory')
-                product_name = release.get('product_name', '')
-                if advisory and advisory.startswith("RHSA"):
-                    # 제품명 축약 (예: "Red Hat Enterprise Linux 8..." -> "RHEL 8")
-                    short_product_name = re.sub(r'Red Hat Enterprise Linux (\d+).*', r'RHEL \1', product_name)
-                    if short_product_name not in rhsa_product_map.get(advisory, []):
-                        rhsa_product_map.setdefault(advisory, []).append(short_product_name)
-
-        remediation_html = ""
-        if rhsa_product_map:
-            # RHSA ID로 정렬하여 일관된 순서로 표시
-            sorted_rhsa = sorted(rhsa_product_map.keys())
-            for rhsa_id in sorted_rhsa:
-                # 제품 목록을 정렬하여 (RHEL 7, RHEL 8) 순서 보장
-                products = ", ".join(sorted(rhsa_product_map[rhsa_id]))
-                # 최종 HTML 생성 (예: RHSA-2025:12345 (RHEL 8, RHEL 9))
-                remediation_html += f'<div class="rhsa-item"><span class="rhsa-tag"><a href="https://access.redhat.com/errata/{html.escape(rhsa_id)}" target="_blank">{html.escape(rhsa_id)}</a></span> <span class="rhsa-product">({products})</span></div>'
-        else:
-            remediation_html = "발행 예정"
-        
         severity_icon, severity_class = ('🔥', 'severity-critical') if severity == 'critical' else ('⚠️', 'severity-important')
         rank_change_icon = {'up': '▲', 'down': '▼', 'same': '—', 'new': 'N'}.get(cve.get('rank_change'), '—')
         rank_change_class = f"rank-{cve.get('rank_change', 'same')}"
@@ -1252,17 +1284,20 @@ def generate_report(processed_cves, executive_summary):
              except (ValueError, TypeError): pass
 
         # [사용자 요청] CISA, EPSS 정보 추가
+        # [BUG FIX] CISA/EPSS 정보가 리포트에 누락되는 문제를 해결합니다.
+        # threat_intel 데이터를 사용하여 cisa_info와 epss_info를 생성합니다.
         threat_intel = cve.get('threat_intel', {})
-        cisa_kev_data = threat_intel.get('cisa_kev', {})
-        if cisa_kev_data.get('in_kev'):
-            cisa_info = cisa_kev_data.get('dueDate', '등재됨') # dueDate가 없으면 '등재됨'으로 표시
+        cisa_kev_info = threat_intel.get('cisa_kev', {})
+        if cisa_kev_info.get('in_kev'):
+            cisa_info = cisa_kev_info.get('date_added', '등재됨')
         else:
             cisa_info = "해당 없음"
         
+        epss_info = "N/A"
         epss_score = threat_intel.get('epss', {}).get('score')
         # [BUG FIX] epss_score가 숫자인 경우에만 포맷팅을 적용하여 ValueError를 방지합니다.
         epss_info = "N/A"
-        if epss_score is not None:
+        if epss_score is not None and isinstance(epss_score, (int, float)):
             try:
                 epss_info = f"{float(epss_score):.5f}"
             except (ValueError, TypeError):
@@ -1270,7 +1305,7 @@ def generate_report(processed_cves, executive_summary):
         
         score_details_html = f"""
             <div class="score-details">
-                <span>CVSS: {cvss3_score if cvss3_score else 'N/A'}</span>
+                <span>CVSS: {cvss3_score if cvss3_score > 0 else 'N/A'}</span>
                 <span>CISA: {cisa_info}</span>
                 <span>EPSS: {epss_info}</span>
             </div>
@@ -1278,10 +1313,10 @@ def generate_report(processed_cves, executive_summary):
 
         table_rows_html += f"""<tr>
             <td class="center-align"><div class="rank-cell"><span class="rank-number">{rank}</span><span class="rank-change {rank_change_class}">{html.escape(rank_change_icon)}</span></div></td>
-            <td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a><br><small>{public_date}</small></td>
+            <td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a><br><small>{public_date if public_date != 'N/A' else ''}</small></td>
             <td class="center-align"><span class="{severity_class} severity-badge">{severity_icon} {str(severity).capitalize()}</span>{score_details_html}</td>
             <td class="center-align">{days_in_rank}일</td>
-            <td>{final_tags_html}{summary}{affected_products_html}</td>
+            <td><div class="summary-tags">{tags_html}{packages_html}</div>{summary}{affected_products_html}</td>
             <td>{selection_reason}</td>
             <td>{remediation_html}</td></tr>"""
     
@@ -1370,11 +1405,13 @@ def generate_report(processed_cves, executive_summary):
     .tag-exploited{{ background-color: var(--danger-color); }}
     .tag-threat{{ background-color: #f57c00; }}
     .tag-pkg{{ background-color: var(--secondary-color); }}
-    .rhsa-item {{ margin-bottom: 0.3rem; }}
-    .rhsa-tag {{ display: inline-block; background-color: var(--success-color); color: white; padding: .2em .6em; border-radius: 4px; font-size: .85rem; font-weight: 500; }}
-    .rhsa-tag a {{ color: white; text-decoration: none; }}
-    .rhsa-tag a:hover {{ text-decoration: underline; }}
-    .rhsa-product {{ font-size: 0.8rem; color: #6c757d; }}
+    /* [사용자 요청] RHSA 조치 방안 스타일 개선 */
+    .rhsa-item {{ display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.4rem; }}
+    .rhsa-id-tag {{ display: inline-block; background-color: var(--success-color); color: white; padding: .2em .6em; border-radius: 4px; font-size: .85rem; font-weight: 500; }}
+    .rhsa-id-tag a {{ color: white; text-decoration: none; }}
+    .rhsa-id-tag a:hover {{ text-decoration: underline; }}
+    .rhsa-product-tag {{ display: inline-block; background-color: #e9ecef; color: #495057; padding: .2em .6em; border-radius: 4px; font-size: .8rem; font-weight: 500; }}
+    /* --- END RHSA 스타일 --- */
     .score-details {{
         font-size: 0.8em; color: #6c757d; margin-top: 0.4rem;
         display: flex; flex-direction: column; align-items: center; gap: 2px;

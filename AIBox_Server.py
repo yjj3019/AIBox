@@ -337,6 +337,21 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
                     ANALYSIS_STATUS[log_key]["report_file"] = os.path.basename(report_full_path)
             else:
                 ANALYSIS_STATUS[log_key]["status"] = "failed"
+            
+            # [사용자 요청] 분석 완료 시, 생성 시간 및 소요 시간 메타데이터를 JSON 파일로 저장합니다.
+            if is_success and "report_file" in ANALYSIS_STATUS[log_key]:
+                end_time = time.time()
+                start_time = ANALYSIS_STATUS[log_key].get("start_time", end_time)
+                duration = end_time - start_time
+                
+                report_basename = os.path.splitext(ANALYSIS_STATUS[log_key]["report_file"])[0]
+                meta_filename = f"{report_basename}.json"
+                meta_filepath = os.path.join(app.config['OUTPUT_FOLDER'], meta_filename)
+                
+                meta_data = {"creation_timestamp": end_time, "duration_seconds": duration}
+                with open(meta_filepath, 'w', encoding='utf-8') as f:
+                    json.dump(meta_data, f)
+                logging.info(f"분석 메타데이터 저장 완료: {meta_filepath}")
                 # [사용자 요청] 분석 실패 시, 마지막 로그를 함께 기록하여 원인 파악을 돕습니다.
                 last_log_line = ANALYSIS_STATUS[log_key]["log"][-1] if ANALYSIS_STATUS[log_key]["log"] else "로그 없음"
                 fail_message = (
@@ -378,13 +393,16 @@ def cleanup_old_analysis_statuses():
 def log_server_status():
     """[신규] 서버의 현재 부하 상태를 주기적으로 로깅합니다."""
     with ANALYSIS_LOCK:
-        running_analyses = sum(1 for status in ANALYSIS_STATUS.values() if status['status'] == 'running')
+        running_analyses = sum(1 for status in ANALYSIS_STATUS.values() if status['status'] not in ['complete', 'failed', 'queued'])
     
-    # [수정] Semaphore 대신 Queue 크기를 로깅합니다.
+    # [수정] Queue 크기와 함께 최대 워커 수를 로깅하여 제한을 함께 표시합니다.
+    limit = CONFIG.get('llm_max_workers', 'N/A')
+    limit_str = 'unlimited' if limit == 0 else limit
+
     status_log = (
         f"[SERVER STATUS] Active Threads: {threading.active_count()}, "
         f"Running Analyses: {running_analyses}, "
-        f"LLM Queue Size: {LLM_REQUEST_QUEUE.qsize()}"
+        f"LLM Queue Size: {LLM_REQUEST_QUEUE.qsize()}/{limit_str}"
     )
  
     # psutil이 설치된 경우에만 메모리 사용량 정보를 추가합니다.
@@ -483,9 +501,17 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
     """
     [개선] LLM을 호출하고 결과를 캐싱하는 블로킹 함수.
     동일한 요청에 대해서는 캐시된 결과를 반환하여 API 호출을 줄입니다.
+    [사용자 요청] 작업 유형에 따라 적합한 LLM 모델을 선택적으로 사용합니다.
     """
     cache_key = get_cache_key(system_message, user_message)
     cache_ttl_seconds = CONFIG.get('cache_ttl_days', 7) * 24 * 60 * 60
+
+    # [신규] 프롬프트 내용에 따라 사용할 모델을 결정합니다.
+    # 'deep_dive', '종합 분석', 'Executive Summary' 등 복잡한 추론이 필요하면 reasoning_model을 사용합니다.
+    if any(keyword in user_message for keyword in ['deep_dive', '종합 분석', 'Executive Summary', 'security report']):
+        model_to_use = CONFIG.get("reasoning_model", CONFIG["model"])
+    else:
+        model_to_use = CONFIG.get("fast_model", CONFIG["model"])
 
     # 1. 캐시 확인
     cached_response = cache.get(cache_key)
@@ -497,13 +523,11 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
 
     # 2. Cache Miss: LLM 호출 (지능형 청킹 적용)
     logging.info(f"[CACHE MISS] LLM 서버에 분석을 요청합니다. (Key: {cache_key[:10]}...)")
-    
-    # [핵심 개선] _call_llm_single_blocking 함수가 이제 재귀적으로 청킹을 처리하므로,
-    # 이 함수를 직접 호출하기만 하면 됩니다.
-    # [BUG FIX] 데드락을 유발하는 submit_llm_request를 제거하고, 실제 작업 함수를 직접 호출합니다.
-    # submit_llm_request는 블로킹 함수이므로, API 핸들러 스레드가 여기서 멈추면
-    # 다른 요청을 처리할 수 없어 데드락이 발생합니다.
-    raw_response_str = _call_llm_single_blocking(system_message, user_message, max_tokens, cache_key)
+
+    # [핵심 개선] 모든 LLM 요청을 중앙 큐에서 관리하기 위해 submit_llm_request를 사용합니다.
+    # 블로킹 요청도 큐를 통해 순차적으로 처리하여 LLM 서버의 과부하를 방지하고 안정성을 높입니다.
+    # submit_llm_request는 Future 객체의 결과를 기다리므로, 이 함수는 블로킹으로 동작합니다.
+    raw_response_str = submit_llm_request(_call_llm_single_blocking, system_message, user_message, model_to_use, max_tokens, cache_key)
         
     # 3. LLM 응답 파싱 및 객체 변환
     # [BUG FIX] LLM 응답 파싱 실패 시, 클라이언트가 AttributeError를 일으키지 않도록
@@ -526,7 +550,7 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
 
     return final_object
 
-def _call_llm_single_blocking(system_message, user_message, max_tokens=16384, cache_key=None):
+def _call_llm_single_blocking(system_message, user_message, model_name, max_tokens=16384, cache_key=None):
     """단일 LLM 호출을 처리하는 내부 블로킹 함수."""
     # [BUG FIX] 데드락을 유발하는 재귀적 Map-Reduce 로직을 제거합니다.
     # 이제 데이터 청킹은 전적으로 클라이언트(security.py 등)의 책임이며,
@@ -541,7 +565,7 @@ def _call_llm_single_blocking(system_message, user_message, max_tokens=16384, ca
         try:
             headers = {'Content-Type': 'application/json'}
             if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
-            payload = {"model": CONFIG["model"], "messages": [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}], "max_tokens": max_tokens, "temperature": 0.1, "stream": False}
+            payload = {"model": model_name, "messages": [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}], "max_tokens": max_tokens, "temperature": 0.1, "stream": False}
             
             # [BUG FIX] LLM URL이 외부 주소일 경우 시스템 프록시를 사용하도록 수정합니다.
             # 로컬 주소(127.0.0.1, localhost)일 경우에만 프록시를 명시적으로 비활성화합니다.
@@ -554,7 +578,7 @@ def _call_llm_single_blocking(system_message, user_message, max_tokens=16384, ca
             # [신규] LLM 요청 로깅
             # [개선] 요청 ID를 포함하여 로그를 추적하기 쉽게 만듭니다.
             log_prefix = f"[{request_id}]"
-            logging.info(f"{log_prefix} LLM 요청 (시도 {attempt + 1}/{max_retries})...")
+            logging.info(f"{log_prefix} LLM 요청 (모델: {model_name}, 시도 {attempt + 1}/{max_retries})...")
             llm_logger.info(f"{log_prefix} --- LLM Request (Blocking, Attempt {attempt + 1}/{max_retries}) ---")
             llm_logger.debug(f"{log_prefix} System Message: {system_message}")
             llm_logger.debug(f"{log_prefix} User Message: {user_message}")
@@ -722,14 +746,22 @@ def call_llm_stream(system_message, user_message):
     # 2. Cache Miss: 실제 LLM API 호출을 큐에 제출
     logging.info(f"[{request_id}] [CACHE MISS][STREAM] LLM 스트리밍 요청을 큐에 추가합니다. (Key: {cache_key[:10]}...)")
     
+    # [사용자 요청] 스트리밍 요청에서도 프롬프트 내용에 따라 모델을 동적으로 선택합니다.
+    if any(keyword in user_message for keyword in ['deep_dive', '종합 분석', 'Executive Summary', 'security report']):
+        model_to_use = CONFIG.get("reasoning_model", CONFIG["model"])
+    else:
+        model_to_use = CONFIG.get("fast_model", CONFIG["model"])
+
     # 스트리밍 응답을 처리하기 위한 내부 제너레이터 함수
     def _stream_generator():
         headers = {'Content-Type': 'application/json'}
         if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
         messages = [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}]
-        payload = {"model": CONFIG["model"], "messages": messages, "max_tokens": 8192, "temperature": 0.2, "stream": True}
+        payload = {"model": model_to_use, "messages": messages, "max_tokens": 8192, "temperature": 0.2, "stream": True}
         
-        llm_logger.info(f"[{request_id}] [REQ][STREAM] POST {CONFIG['llm_url']}")
+        # [사용자 요청] 스트리밍 요청 로그에도 모델 이름을 포함하여 기록합니다.
+        logging.info(f"[{request_id}] LLM 스트리밍 요청 (모델: {model_to_use})...")
+        llm_logger.info(f"[{request_id}] [REQ][STREAM] POST {CONFIG['llm_url']} (Model: {model_to_use})")
         
         full_response_accumulator = []
         max_retries = 3
@@ -1076,15 +1108,15 @@ def api_reports():
         if not filename:
             return jsonify({"error": "File parameter is missing"}), 400
 
-        if filename.startswith('report-') and filename.endswith('.html'):
+        if filename.endswith('.html'):
             try:
-                hostname = filename[len('report-'):-len('.html')]
+                base_name = os.path.splitext(filename)[0]
                 output_folder = app.config['OUTPUT_FOLDER']
                 
-                # 호스트네임을 포함하는 모든 관련 파일(html, json 등)을 찾습니다.
-                files_to_delete = [f for f in os.listdir(output_folder) if hostname in f]
+                # HTML 파일과 동일한 기본 이름을 가진 모든 관련 파일(html, json 등)을 찾습니다.
+                files_to_delete = [f for f in os.listdir(output_folder) if f.startswith(base_name)]
                 
-                for f_to_delete in files_to_delete:
+                for f_to_delete in files_to_delete: # noqa: E501
                     file_path = os.path.join(output_folder, f_to_delete)
                     if os.path.exists(file_path):
                         os.remove(file_path)
@@ -1095,11 +1127,25 @@ def api_reports():
         return jsonify({"error": "잘못된 파일 이름 형식입니다."}), 400
     else: # GET
         try:
-            reports = sorted([
-                {"name": f, "mtime": os.path.getmtime(os.path.join(OUTPUT_FOLDER, f))}
-                for f in os.listdir(OUTPUT_FOLDER)
-                if f.startswith('report-') and f.endswith('.html')
-            ], key=lambda r: r['mtime'], reverse=True)
+            reports = []
+            output_files = os.listdir(OUTPUT_FOLDER)
+            html_files = [f for f in output_files if f.endswith('.html') and f != 'index.html']
+
+            for html_file in html_files:
+                report_info = {"name": html_file}
+                base_name = os.path.splitext(html_file)[0]
+                meta_file = f"{base_name}.json"
+                
+                # [사용자 요청] 각 리포트에 대한 메타데이터(생성 시간, 소요 시간) 파일을 읽어 정보 추가
+                if meta_file in output_files:
+                    try:
+                        with open(os.path.join(OUTPUT_FOLDER, meta_file), 'r') as f:
+                            meta_data = json.load(f)
+                        report_info.update(meta_data)
+                    except (IOError, json.JSONDecodeError):
+                        pass # 메타 파일 읽기 실패 시 무시
+                reports.append(report_info)
+            reports.sort(key=lambda r: r.get('creation_timestamp', 0), reverse=True)
             return jsonify(reports)
         except Exception:
             return jsonify({"error": "리포트 목록을 가져오는 데 실패했습니다."}), 500
@@ -1127,6 +1173,36 @@ def api_delete_all_reports():
     except Exception as e:
         logging.error(f"Error deleting all reports: {e}", exc_info=True)
         return jsonify({"error": "Failed to delete all reports."}), 500
+
+@app.route('/AIBox/api/reports/zip', methods=['GET'])
+def api_zip_all_reports():
+    """[신규] output 디렉토리의 모든 .html 파일을 압축하여 다운로드합니다."""
+    import zipfile
+    import io
+
+    output_folder = app.config['OUTPUT_FOLDER']
+    
+    # 메모리 내에서 ZIP 파일 생성
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        html_files_found = False
+        for filename in os.listdir(output_folder):
+            # [BUG FIX] index.html을 제외한 모든 .html 파일을 압축 대상에 포함합니다.
+            if filename.endswith('.html') and filename != 'index.html':
+                file_path = os.path.join(output_folder, filename)
+                zf.write(file_path, arcname=filename)
+                html_files_found = True
+    
+    if not html_files_found:
+        return "압축할 리포트 파일이 없습니다.", 404
+
+    memory_file.seek(0)
+    
+    return Response(
+        memory_file,
+        mimetype='application/zip',
+        headers={'Content-Disposition': 'attachment;filename=reports.zip'}
+    )
 
 @app.route('/AIBox/api/sos/analyze_system', methods=['POST'])
 def api_sos_analyze_system():
@@ -1186,16 +1262,9 @@ def api_cve_analyze():
         # cve_report_generator.py와 같이 단일 응답을 기대하는 클라이언트와의 호환성을 보장합니다.
         if cve_data.get('stream', False):
             # 스트리밍 요청 처리
-            response_stream = call_llm_stream(system_message, user_message=prompt)
-            full_response_str = "".join(list(response_stream))
-            try:
-                parsed_json = json.loads(full_response_str)
-                return jsonify(parsed_json)
-            except json.JSONDecodeError:
-                match = re.search(r'```(json)?\s*(\{.*\}|\[.*\])\s*```', full_response_str, re.DOTALL)
-                if match:
-                    return Response(match.group(2), mimetype='application/json; charset=utf-8')
-                return jsonify({"raw_response": full_response_str, "error": "LLM response was not in a valid JSON format."})
+            # [핵심 수정] LLM으로부터 받은 스트림을 클라이언트로 즉시 전달합니다.
+            # 이렇게 하면 클라이언트가 타임아웃 없이 응답을 실시간으로 받을 수 있습니다.
+            return Response(call_llm_stream(system_message, user_message=prompt), mimetype='text/plain; charset=utf-8')
         else:
             # 블로킹 요청 처리
             response_obj = call_llm_blocking(system_message, user_message=prompt)
@@ -1371,7 +1440,10 @@ def api_upload_and_analyze():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Unified AI Server", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--llm-url', required=True, help='Full URL for LLM server API')
-    # Add checks and logging for all service logic at service startup
+    # [사용자 요청] 추론 모델과 빠른 응답 모델을 별도로 지정할 수 있도록 인자 추가
+    parser.add_argument('--reasoning-model', help='LLM model name for complex reasoning tasks (e.g., S-Core/Qwen3-235B-A22B)')
+    parser.add_argument('--fast-model', help='LLM model name for fast, structured tasks (e.g., S-Core/Qwen3-235B-A22B-no_think)')
+
     logging.info("==========================================================")
     logging.info("            Starting AIBox Server Sequence...           ")
     logging.info("==========================================================")
@@ -1410,6 +1482,13 @@ if __name__ == '__main__':
     # [개선] base_url이 설정되지 않았을 경우 경고 메시지를 표시합니다.
     if not CONFIG.get('base_url'):
         logging.warning("`--base-url` or `AIBOX_BASE_URL` is not set. This may cause issues with background job callbacks.")
+
+    # [신규] reasoning-model 또는 fast-model이 지정되지 않은 경우, 기본 --model 값을 사용합니다.
+    if not CONFIG.get('reasoning_model'):
+        CONFIG['reasoning_model'] = CONFIG.get('model')
+    if not CONFIG.get('fast_model'):
+        CONFIG['fast_model'] = CONFIG.get('model')
+    logging.info(f"Reasoning Model: {CONFIG['reasoning_model']}, Fast Model: {CONFIG['fast_model']}")
 
     logging.info("[2/8] Default configuration loaded.")
     
