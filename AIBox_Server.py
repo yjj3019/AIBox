@@ -115,6 +115,7 @@ PROMPT_LOCK = threading.Lock()
 UPLOAD_FOLDER = '/data/iso/AIBox/upload'
 OUTPUT_FOLDER = '/data/iso/AIBox/output'
 CACHE_FOLDER = '/data/iso/AIBox/cache'
+CVE_CHECK_OUTPUT_FOLDER = '/data/iso/AIBox/cve-check/output' # [신규] cve-check 리포트 경로
 RULES_FOLDER = '/data/iso/AIBox/rules'
 SOS_ANALYZER_SCRIPT = "/data/iso/AIBox/sos_analyzer.py"
 CVE_FOLDER = '/data/iso/AIBox/cve'
@@ -187,6 +188,7 @@ CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 os.makedirs(CVE_FOLDER, exist_ok=True)
+os.makedirs(CVE_CHECK_OUTPUT_FOLDER, exist_ok=True) # [신규] cve-check 리포트 디렉토리 생성
 os.makedirs(EPSS_FOLDER, exist_ok=True)
 os.makedirs(RULES_FOLDER, exist_ok=True)
 # [개선] diskcache는 디렉토리를 자동으로 생성하므로, 이 라인은 더 이상 필요하지 않습니다.
@@ -1203,6 +1205,79 @@ def api_zip_all_reports():
         mimetype='application/zip',
         headers={'Content-Disposition': 'attachment;filename=reports.zip'}
     )
+
+# [사용자 요청] cve_check_report.py가 생성한 리포트를 관리하는 API 추가
+@app.route('/AIBox/api/cve-check/reports/zip', methods=['GET'])
+def api_zip_cve_check_reports():
+    """cve-check/output 디렉토리의 모든 .html 파일을 압축하여 다운로드합니다."""
+    import zipfile
+    import io
+
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        found = False
+        for filename in os.listdir(CVE_CHECK_OUTPUT_FOLDER):
+            if filename.endswith('.html') and filename != 'index.html':
+                file_path = os.path.join(CVE_CHECK_OUTPUT_FOLDER, filename)
+                zf.write(file_path, arcname=filename)
+                found = True
+    
+    if not found:
+        return "압축할 리포트 파일이 없습니다.", 404
+
+    memory_file.seek(0)
+    return Response(
+        memory_file,
+        mimetype='application/zip',
+        headers={'Content-Disposition': 'attachment;filename=cve_check_reports.zip'}
+    )
+
+@app.route('/AIBox/api/cve-check/reports/all', methods=['DELETE'])
+def api_delete_all_cve_check_reports():
+    """cve-check/output 디렉토리의 모든 파일을 삭제합니다."""
+    if not request.json or request.json.get('password') != CONFIG.get("password"):
+        return jsonify({"error": "Unauthorized"}), 401
+        
+    try:
+        count = 0
+        for filename in os.listdir(CVE_CHECK_OUTPUT_FOLDER):
+            file_path = os.path.join(CVE_CHECK_OUTPUT_FOLDER, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                    count += 1
+            except Exception as e:
+                logging.error(f"전체 cve-check 리포트 삭제 중 '{file_path}' 파일 삭제 실패: {e}")
+        logging.info(f"모든 cve-check 리포트 및 관련 파일 {count}개를 삭제했습니다.")
+        return jsonify({"success": True, "message": f"{count}개의 파일이 삭제되었습니다."})
+    except Exception as e:
+        logging.error(f"Error deleting all cve-check reports: {e}", exc_info=True)
+        return jsonify({"error": "전체 리포트 삭제 중 오류가 발생했습니다."}), 500
+
+@app.route('/AIBox/api/cve-check/reports', methods=['DELETE'])
+def api_delete_cve_check_report():
+    """cve-check/output 디렉토리에서 특정 리포트 파일을 삭제합니다."""
+    filename = request.args.get('file')
+    if not filename:
+        return jsonify({"error": "파일 파라미터가 누락되었습니다."}), 400
+
+    if not filename.endswith('.html'):
+        return jsonify({"error": "잘못된 파일 이름 형식입니다."}), 400
+
+    try:
+        file_path = os.path.join(CVE_CHECK_OUTPUT_FOLDER, secure_filename(filename))
+        
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logging.info(f"cve-check 리포트 파일 삭제 완료: {file_path}")
+            return jsonify({"success": True, "message": f"'{filename}' 파일이 삭제되었습니다."})
+        else:
+            return jsonify({"error": "파일을 찾을 수 없습니다."}), 404
+            
+    except Exception as e:
+        logging.error(f"cve-check 리포트 삭제 중 오류 발생: {e}", exc_info=True)
+        return jsonify({"error": f"파일 삭제 중 오류 발생: {e}"}), 500
+
 
 @app.route('/AIBox/api/sos/analyze_system', methods=['POST'])
 def api_sos_analyze_system():

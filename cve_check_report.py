@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
 # --- 설정값 ---
 SYSTEM_DATA_DIR = Path("/data/iso/AIBox/cve-check/data")
 REPORT_OUTPUT_DIR = Path("/data/iso/AIBox/cve-check/output")
-CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/cve-check_db.json")
+CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/meta/cve-check_db.json")
 
 # --- 필터링할 RHEL 제품 목록 (정규표현식 사용) ---
 TARGET_PRODUCT_PATTERNS = [
@@ -47,11 +47,12 @@ TARGET_PRODUCT_PATTERNS = [
     re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Extended Update Support$"),
     re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Extended Update Support Long-Life Add-On$"),
     re.compile(r"^Red Hat Enterprise Linux 9\.\d+ Update Services for SAP Solutions$"),
-    re.compile(r"^Red Hat Enterprise Linux 10$"), # 요청에 포함된 RHEL 10 패턴 추가
+    re.compile(r"^Red Hat Enterprise Linux 10$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support Long-Life Add-On$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Update Services for SAP Solutions$"),
-    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$")
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ Update Services for SAP Solutions$")
 ]
 
 # --- RPM 버전 비교를 위한 라이브러리 ---
@@ -64,93 +65,74 @@ try:
     logging.info(Color.info("Info: Using installed 'rpm-vercomp' library for version comparison."))
 except ImportError:
     logging.info(Color.info("Info: 'rpm-vercomp' library not found. Using the built-in pure Python version comparison logic."))
+# --- RPM 버전 비교 함수 ---
+# [핵심 수정] 'rpm-vercomp' 라이브러리 의존성을 완전히 제거하고,
+# 순수 파이썬으로 구현된 버전 비교 함수를 기본으로 사용합니다.
+def compare_versions(v1, v2):
+    """
+    순수 Python으로 구현된 RPM 버전 비교 함수.
+    Epoch, Version, Release를 처리하며, rpm-vercomp 라이브러리를 대체합니다.
+    v1이 v2보다 오래되었으면 -1, 같으면 0, 최신이면 1을 반환합니다.
+    """
+    def split_version(version_str):
+        epoch_match = re.match(r"(\d+):", str(version_str))
+        epoch = 0
+        if epoch_match:
+            epoch = int(epoch_match.group(1))
+            version_str = str(version_str)[len(epoch_match.group(0)):]
+        return epoch, str(version_str)
 
-    def compare_versions(v1, v2):
-        """
-        순수 Python으로 구현된 RPM 버전 비교 함수.
-        Epoch, Version, Release를 처리하며, rpm-vercomp 라이브러리를 대체합니다.
-        v1이 v2보다 오래되었으면 -1, 같으면 0, 최신이면 1을 반환합니다.
-        """
-        def split_version(version_str):
-            epoch_match = re.match(r"(\d+):", version_str)
-            epoch = 0
-            if epoch_match:
-                epoch = int(epoch_match.group(1))
-                version_str = version_str[len(epoch_match.group(0)):]
-            return epoch, version_str
+    def compare_strings(s1, s2):
+        parts1 = re.findall(r"([a-zA-Z]+)|(\d+)|(~)", s1)
+        parts2 = re.findall(r"([a-zA-Z]+)|(\d+)|(~)", s2)
 
-        def compare_strings(s1, s2):
-            # 문자열을 알파벳과 숫자 덩어리로 분리
-            parts1 = re.findall(r"([a-zA-Z]+)|(\d+)|(~)", s1)
-            parts2 = re.findall(r"([a-zA-Z]+)|(\d+)|(~)", s2)
-
-            for p1, p2 in zip(parts1, parts2):
-                # p1, p2는 ('alpha', '', '') 또는 ('', '123', '') 또는 ('', '', '~') 형태의 튜플
-                if p1[2] or p2[2]: # 틸드(~) 처리
-                    if p1[2] and not p2[2]: return -1
-                    if not p1[2] and p2[2]: return 1
-                
-                p1_alpha, p1_num, _ = p1
-                p2_alpha, p2_num, _ = p2
-
-                if p1_num and p2_num: # 둘 다 숫자
-                    diff = int(p1_num) - int(p2_num)
-                    if diff != 0: return 1 if diff > 0 else -1
-                elif p1_alpha and p2_alpha: # 둘 다 알파벳
-                    if p1_alpha != p2_alpha: return 1 if p1_alpha > p2_alpha else -1
-                elif p1_num: return 1 # 숫자 > 알파벳
-                elif p2_num: return -1 # 알파벳 < 숫자
+        for p1, p2 in zip(parts1, parts2):
+            if p1[2] or p2[2]:
+                if p1[2] and not p2[2]: return -1
+                if not p1[2] and p2[2]: return 1
             
-            return (len(parts1) > len(parts2)) - (len(parts1) < len(parts2))
+            p1_alpha, p1_num, _ = p1
+            p2_alpha, p2_num, _ = p2
 
-        e1, ver_rel1 = split_version(v1)
-        e2, ver_rel2 = split_version(v2)
+            if p1_num and p2_num:
+                diff = int(p1_num) - int(p2_num)
+                if diff != 0: return 1 if diff > 0 else -1
+            elif p1_alpha and p2_alpha:
+                if p1_alpha != p2_alpha: return 1 if p1_alpha > p2_alpha else -1
+            elif p1_num: return 1
+            elif p2_num: return -1
+        
+        return (len(parts1) > len(parts2)) - (len(parts1) < len(parts2))
 
-        if e1 != e2: return 1 if e1 > e2 else -1
-        return compare_strings(ver_rel1, ver_rel2)
+    e1, ver_rel1 = split_version(v1)
+    e2, ver_rel2 = split_version(v2)
+
+    if e1 != e2: return 1 if e1 > e2 else -1
+    return compare_strings(ver_rel1, ver_rel2)
 
 # --- 유틸리티 함수 ---
 
 def parse_rpm_full_name(rpm_full_name):
-    """RPM 전체 이름에서 이름, 버전, 아키텍처를 분리합니다."""
-    # 예: "NetworkManager-1.40.16-20.el8_10.x86_64"
-    # 예: "1:NetworkManager-1.40.16-20.el8_10.x86_64" (표준 epoch)
-    # 예: "dbus-1:1.12.8-24.el8_8.1" (비표준 epoch 포함, arch 없음)
-    
-    # 1. 아키텍처(.arch)를 먼저 분리합니다.
-    arch_match = re.search(r'\.([^\.]+)$', rpm_full_name)
-    if not arch_match or arch_match.group(1) in ['src', 'rpm']: # 소스 RPM은 제외
-        # 아키텍처가 없는 경우 (예: dbus-1:1.12.8-24.el8_8.1)
-        name_ver_part = rpm_full_name
-        arch = 'N/A'
-    else:
-        arch = arch_match.group(1)
-        name_ver_part = rpm_full_name[:arch_match.start()]
+    """[개선] RPM 전체 이름에서 이름, 버전, 아키텍처를 효율적으로 분리합니다."""
+    # 정규식 설명:
+    #   ^((?:(\d+):)?(.+?)) : 그룹 1(전체 이름), 그룹 2(선택적 epoch), 그룹 3(패키지 이름)
+    #   -([^-]+)             : 그룹 4(버전) - 하이픈으로 시작하고 하이픈이 없는 문자열
+    #   -([^-]+)             : 그룹 5(릴리즈) - 위와 동일
+    #   (?:\.([^.]+))?$      : 그룹 6(선택적 아키텍처) - 점으로 시작하고 점이 없는 문자열
+    match = re.match(r'^((?:(\d+):)?(.+?))-([^-]+)-([^_.-]+(?:_[^.-]*)?)(?:\.([^.]+))?$', rpm_full_name)
+    if not match:
+        # 위의 정규식으로 처리되지 않는 예외 케이스 (예: 릴리즈에 하이픈 포함)
+        # 마지막 하이픈 2개를 기준으로 분리 시도
+        parts = rpm_full_name.rsplit('-', 2)
+        if len(parts) == 3 and re.search(r'^\d', parts[1]):
+            name, version, release_arch = parts
+            release, _, arch = release_arch.rpartition('.') if '.' in release_arch else (release_arch, '', '')
+            return name, f"{version}-{release}", arch if arch else 'N/A'
+        return None, None, None
 
-    # 2. 이름과 버전-릴리즈를 분리합니다.
-    # 마지막 두 개의 하이픈을 기준으로 분리하여 이름에 하이픈이 포함된 경우를 처리합니다.
-    parts = name_ver_part.rsplit('-', 2)
-    if len(parts) == 3 and parts[1].replace('.', '').isdigit(): # name-version-release 형식
-        name, version, release = parts
-        full_version = f"{version}-{release}"
-    else: # name-version-release 형식이 아닌 경우 (예: epoch 포함)
-        # 마지막 하이픈을 기준으로 버전과 이름을 분리합니다.
-        try:
-            name, full_version = name_ver_part.rsplit('-', 1)
-        except ValueError:
-            return None, None, None # 분리 실패
-    
-    # 3. 이름에 포함된 epoch를 버전 앞으로 이동시킵니다. (예: 'name-epoch:' -> 'epoch:version')
-    epoch_match = re.match(r'(.+)-(\d+):$', name)
-    if epoch_match:
-        name, epoch = epoch_match.groups()
-        full_version = f"{epoch}:{full_version}"
-    # 표준 epoch 처리 (예: '1:name')
-    elif ':' in name:
-        epoch, name = name.split(':', 1)
-        full_version = f"{epoch}:{full_version}"
-    
-    return name, full_version, arch
+    _, epoch, name, version, release, arch = match.groups()
+    full_version = f"{epoch}:{version}-{release}" if epoch else f"{version}-{release}"
+    return name, full_version, arch if arch else 'N/A'
 
 def parse_cve_package_field(package_field: str):
     """
@@ -161,26 +143,23 @@ def parse_cve_package_field(package_field: str):
     - 예4: "gmp-1:6.1.2-11.el8" -> name: "gmp", version: "1:6.1.2-11.el8"
     - 예5: "kernel-0:4.18.0-553.74.1.el8_10" -> name: "kernel", version: "0:4.18.0-553.74.1.el8_10"
     """
-    # [핵심 수정] RPM 이름 파싱 로직을 전면 재구성하여 안정성과 정확성을 높입니다.
-    # 정규식: (이름)-(epoch):(버전)-(릴리즈) 또는 (이름)-(버전)-(릴리즈)
-    # 그룹 1: 패키지 이름 (욕심내지 않고 최소한으로 일치)
-    # 그룹 2: (선택) Epoch 값 (예: '0:')
-    # 그룹 3: 버전 및 릴리즈
-    match = re.match(r'^(.*?)-(\d+:)?([\w.~+-]+-[\w.~+-]+)$', package_field)
+    # [핵심 수정] Epoch를 포함한 RPM 이름 파싱 로직을 전면 재검토하여 안정성과 정확성을 높입니다. (v3)
+    # 정규식 설명 (두 가지 주요 패턴 처리):
+    # 1. 이름-에포크:버전-릴리즈 (예: kernel-0:4.18.0-...)
+    #    ^(.+?)-(\d+):(.+-.+)$
+    # 2. 에포크:이름-버전-릴리즈 (예: 1:gmp-6.1.2-...)
+    #    ^(\d+):(.+?)-(.+-.+)$
+    match = re.match(r'^(.+?)-(\d+):(.+-.+)$', package_field) # 패턴 1
     if match:
-        name, epoch, version_release = match.groups()
-        if epoch:
-            # epoch가 이름과 버전 사이에 있는 경우 (예: kernel-0:4.18.0-...)
-            return name, f"{epoch.rstrip(':')}:{version_release}"
-        return name, version_release
-
-    # 위의 정규식으로 처리되지 않는 경우 (이름에 하이픈이 많은 경우 등)를 위한 폴백
-    # 마지막 하이픈을 기준으로 이름과 버전을 분리합니다.
+        name, epoch, ver_rel = match.groups()
+        return name, f"{epoch}:{ver_rel}"
+    
+    # 마지막 하이픈을 기준으로 이름과 버전을 분리 (패턴 2 및 일반적인 경우 처리)
     parts = package_field.rsplit('-', 1)
-    if len(parts) == 2 and re.search(r'^\d', parts[1]):
+    if len(parts) == 2 and re.search(r'[\d.]', parts[1]):
         return parts[0], parts[1]
 
-    return package_field, "" # 분리 실패
+    return package_field, "" # 모든 방법으로 분리 실패 시
 
 def summarize_vulnerability(details, statement):
     """취약점 요약 생성 (LLM 대신 규칙 기반으로 핵심 내용 요약)"""
@@ -200,16 +179,16 @@ def summarize_vulnerability(details, statement):
     try:
         # AIBox 서버의 범용 분석 엔드포인트를 사용합니다.
         api_url = 'http://127.0.0.1:5000/AIBox/api/cve/analyze'
-        # [BUG FIX] LLM이 항상 JSON 형식으로 응답하도록 프롬프트를 수정합니다.
+        # [사용자 요청] 취약점 요약이 핵심 내용만 포함하도록 프롬프트를 수정합니다.
         prompt = f"""[SYSTEM ROLE]
-You are an expert IT translator specializing in cybersecurity. Your task is to read the following English vulnerability summary, fully understand its technical content, and then summarize its core meaning into a single, clear Korean sentence.
+You are a cybersecurity analyst. Your task is to summarize the core threat of the following vulnerability in a single, concise Korean sentence, focusing on the impact (e.g., remote code execution, privilege escalation).
 
 [ENGLISH SUMMARY]
 {english_summary}
 
 [OUTPUT FORMAT]
-You MUST return ONLY a single, valid JSON object with the key "analysis_report".
-Example: {{"analysis_report": "리눅스 커널의 특정 기능에서 발견된 취약점으로, 권한 상승으로 이어질 수 있습니다."}}
+You MUST return ONLY a single, valid JSON object with the key "analysis_report". Do not add any other text.
+Example: {{"analysis_report": "특정 조건에서 원격 코드 실행이 가능한 취약점입니다."}}
 """
         # [사용자 요청] AIBox 서버가 fast-model을 사용하도록 model_selector 추가
         payload = {
@@ -250,6 +229,74 @@ def is_target_product(product_name):
             return True
     return False
 
+def get_product_source_label(product_name: str) -> str:
+    """
+    [사용자 요청] product_name에 따라 RHSA ID 옆에 표시할 출처 라벨을 반환합니다.
+    """
+    if not product_name:
+        return ""
+    
+    if "Extended Lifecycle Support" in product_name:
+        return "ELS"
+    if "Extended Update Support Long-Life Add-On" in product_name:
+        return "EUS-LongLife"
+    if "Extended Update Support" in product_name:
+        return "EUS"
+    if "Update Services for SAP Solutions" in product_name:
+        return "SAP-Solution"
+    
+    return "" # 기본 RHEL 버전은 라벨 없음
+
+def get_product_source_label(product_name: str) -> str: # noqa: E302
+    """
+    [사용자 요청] product_name에 따라 RHSA ID 옆에 표시할 출처 라벨을 반환합니다. (security.py와 동일한 로직)
+    """
+    if not product_name: return ""
+
+    # [BUG FIX] 더 구체적인 규칙을 먼저 확인하도록 순서 조정
+    if "Extended Lifecycle Support" in product_name:
+        return "ELS"
+    if "Extended Update Support Long-Life Add-On" in product_name:
+        return "EUS-LongLife"
+    if "Extended Update Support" in product_name:
+        return "EUS"
+    # [BUG FIX] 요청에 따라 'Update Services for SAP Solutions'와 'for SAP Solutions'를 구분
+    if "Update Services for SAP Solutions" in product_name:
+        return "Update-SAP-Solution"
+    if "for SAP Solutions" in product_name:
+        return "SAP-Solution"
+    
+    return "" # 기본 RHEL 버전은 라벨 없음
+
+def get_vulnerability_status(vuln):
+    """
+    [신규] CVE 데이터의 조치 상태를 계산합니다.
+    -1: 조치 필요 (NOK), 0: 조치 완료 (OK - 동일), 1: 조치 완료 (OK - 높음), None: 정보 없음
+    """
+    findings = vuln.get('findings', [])
+    if not findings:
+        return None, None  # 정보 없음
+
+    overall_status = 0  # 기본값: 모두 동일
+    representative_finding = findings[0]
+    
+    # 조치가 필요한(NOK) finding을 우선적으로 대표로 삼기 위해 먼저 순회
+    nok_finding = next((f for f in findings if f.get('version_comparison', -1) < 0), None)
+    if nok_finding:
+        overall_status = -1
+        representative_finding = nok_finding
+    else:
+        # NOK가 없다면, 버전이 높은(OK) finding이 있는지 확인
+        high_finding = next((f for f in findings if f.get('version_comparison', -1) > 0), None)
+        if high_finding:
+            overall_status = 1
+            # 버전이 높은 것들 중 첫번째 것을 대표로 삼을 수 있으나,
+            # 보통은 어떤 finding이든 상관 없으므로 첫번째 것을 그대로 사용해도 무방합니다.
+            # representative_finding = high_finding 
+
+    return overall_status, representative_finding
+
+
 # --- HTML 리포트 생성 함수 ---
 
 def generate_html_report(system_info, vulnerabilities):
@@ -267,53 +314,49 @@ def generate_html_report(system_info, vulnerabilities):
         representative_finding = None
         rhsa_ids_html = []
         
-        # [사용자 요청] 버전 비교 결과를 종합하여 최종 상태를 결정합니다.
-        # -1: 조치 필요 (하나라도 낮음), 0: 조치 완료 (모두 동일), 1: 조치 완료 (하나라도 높음)
-        overall_status = 0 # 기본값: 모두 동일
-        
-        findings = vuln.get('findings', [])
-        if findings:
-            # 기본 대표 finding을 첫 번째 항목으로 설정
-            representative_finding = findings[0]
-        
-        for finding in findings: # noqa: E501
-            rhsa_link = f'<a href="https://access.redhat.com/errata/{html.escape(finding["rhsa_id"])}" target="_blank">{html.escape(finding["rhsa_id"])}</a>' if finding.get("rhsa_id") and finding["rhsa_id"] != "N/A" else "N/A"
-            rhsa_ids_html.append(rhsa_link)
+        overall_status, representative_finding = get_vulnerability_status(vuln)
+        for finding in vuln.get('findings', []):
+            # [사용자 요청] RHSA ID 옆에 출처 라벨 추가
+            source_label = finding.get("source_label", "")
+            rhsa_id_with_label = html.escape(finding["rhsa_id"])
+            if source_label:
+                rhsa_id_with_label += f" - {source_label}"
             
-            comparison = finding.get('version_comparison', -1)
-            if comparison < 0:
-                overall_status = -1 # 하나라도 낮으면 최종 상태는 '낮음'
-                # 조치가 필요한 finding을 대표로 설정
-                representative_finding = finding
-            elif comparison > 0 and overall_status != -1:
-                overall_status = 1 # '낮음'이 없는 상태에서 '높음'이 발견되면 최종 상태는 '높음'
+            # 링크가 있는 경우와 없는 경우를 분리하여 처리
+            if finding.get("rhsa_id") and finding["rhsa_id"] != "N/A":
+                rhsa_ids_html.append(f'<a href="https://access.redhat.com/errata/{html.escape(finding["rhsa_id"])}" target="_blank">{rhsa_id_with_label}</a>')
+            else:
+                rhsa_ids_html.append(rhsa_id_with_label)
 
         cve_link = f'<a href="https://access.redhat.com/security/cve/{html.escape(vuln["cve_id"])}" target="_blank">{html.escape(vuln["cve_id"])}</a>'
         
         # [사용자 요청] 종합된 상태(overall_status)에 따라 아이콘과 툴팁을 다르게 표시합니다.
-        if not representative_finding: # finding 정보가 없으면
+        if overall_status is None: # finding 정보가 없으면
             status_html = '<span class="status-icon status-nok" title="정보 없음">N/A</span>'
-        elif overall_status < 0:
-            status_html = '<span class="status-icon status-nok" title="조치 필요 (설치된 버전이 권고 버전보다 낮음)">NOK &darr;</span>'
-        elif overall_status == 0:
-            status_html = '<span class="status-icon status-ok" title="조치 완료 (버전 동일)">OK =</span>'
-        else:
-            status_html = '<span class="status-icon status-higher" title="조치 완료 (버전 높음)">OK &uarr;</span>'
+            current_pkg_html = '정보 없음'
+        elif overall_status < 0: # 현재 < 권고: 조치 필요
+            status_html = '<span class="status-icon status-nok" title="조치 필요 (설치된 버전이 권고 버전보다 낮음)">NOK</span>'
+            # [요청사항] 현재 패키지 버전 옆에 LOW 아이콘 추가
+            current_pkg_html = f'{html.escape(representative_finding["current_package"])} <span class="version-icon low" title="권고 버전보다 낮음">↓</span>'
+        elif overall_status > 0: # 현재 > 권고: 버전 높음
+            status_html = '<span class="status-icon status-ok" title="조치 완료 (설치된 버전이 권고 버전보다 높음)">OK</span>'
+            # [요청사항] 현재 패키지 버전 옆에 HIGH 아이콘 추가
+            current_pkg_html = f'{html.escape(representative_finding["current_package"])} <span class="version-icon high" title="권고 버전보다 높음">↑</span>'
+        else: # 현재 == 권고: 버전 동일
+            status_html = '<span class="status-icon status-ok" title="조치 완료 (버전 동일)">OK</span>'
+            current_pkg_html = html.escape(representative_finding['current_package'])
         
-        # [사용자 요청] 대표 finding의 정보만 추출하여 표시
-        current_pkg_html = html.escape(representative_finding['current_package']) if representative_finding else '정보 없음'
         fix_pkg_html = html.escape(representative_finding['fix_package']) if representative_finding else '정보 없음'
         # RHSA ID는 중복을 제거하고 모두 표시
         unique_rhsa_html = '<br>'.join(sorted(list(set(rhsa_ids_html)))) if rhsa_ids_html else '정보 없음'
 
-
         vuln_rows += f"""
         <tr>
             <td>{i}</td>
-            <td>{cve_link} ({html.escape(vuln['public_date'])})</td>
+            <td>{cve_link}<br>({html.escape(vuln['public_date'])})</td>
             <td>{html.escape(vuln['severity'])}<br>(CVSS: {html.escape(vuln['score'])})</td>
             <td>{html.escape(vuln['summary'])}</td>
-            <td>{current_pkg_html}</td>
+            <td>{current_pkg_html}</td> <!-- 수정된 부분 -->
             <td>{fix_pkg_html}</td>
             <td>{unique_rhsa_html}</td>
             <td class="status-cell">{status_html}</td>
@@ -325,77 +368,163 @@ def generate_html_report(system_info, vulnerabilities):
     <html lang="ko">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>취약점 분석 리포트 - {html.escape(hostname)}</title>
+        <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+        <style>
+            :root {{
+                --primary-color: #007aff; --secondary-color: #6c757d; --success-color: #34c759;
+                --danger-color: #ff3b30; --warning-color: #ff9500; --background-color: #f7f8fc;
+                --surface-color: #ffffff; --text-color: #1a1a1a; --header-bg: #1f2937;
+                --header-text: #ffffff; --border-color: #e5e7eb; --shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.04);
+            }}
+            body {{ font-family: 'Noto Sans KR', sans-serif; margin: 0; padding: 2rem; background-color: var(--background-color); color: var(--text-color); line-height: 1.7; }}
+            .container {{ max-width: 100%; margin: 0 auto; }}
+            .header {{ background: var(--header-bg); color: var(--header-text); padding: 2.5rem; text-align: center; border-radius: 16px; margin-bottom: 2rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }}
+            h1 {{ font-size: 2.5rem; font-weight: 700; margin: 0; }}
+            .header p {{ font-size: 1.2rem; opacity: 0.8; margin: 0.5rem 0 0; }}
+            .card {{ background-color: var(--surface-color); border: 1px solid var(--border-color); border-radius: 16px; box-shadow: var(--shadow); overflow: hidden; margin-bottom: 2rem; }}
+            .card-header {{ font-size: 1.5rem; color: var(--text-color); border-bottom: 1px solid var(--border-color); padding: 1.5rem 2rem; margin: 0; font-weight: 600; }}
+            .card-body {{ padding: 1.5rem; }}
+            .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; padding: 0.5rem 1.5rem 1.5rem; }}
+            .info-item {{ background-color: #f9fafb; padding: 1.25rem; border-radius: 10px; border: 1px solid var(--border-color); }}
+            .info-item strong {{ display: block; color: var(--secondary-color); font-size: 0.9rem; margin-bottom: 0.25rem; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 1rem 1.5rem; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border-color); }}
+            thead th {{ background-color: #f9fafb; color: var(--secondary-color); font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.5px; }}
+            tbody tr:hover {{ background-color: #f5f8ff; }}
+            tbody tr:last-child td {{ border-bottom: none; }}
+            a {{ color: #007bff; text-decoration: none; }}
+            a:hover {{ text-decoration: underline; }}
+            .status-cell {{ text-align: center; vertical-align: middle; }}
+            .status-icon {{
+                display: inline-block;
+                padding: 0.25em 0.6em;
+                border-radius: 20px;
+                font-size: 0.85em;
+                color: white;
+                font-weight: bold;
+                min-width: 40px;
+            }}
+            .status-ok {{ background-color: var(--success-color); }}
+            .status-nok {{ background-color: var(--danger-color); }}
+            .version-icon {{ font-weight: bold; font-size: 1.1em; vertical-align: middle; margin-left: 4px; }}
+            .version-icon.high {{ color: var(--success-color); }}
+            .version-icon.low {{ color: var(--danger-color); }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>취약점 분석 리포트</h1>
+                <p>Hostname: {html.escape(hostname)}</p>
+            </div>
+            <div class="card">
+                <div class="card-header">시스템 정보</div>
+                <div class="card-body info-grid">
+                    <div class="info-item"><strong>OS Version</strong> {html.escape(os_version)}</div>
+                    <div class="info-item"><strong>Kernel Version</strong> {html.escape(kernel_version)}</div>
+                    <div class="info-item"><strong>Uptime</strong> {html.escape(uptime)}</div>
+                    <div class="info-item"><strong>Boot Time</strong> {html.escape(boot_time)}</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">분석 요약</div>
+                <div class="card-body">
+                    <p>총 <strong>{len(vulnerabilities)}</strong>개의 고유 CVE에 대해 분석했으며, 그 중 <strong>{sum(1 for v in vulnerabilities if any(f.get('version_comparison', -1) < 0 for f in v.get('findings', [])))}</strong>개의 CVE에 대한 조치가 필요합니다.</p>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">취약점 상세 정보</div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 3%;">No.</th>
+                            <th>CVE ID (발행일)</th>
+                            <th>심각도 & 점수</th>
+                            <th>취약점 요약</th>
+                            <th style="width: 15%;">현재 패키지 버전</th>
+                            <th style="width: 15%;">권고 버전</th>
+                            <th style="width: 10%;">RHSA ID</th>
+                            <th style="width: 5%;">조치 상태</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {vuln_rows if vuln_rows else "<tr><td colspan='8' style='text-align:center; padding: 2rem; color: #666;'>발견된 취약점이 없습니다.</td></tr>"}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html_template
+
+def generate_nok_report_html(nok_vulnerabilities):
+    """[신규] 조치 상태가 'NOK'인 모든 취약점 목록을 보여주는 HTML 파일을 생성합니다."""
+    
+    nok_rows = ""
+    for i, item in enumerate(nok_vulnerabilities, 1):
+        cve_link = f'<a href="https://access.redhat.com/security/cve/{html.escape(item["cve_id"])}" target="_blank">{html.escape(item["cve_id"])}</a>'
+        nok_rows += f"""
+        <tr>
+            <td>{i}</td>
+            <td>{html.escape(item['hostname'])}</td>
+            <td>{cve_link}</td>
+            <td>{html.escape(item['current_package'])}</td>
+            <td>{html.escape(item['fix_package'])}</td>
+            <td class="status-cell"><span class="status-icon status-nok">NOK</span></td>
+        </tr>
+        """
+
+    nok_report_template = f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <title>전체 조치 필요(NOK) 취약점 목록</title>
         <style>
             body {{ font-family: sans-serif; margin: 2em; line-height: 1.6; color: #333; }}
-            /* [사용자 요청] 요약 정보 스타일 추가 */
-            .summary-box {{ background-color: #eef7ff; border: 1px solid #cce5ff; padding: 15px; margin-bottom: 20px; border-radius: 5px; }}
-            .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }}
-            .summary-item {{ background-color: white; padding: 1rem; border-radius: 8px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-            .summary-item .count {{ font-size: 2rem; font-weight: bold; }}
-            h1, h2 {{ color: #0056b3; border-bottom: 2px solid #eee; padding-bottom: 0.5em; margin-top: 1.5em; }}
-            .info-box {{ background-color: #eef7ff; border: 1px solid #cce5ff; padding: 15px; margin-bottom: 20px; border-radius: 5px; }}
-            .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }}
-            .info-box p {{ margin: 0.5em 0; }}
+            h1 {{ color: #dc3545; border-bottom: 2px solid #eee; padding-bottom: 0.5em; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 20px; box-shadow: 0 2px 3px rgba(0,0,0,0.1); }}
-            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; vertical-align: top; }}
+            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; vertical-align: middle; }}
             th {{ background-color: #f2f2f2; font-weight: bold; color: #555; }}
             tr:nth-child(even) {{ background-color: #f9f9f9; }}
             a {{ color: #007bff; text-decoration: none; }}
             a:hover {{ text-decoration: underline; }}
-            /* [사용자 요청] 아이콘 스타일 추가 */
-            .status-cell {{ text-align: center; vertical-align: middle; }}
+            .status-cell {{ text-align: center; }}
             .status-icon {{
-                display: inline-block;
-                width: 40px;
-                height: 40px;
-                line-height: 40px;
-                border-radius: 50%;
-                color: white;
-                font-weight: bold;
+                display: inline-block; padding: 0.25em 0.6em; border-radius: 20px;
+                font-size: 0.85em; color: white; font-weight: bold; min-width: 40px;
             }}
-            .status-ok {{ background-color: #28a745; }}
-            .status-nok {{ background-color: #dc3545; }}
-            .status-higher {{ background-color: #007bff; }} /* 높은 버전에 대한 색상 추가 */
+            .status-nok {{ background-color: #ff3b30; }}
         </style>
     </head>
     <body>
-        <h1>취약점 분석 리포트</h1>
-        <div class="info-box">
-            <h2>시스템 정보</h2>
-            <p><strong>Hostname:</strong> {html.escape(hostname)}</p>
-            <p><strong>OS Version:</strong> {html.escape(os_version)}</p>
-            <p><strong>Kernel Version:</strong> {html.escape(kernel_version)}</p>
-            <p><strong>Uptime:</strong> {html.escape(uptime)}</p>
-            <p><strong>Boot Time:</strong> {html.escape(boot_time)}</p>
-        </div>
-
-        <!-- [사용자 요청] 취약점 요약 정보 추가 -->
-        <h2>분석 요약</h2>
-        <p>총 <strong>{len(vulnerabilities)}</strong>개의 고유 CVE에 대해 분석했으며, 그 중 <strong>{sum(1 for v in vulnerabilities if any(f.get('version_comparison', -1) < 0 for f in v.get('findings', [])))}</strong>개의 CVE에 대한 조치가 필요합니다.</p>
-        
-        <h2>취약점 정보</h2>
+        <h1>전체 조치 필요(NOK) 취약점 목록</h1>
+        <p>총 <strong>{len(nok_vulnerabilities)}</strong>개의 조치 필요 항목이 발견되었습니다.</p>
         <table>
             <thead>
                 <tr>
                     <th style="width: 5%;">No.</th>
-                    <th>CVE ID (발행일)</th>
-                    <th>심각도 & 점수</th>
-                    <th>취약점 요약</th>
-                    <th style="width: 15%;">현재 패키지 버전</th>
-                    <th style="width: 15%;">권고 버전</th>
-                    <th style="width: 10%;">RHSA ID</th>
+                    <th>Hostname</th>
+                    <th>CVE ID</th>
+                    <th>현재 패키지 버전</th>
+                    <th>권고 버전</th>
                     <th style="width: 8%;">조치 상태</th>
                 </tr>
             </thead>
             <tbody>
-                {vuln_rows if vuln_rows else "<tr><td colspan='8' style='text-align:center; color: #666;'>발견된 취약점이 없습니다.</td></tr>"}
+                {nok_rows if nok_rows else "<tr><td colspan='6' style='text-align:center; color: #666;'>조치가 필요한 취약점이 없습니다.</td></tr>"}
             </tbody>
         </table>
     </body>
     </html>
     """
-    return html_template
+    return nok_report_template
+
 
 # --- [신규] 인덱스 HTML 생성 함수 ---
 def generate_index_html(report_list, total_input_files):
@@ -404,6 +533,7 @@ def generate_index_html(report_list, total_input_files):
     """
     # [사용자 요청] 각 리포트 앞에 번호를 붙이기 위해 enumerate 사용
     report_rows = ""
+    # [사용자 요청] 개별 삭제 버튼을 위해 report_filename과 hostname을 deleteReport 함수에 전달합니다.
     for i, report in enumerate(sorted(report_list, key=lambda x: x['creation_time'], reverse=True), 1):
         report_rows += f""" # noqa: E501
         <tr id="report-row-{html.escape(report['hostname'])}">
@@ -413,6 +543,10 @@ def generate_index_html(report_list, total_input_files):
             <td>{html.escape(report['creation_time'])}</td>
             <td>{report['total_vulnerabilities']}</td>
             <td style="color: #dc3545; font-weight: bold;">{report['nok_vulnerabilities']}</td>
+            <!-- [사용자 요청] 개별 삭제 버튼 추가 -->
+            <td class="actions">
+                <button class="button button-delete" onclick="deleteReport('{html.escape(report['report_filename'])}', '{html.escape(report['hostname'])}')"><i class="fas fa-trash-alt"></i> 삭제</button>
+            </td>
         </tr>
         """
 
@@ -437,6 +571,7 @@ def generate_index_html(report_list, total_input_files):
             .button-delete-all:hover {{ background-color: #bb2d3b; }}
             .button-download {{ background-color: #0d6efd; color: white; border-color: #0d6efd; font-size: 0.85rem; padding: 6px 12px;}}
             .button-download:hover {{ background-color: #0b5ed7; }}
+            /* [사용자 요청] 개별 삭제 버튼 스타일 추가 */
             .button-delete {{ background-color: #6c757d; color: white; border-color: #6c757d; font-size: 0.85rem; padding: 6px 12px;}}
             .button-delete:hover {{ background-color: #5c636a; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 20px; box-shadow: 0 2px 3px rgba(0,0,0,0.1); }}
@@ -445,13 +580,16 @@ def generate_index_html(report_list, total_input_files):
             tr:nth-child(even) {{ background-color: #f9f9f9; }}
             a {{ color: #007bff; text-decoration: none; }}
             a:hover {{ text-decoration: underline; }}
+            .actions {{ text-align: center; }}
         </style>
     </head>
     <body>
         <h1>취약점 분석 리포트 목록</h1>
         <div class="summary-box">
             <h2>분석 요약</h2>
-            <p>총 <strong>{total_input_files}</strong>개의 시스템 정보 파일이 입력되어 <strong>{len(report_list)}</strong>개의 리포트가 생성되었습니다.</p>
+            <p>
+                총 <strong>{total_input_files}</strong>개의 시스템 정보 파일이 입력되어 <strong>{len(report_list)}</strong>개의 리포트가 생성되었습니다.
+            </p>
         </div>
         <!-- [신규] 전역 제어판 -->
         <div class="global-controls">
@@ -461,12 +599,16 @@ def generate_index_html(report_list, total_input_files):
         <table>
             <thead>
                 <tr>
-                    <th style="width: 5%;">No.</th><th>Hostname</th><th>Report File</th><th>생성 시간</th><th>총 취약점</th><th>조치 필요</th> <!-- No. 헤더 추가 -->
+                    <th style="width: 5%;">No.</th><th>Hostname</th><th>Report File</th><th>생성 시간</th><th>총 취약점</th><th>조치 필요</th><th style="width: 10%;">작업</th> <!-- 작업 열 추가 -->
                 </tr>
             </thead>
             <tbody>
-                {report_rows if report_rows else "<tr><td colspan='6' style='text-align:center; color: #666;'>생성된 리포트가 없습니다.</td></tr>"} <!-- colspan 5 -> 6 -->
+                {report_rows if report_rows else "<tr><td colspan='7' style='text-align:center; color: #666;'>생성된 리포트가 없습니다.</td></tr>"} <!-- colspan 6 -> 7 -->
             </tbody>
+        </table>
+        <!-- [사용자 요청] 전체 시스템 취약점 정보 링크 추가 -->
+        <table style="margin-top: 2rem;">
+             <tr id="total-info-row"><td colspan="7" style="text-align:center; font-weight:bold;"><a href="all_nok_vulnerabilities_{datetime.now().strftime('%Y%m%d')}.html" target="_blank">전체 시스템 취약점 정보</a></td></tr>
         </table>
 
         <!-- [신규] 비밀번호 입력 모달 -->
@@ -493,20 +635,24 @@ def generate_index_html(report_list, total_input_files):
             async function deleteReport(filename, hostname) {{
                 if (!confirm(`'${{filename}}' 리포트와 관련 데이터를 정말 삭제하시겠습니까?`)) return;
 
-                try {{
+                try {{ 
                     // 서버의 삭제 API 호출
-                    const response = await fetch(`/AIBox/api/reports?file=${{encodeURIComponent(filename)}}`, {{ method: 'DELETE' }});
+                    // [BUG FIX] API 경로를 수정합니다. cve-check 리포트는 /cve-check/api 경로를 사용해야 합니다.
+                    // [BUG FIX] API 경로를 절대 경로로 수정하여 404 오류를 해결합니다.
+                    const response = await fetch(`/AIBox/api/cve-check/reports?file=${{encodeURIComponent(filename)}}`, {{ method: 'DELETE' }});
                     if (!response.ok) {{
                         const result = await response.json();
-                        throw new Error(result.error || '삭제에 실패했습니다.');
+                        throw new Error(result.error || '개별 리포트 삭제에 실패했습니다.');
                     }}
                     // 성공 시 테이블에서 해당 행 제거
                     const row = document.getElementById(`report-row-${{hostname}}`);
-                    if (row) row.remove();
+                    if (row) {{
+                        row.remove();
+                    }}
 
                     // 테이블이 비었는지 확인하고 메시지 표시
                     const tbody = document.querySelector('tbody');
-                    if (tbody.children.length === 0) {{
+                    if (tbody && tbody.children.length === 0) {{
                         tbody.innerHTML = "<tr><td colspan='5' style='text-align:center; color: #666;'>생성된 리포트가 없습니다.</td></tr>";
                     }}
                 }} catch (error) {{
@@ -542,11 +688,11 @@ def generate_index_html(report_list, total_input_files):
                     passwordInput.value = '';
 
                     try {{
-                        const response = await fetch('/AIBox/api/reports/all', {{ method: 'DELETE', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ password: password }}) }});
+                        const response = await fetch('/AIBox/api/cve-check/reports/all', {{ method: 'DELETE', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ password: password }}) }});
                         const result = await response.json();
                         if (!response.ok) throw new Error(result.error || '전체 삭제에 실패했습니다.');
                         alert('모든 리포트가 성공적으로 삭제되었습니다.');
-                    document.querySelector('tbody').innerHTML = "<tr><td colspan='6' style='text-align:center; color: #666;'>생성된 리포트가 없습니다.</td></tr>";
+                        document.querySelector('tbody').innerHTML = "<tr><td colspan='7' style='text-align:center; color: #666;'>생성된 리포트가 없습니다.</td></tr>";
                     }} catch (error) {{ alert(`전체 삭제 오류: ${{error.message}}`); }}
                 }});
             }}
@@ -554,7 +700,7 @@ def generate_index_html(report_list, total_input_files):
             // 전체 압축 다운로드 함수
             function downloadAllAsZip() {{
                 // 서버의 ZIP 다운로드 API 엔드포인트로 리디렉션
-                window.location.href = '/AIBox/api/reports/zip';
+                window.location.href = '/AIBox/api/cve-check/reports/zip';
             }}
         </script>
     </body>
@@ -597,6 +743,8 @@ def main():
 
     # [신규] 생성된 리포트 정보를 저장할 리스트
     report_metadata_list = []
+    # [신규] 전체 NOK 취약점을 저장할 리스트
+    all_nok_vulnerabilities = []
 
     for i, system_file in enumerate(system_files, 1):
         logging.info(f"\n--- [{i}/{len(system_files)}] '{system_file.name}' 파일 분석 시작 ---")
@@ -676,12 +824,20 @@ def main():
                     
                     # [BUG FIX] 버전 비교 결과와 상관없이, 영향을 받는 패키지라면 모든 RHSA 정보를 수집합니다.
                     # 버전 비교는 보고서의 '조치 상태' 표시에만 사용됩니다.
-                    version_comparison_result = compare_versions(installed_ver, fix_version)
+                    # [요청사항] 버전 비교 시 양쪽 모두에서 epoch를 제거하고, 표시용 권고 버전에서도 epoch를 제거합니다.
+                    fix_package_display = re.sub(r'^\d+:', '', fix_version) # 표시용 버전에서 epoch 제거
+                    
+                    # 비교용 버전 문자열 생성 (양쪽 모두 epoch 제거)
+                    installed_ver_for_compare = re.sub(r'^\d+:', '', installed_ver)
+                    fix_version_for_compare = re.sub(r'^\d+:', '', fix_version)
+
+                    version_comparison_result = compare_versions(installed_ver_for_compare, fix_version_for_compare)
                     finding_details = {
                         "current_package": f"{vuln_pkg_name}-{installed_ver}.{installed_arch}",
-                        "fix_package": f"{vuln_pkg_name}-{fix_version}",
-                        "rhsa_id": release.get("advisory", "N/A"),
-                        "version_comparison": version_comparison_result
+                        "fix_package": f"{vuln_pkg_name}-{fix_package_display}", # Epoch가 제거된 표시용 버전
+                        "rhsa_id": release.get("advisory", "N/A"), # noqa: E501
+                        "version_comparison": version_comparison_result,
+                        "source_label": get_product_source_label(product_name) # [사용자 요청] 출처 라벨 추가
                     }
                     cve_findings.append(finding_details) # noqa: E501
             
@@ -696,6 +852,17 @@ def main():
                         "findings": []
                     }
                 found_vulnerabilities_map[cve_id]['findings'].extend(cve_findings)
+
+        # [신규] NOK 취약점 수집
+        for cve_id, cve_data in found_vulnerabilities_map.items():
+            overall_status, representative_finding = get_vulnerability_status(cve_data)
+            if overall_status == -1 and representative_finding:
+                all_nok_vulnerabilities.append({
+                    'hostname': system_info['hostname'],
+                    'cve_id': cve_id,
+                    'current_package': representative_finding.get('current_package', 'N/A'),
+                    'fix_package': representative_finding.get('fix_package', 'N/A'),
+                })
 
         # 최종 리포트용 리스트로 변환
         final_vulnerabilities = list(found_vulnerabilities_map.values())
@@ -723,7 +890,9 @@ def main():
             logging.error(Color.error(f"오류: 파일 '{system_file.name}' 삭제 실패 - {e}"))
 
         # [사용자 요청] 인덱스 생성을 위해 리포트 메타데이터 저장 (취약점 개수 정보 추가)
-        nok_count = sum(1 for cve in final_vulnerabilities for finding in cve.get('findings', []) if finding.get('version_comparison', -1) < 0)
+        # [BUG FIX] '조치 필요' 개수가 중복 계산되는 오류 수정
+        # 각 CVE에 대해 '조치 필요' 상태인 finding이 하나라도 있으면 1로 계산합니다.
+        nok_count = sum(1 for cve in final_vulnerabilities if any(finding.get('version_comparison', -1) < 0 for finding in cve.get('findings', [])))
         report_metadata_list.append({
             'hostname': system_info['hostname'],
             'report_filename': report_filename,
@@ -740,6 +909,16 @@ def main():
         with open(index_path, 'w', encoding='utf-8') as f:
             f.write(index_html_content)
         logging.info(Color.success(f"인덱스 파일 생성 완료: {index_path}"))
+    
+    # [신규] 전체 NOK 리포트 생성
+    date_str = datetime.now().strftime("%Y%m%d")
+    nok_report_filename = f"all_nok_vulnerabilities_{date_str}.html"
+    nok_report_path = REPORT_OUTPUT_DIR / nok_report_filename
+    logging.info(Color.header("\n--- 전체 NOK 리포트 생성 중 ---"))
+    nok_report_html = generate_nok_report_html(all_nok_vulnerabilities)
+    with open(nok_report_path, 'w', encoding='utf-8') as f:
+        f.write(nok_report_html)
+    logging.info(Color.success(f"전체 NOK 리포트 생성 완료: {nok_report_path}"))
 
     logging.info(Color.header("\n모든 작업이 완료되었습니다."))
 

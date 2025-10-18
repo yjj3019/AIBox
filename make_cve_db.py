@@ -32,7 +32,7 @@ LOCAL_CVE_URL = "http://127.0.0.1:5000/AIBox/cve/{cve_id}.json"
 REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
 
 # CVE DB 저장 경로
-CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/cve-check_db.json")
+CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/meta/cve-check_db.json")
 
 def fetch_cve_data(cve_id):
     """CVE ID에 대한 JSON 데이터를 로컬 서버 우선으로 가져옵니다."""
@@ -115,6 +115,8 @@ def main():
     success_count = 0
     failure_count = 0
     skipped_count = 0
+    # [사용자 요청] 수집에 실패한 CVE ID를 저장할 리스트
+    failed_cves = []
 
     logging.info(Color.header(f"\n===== CVE 데이터베이스 생성을 시작합니다 (총 {len(cve_ids)}개) ====="))
     with tqdm(total=len(cve_ids), desc="CVE 수집 진행률", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
@@ -133,6 +135,7 @@ def main():
                     success_count += 1
             else:
                 failure_count += 1
+                failed_cves.append(cve_id)
             
             pbar.set_postfix_str(f"성공: {Color.success(str(success_count))}, 실패: {Color.error(str(failure_count))}, 건너뜀: {Color.warn(str(skipped_count))}")
             pbar.update(1)
@@ -151,6 +154,11 @@ def main():
     logging.info(f"  - {Color.success('신규 수집 성공')}: {success_count}개")
     logging.info(f"  - {Color.error('수집 실패')}: {failure_count}개")
     logging.info(f"  - {Color.warn('건너뜀 (중복)')}: {skipped_count}개")
+    # [사용자 요청] 최종적으로 수집에 실패한 CVE 목록을 출력합니다.
+    if failed_cves:
+        logging.info(Color.error("\n--- 최종 수집 실패 CVE 목록 ---"))
+        for cve in failed_cves:
+            logging.info(Color.error(f"  - {cve}"))
     logging.info(Color.header("----------------------"))
 
 if __name__ == "__main__":
