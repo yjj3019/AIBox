@@ -994,14 +994,28 @@ class SosreportParser:
 
     def parse_all(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
         log_step("1단계: 로컬 데이터 파싱 및 분석")
+        logging.info("  - (1/5) 시스템 기본 정보 파싱 시작...")
         metadata = { "system_info": self._parse_system_details(), "storage": self._parse_storage(), "processes": self._parse_process_stats(), "network": self._parse_network_details(), **self._parse_additional_info() }
+        logging.info("  - (1/5) 시스템 기본 정보 파싱 완료.")
+        
+        logging.info("  - (2/5) SAR 성능 데이터 파싱 시작...")
         sar_data = self._parse_sar_data()
+        logging.info("  - (2/5) SAR 성능 데이터 파싱 완료.")
+        
+        logging.info("  - (3/5) 로그 이벤트 및 성능 병목 분석 시작...")
         log_analysis = self._analyze_logs_and_correlate_events(sar_data); perf_analysis = self._analyze_performance_bottlenecks(sar_data)
+        logging.info("  - (3/5) 로그 이벤트 및 성능 병목 분석 완료.")
+        
+        logging.info("  - (4/5) 스마트 로그 패턴화 시작...")
         smart_log_analysis = self._parse_and_patternize_logs() # [신규] 스마트 로그 분석 호출
+        logging.info("  - (4/5) 스마트 로그 패턴화 완료.")
+        
+        logging.info("  - (5/5) 최종 데이터 취합 시작...")
         metadata.update(log_analysis)
         metadata.update(smart_log_analysis) # [신규] 스마트 로그 분석 결과를 메타데이터에 추가
         metadata["performance_analysis"] = perf_analysis # 분석 결과를 메타데이터에 추가
         logging.info(Color.success("\n로컬 데이터 파싱 및 분석 완료."))
+        logging.info("  - (5/5) 최종 데이터 취합 완료.")
         return metadata, sar_data
 class HTMLReportGenerator:
     def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str, report_date: datetime.datetime, device_map: Dict):
@@ -1574,37 +1588,63 @@ class AIAnalyzer:
         self.tokenizer = None
         if IS_TIKTOKEN_AVAILABLE:
             try:
-                # 토크나이저를 미리 로드하여 성능 향상
                 self.tokenizer = tiktoken.get_encoding("cl100k_base")
             except Exception as e:
                 logging.warning(f"tiktoken 토크나이저 로딩 실패: {e}. 문자 길이 기반으로 폴백합니다.")
 
     def _safe_float(self, value: Any) -> float:
-        """입력값을 float으로 안전하게 변환합니다."""
+        """[개선] 입력값을 float으로 안전하게 변환합니다."""
         if isinstance(value, (int, float)):
             return float(value)
         try:
-            # locale에 따라 소수점이 쉼표(,)로 표현되는 경우를 처리합니다.
             return float(str(value).replace(',', '.'))
         except (ValueError, TypeError):
             return 0.0
 
     def _make_request(self, endpoint: str, data: Dict, timeout: int = 600) -> Dict:
-        """AIBox 서버에 POST 요청을 보내고 JSON 응답을 반환합니다."""
+        """[개선] 재시도 로직이 추가된 AIBox 서버 요청 함수."""
         url = f"{self.server_url}/api/{endpoint}"
-        try:
-            logging.info(f"AI 서버에 분석 요청: {url}")
-            response = requests.post(url, json=data, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logging.error(Color.error(f"AI 서버({url}) 통신 오류: {e}"))
-            # [안정성 강화] 서버 통신 실패 시, AI 분석 결과가 없음을 나타내는 기본 구조를 반환합니다.
-            return {
-                "summary": "AI 분석 서버와 통신하지 못했습니다. 네트워크 연결 및 서버 상태를 확인하세요.",
-                "critical_issues": [], "warnings": [], "recommendations": []
-            }
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logging.info(f"AI 서버에 분석 요청: {url} (시도 {attempt + 1}/{max_retries})")
+                response = requests.post(url, json=data, timeout=timeout)
+                
+                if attempt > 0:
+                    logging.info(Color.success(f"AI 서버 재연결 성공 (시도 {attempt + 1}/{max_retries}): {url}"))
 
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                logging.warning(Color.warn(f"AI 서버({url}) 통신 오류 (시도 {attempt + 1}/{max_retries}): {e}"))
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                else:
+                    logging.error(Color.error(f"AI 서버({url}) 통신이 모든 재시도 후에도 최종 실패했습니다."))
+                    return { "summary": "AI 분석 서버와 통신하지 못했습니다. 네트워크 연결 및 서버 상태를 확인하세요.", "critical_issues": [], "warnings": [], "recommendations": [] }
+        return {} # Should not be reached
+
+    def _make_get_request_with_retry(self, url: str, timeout: int = 10, max_retries: int = 3) -> Optional[requests.Response]: # type: ignore
+        """[BUG FIX] 재시도 로직이 포함된 GET 요청 함수. _make_request를 잘못 호출하던 문제를 수정합니다."""
+        for attempt in range(max_retries):
+            try:
+                # 로컬 서버와 통신하므로 프록시를 사용하지 않습니다.
+                # [BUG FIX] _make_request 대신 requests.get을 직접 호출하여 올바른 GET 요청을 보냅니다.
+                response = requests.get(url, timeout=timeout, proxies={'http': None, 'https': None})
+                
+                if attempt > 0:
+                    logging.info(f"GET 요청 재연결 성공 (시도 {attempt + 1}/{max_retries}): {url}")
+
+                response.raise_for_status()
+                return response # type: ignore
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"GET 요청 오류 (시도 {attempt + 1}/{max_retries}): {url}, 오류: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    logging.error(f"GET 요청이 모든 재시도 후에도 최종 실패했습니다: {url}")
+        return None # type: ignore
     def _perform_sar_smart_analysis(self, sar_data: Dict[str, Any], cpu_cores: int) -> Dict[str, Any]:
         """
         [신규] SAR 데이터에서 임계치를 초과하는 성능 지표만 필터링하는 '스마트 분석'을 수행합니다.
@@ -1705,8 +1745,9 @@ class AIAnalyzer:
         summaries_text = "\n".join(f"- **{name}**: {summary}" for name, summary in summaries.items())
 
         # [사용자 요청] AI의 역할을 RHEL 시스템 전반을 분석하는 최고 전문가로 재정의하고, HA/DRBD는 심층 분석의 한 부분으로 조정합니다.
+        # [BUG FIX] return 문이 누락되어 프롬프트가 생성되지 않는 치명적인 오류를 수정합니다.
         return f"""[시스템 역할] 종합 분석
-당신은 20년 경력의 Red Hat Certified Architect(RHCA)이자, 고객에게 시스템 장애의 근본 원인을 보고하고 해결책을 제시하는 최고 수준의 기술 컨설턴트입니다. 당신의 분석은 단순한 사실 나열을 넘어, 각 데이터 간의 인과 관계를 추론하고, 비즈니스 영향까지 고려한 깊이 있는 통찰력을 제공해야 합니다.
+당신은 20년 경력의 Red Hat Certified Architect(RHCA)이자, 고객에게 시스템 장애의 근본 원인을 보고하고 해결책을 제시하는 최고 수준의 기술 컨설턴트입니다. 당신의 분석은 단순한 사실 나열을 넘어, 각 데이터 간의 인과 관계를 추론하고, 비즈니스 영향까지 고려한 깊이 있는 통찰력을 제공해야 합니다. (deep_dive)
 
 [분석 방법론]
 1.  **전체 시스템 상태 평가 (Holistic Review):** 먼저 CPU, 메모리, I/O, 네트워크 등 전반적인 시스템 성능 지표와 커널 로그(dmesg), 시스템 로그를 종합적으로 검토하여 시스템의 전반적인 건강 상태와 이상 징후를 파악합니다.
@@ -1749,134 +1790,52 @@ class AIAnalyzer:
         1. 데이터를 작은 묶음(chunk)으로 나누어 개별적으로 요약 분석을 요청합니다. (병렬 처리)
         2. 요약된 결과들을 모아 최종 종합 분석을 요청합니다.
         """
-        # [개선] LLM 컨텍스트 크기를 '토큰' 기준으로 설정 (예: 128k 모델의 경우, 안전 마진 고려 120,000 토큰)
-        # 실제 청킹은 서버의 LLMChunker가 담당하지만, 클라이언트에서도 1차적으로 분할하여
-        # 단일 요청의 크기가 너무 커지는 것을 방지합니다.
-        MAX_TOKENS_PER_REQUEST = 120000
-        BASE_PROMPT_TOKENS = 2000  # 프롬프트 기본 구조가 차지하는 토큰 (보수적 추정)
-
         log_step("AI 시스템 분석 요청 (지능형 청크 분할)")
         try:
             with open(metadata_path, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
             with open(sar_data_path, 'r', encoding='utf-8') as f:
                 sar_data = json.load(f)
-
+    
             if anonymize:
                 logging.info(Color.info("  - 민감 정보 익명화(Anonymization) 진행 중..."))
                 anonymizer = DataAnonymizer()
                 hostnames = [metadata.get('system_info', {}).get('hostname', '')]
                 metadata = anonymizer.anonymize_data(metadata, hostnames)
                 sar_data = anonymizer.anonymize_data(sar_data, hostnames)
-            
-            # [핵심 개선] SAR 데이터에 대한 스마트 분석 수행
-            # CPU 코어 수 파싱 (문자열 'x' 기준)
-            cpu_info_str = metadata.get('system_info', {}).get('cpu', '1 x')
-            try: # noqa: E501
-                cpu_cores = int(cpu_info_str.split('x')[0].strip())
-            except (ValueError, IndexError):
-                cpu_cores = 1 # 파싱 실패 시 기본값
-            
-            smart_sar_results = self._perform_sar_smart_analysis(sar_data, cpu_cores)
-
-            # [핵심 개선] AI 요청 데이터 최적화
-            # 1. AI 분석에 필요한 핵심 데이터만 선별합니다.
-            essential_data = {
+    
+            # [단순화] 서버의 Map-Reduce 로직을 신뢰하고, 모든 데이터를 하나의 프롬프트로 구성하여 전송합니다.
+            # 서버가 컨텍스트 초과를 감지하고 자동으로 처리할 것입니다.
+            all_data_summary = {
                 "system_info": metadata.get("system_info"),
-                # [사용자 요청] HA 클러스터 및 DRBD 정보 추가
                 "ha_cluster_info": metadata.get("ha_cluster_info"),
                 "drbd_info": metadata.get("drbd_info"),
                 "performance_analysis": metadata.get("performance_analysis"),
                 "critical_log_events": metadata.get("critical_log_events"),
-                "smart_sar_analysis": smart_sar_results,
-                # 2. 매우 큰 데이터는 상위 5개 항목만 잘라서 보냅니다.
-                "smart_log_analysis": {k: v[:5] for k, v in metadata.get("smart_log_analysis", {}).items()}
+                "smart_log_analysis": metadata.get("smart_log_analysis"),
+                "sar_data": sar_data # SAR 데이터도 함께 전송
             }
-
-            chunk_summaries = {}
-            tasks = []
-
-            for chunk_name, chunk_data in essential_data.items():
-                if not chunk_data: continue
-
-                chunk_str = json.dumps(chunk_data, ensure_ascii=False, default=str)
-                
-                # 토큰 계산은 서버의 LLMChunker가 더 정확하게 수행하므로, 여기서는 문자 길이로 대략적인 크기만 확인합니다.
-                # 1 토큰을 약 2.5자로 가정하여, 매우 큰 청크만 분할합니다.
-                chunk_size_approx = len(chunk_str)
-                max_size_approx = (MAX_TOKENS_PER_REQUEST - BASE_PROMPT_TOKENS) * 2
-
-                if chunk_size_approx <= max_size_approx:
-                    tasks.append((chunk_name, chunk_data))
-                else:
-                    logging.warning(f"    - '{chunk_name}' 섹션이 너무 커서({chunk_size_approx}자) 하위 청크로 분할합니다.")
-                    
-                    # [개선] 청크 분할 로직 고도화
-                    if isinstance(chunk_data, list):
-                        # 리스트는 100개 아이템 단위로 분할
-                        for i in range(0, len(chunk_data), 100):
-                            tasks.append((f"{chunk_name}_{i//100+1}", chunk_data[i:i+100]))
-                    elif isinstance(chunk_data, dict):
-                        items = list(chunk_data.items())
-                        # 딕셔너리는 200개 아이템 단위로 분할
-                        for i in range(0, len(items), 200):
-                            tasks.append((f"{chunk_name}_{i//200+1}", dict(items[i:i+200])))
-
-            logging.info(f"  - [1/2] {len(tasks)}개 데이터 묶음(chunk)에 대한 병렬 요약 분석 시작...")
-            # [개선] 병렬 처리 워커 수를 늘려 동시 요청 수를 증가시킴
-            with ThreadPoolExecutor(max_workers=10, thread_name_prefix='Chunk_Summarizer') as executor:
-                future_to_chunk = {executor.submit(self._make_request, 'sos/analyze_system', {"prompt": self._create_chunk_analysis_prompt(name, data)}): name for name, data in tasks}
-
-                for future in as_completed(future_to_chunk):
-                    chunk_name = future_to_chunk[future]
-                    try:
-                        result = future.result()
-                        # [디버깅 강화] AI 서버로부터 받은 응답의 타입과 내용을 로그로 기록합니다.
-                        logging.debug(f"    [DEBUG] '{chunk_name}' 응답 수신: Type={type(result)}, Content={str(result)[:200]}")
-
-                        # [안정성 강화] AI 응답이 딕셔너리 형태인지 확인합니다.
-                        if isinstance(result, dict):
-                            # AI 응답에서 실제 요약 텍스트를 추출합니다.
-                            summary_text = result.get('summary', str(result))
-                            chunk_summaries[chunk_name] = summary_text
-                            logging.info(f"    -> '{chunk_name}' 섹션 요약 분석 완료.")
-                        else:
-                            # 딕셔너리가 아닐 경우, 오류로 기록하고 응답 내용을 그대로 저장합니다.
-                            error_message = f"'{chunk_name}' 섹션의 AI 응답이 예상된 딕셔너리 형식이 아닙니다 (Type: {type(result)})."
-                            logging.error(error_message)
-                            chunk_summaries[chunk_name] = f"분석 오류: {error_message}\n응답 내용: {str(result)}"
-                    except Exception as e:
-                        logging.error(f"'{chunk_name}' 섹션 요약 중 오류 발생: {e}")
-                        chunk_summaries[chunk_name] = f"오류: {e}"
-
-            # 2단계: 요약본을 취합하여 최종 분석 요청
-            logging.info("  - [2/2] 요약본 취합 및 최종 종합 분석 시작...")
-
-            # [핵심 개선] 최종 분석 요청 시, 모든 요약본을 하나의 프롬프트에 담아 전송합니다.
-            # 서버의 LLMChunker가 컨텍스트 크기에 맞춰 자동으로 분할 및 병합 처리를 수행합니다.
-            # 이 방식은 클라이언트 로직을 단순화하고, 서버에서 더 정확한 토큰 기반 청킹을 가능하게 합니다.
-            final_prompt = self._create_final_analysis_prompt(chunk_summaries)
+            final_prompt = self._create_final_analysis_prompt(all_data_summary)
             final_analysis = self._make_request('sos/analyze_system', {"prompt": final_prompt})
-
+    
             return final_analysis
-
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logging.error(Color.error(f"AI 분석을 위한 데이터 파일을 읽는 중 오류 발생: {e}"))
             return {"summary": "분석 데이터 파일을 처리할 수 없어 AI 분석을 수행하지 못했습니다.", "critical_issues": [], "warnings": [], "recommendations": []}
 
     def fetch_security_news(self, metadata: Dict, output_dir: Path) -> List[Dict]: # noqa: E501
-        """[보안 분석 v4] 설치된 패키지 정보를 기반으로 시스템에 영향을 미치는 CVE를 분석하고, AI를 통해 우선순위를 선정합니다."""
+        """[보안 분석 v5] 4단계 AI 분석을 통해 시스템에 영향을 미치는 CVE를 분석하고 우선순위를 선정합니다."""
         log_step("3단계: AI 기반 보안 위협 분석")
 
         installed_packages = metadata.get('installed_packages', [])
-        if not installed_packages:
+        if not installed_packages: # noqa: E501
             logging.warning(Color.warn("  - 설치된 패키지 정보가 없어 보안 분석을 건너뜁니다."))
             return []
 
         # --- 1단계: 로컬 CVE 데이터 수집 및 1차 분류 (기간) ---
         logging.info(Color.info("\n--- 1단계: 로컬 CVE 데이터 수집 및 1차 분류 (기간) ---"))
         # [요청 반영] cve_data.json 파일 경로를 ./cve_data.json으로 지정
-        cve_data_path = Path('./cve_data.json')
+        cve_data_path = Path('./meta/cve_data.json')
         if not cve_data_path.exists():
             # [사용자 요청] security.py의 안정적인 오류 처리 로직을 적용합니다.
             logging.error(Color.error(f"  - CVE 데이터 파일({cve_data_path})을 찾을 수 없어 보안 분석을 건너뜁니다."))
@@ -1901,20 +1860,21 @@ class AIAnalyzer:
         # --- 2단계: CVE 상세 정보 수집 및 2차 분류 (Severity/CVSS) ---
         logging.info(Color.info("\n--- 2단계: CVE 상세 정보 수집 및 2차 분류 (Severity/CVSS) ---"))
         cves_with_details = []
-        # [사용자 요청] 스레드 안전성을 위해 Lock 객체를 생성합니다.
+        # 스레드 안전성을 위해 Lock 객체를 생성합니다.
         cve_details_lock = threading.Lock()
 
         # [BUG FIX] CVE 상세 정보 조회 로직 강화 (로컬 실패 시 외부 API로 폴백)
         # 1단계: 로컬 서버에서 먼저 조회
         logging.info(f"  - {len(recent_cves)}개 CVE 상세 정보 수집 중 (From: http://127.0.0.1:5000/AIBox/cve/)...")
         failed_cve_ids = []
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            future_to_cve = {executor.submit(requests.get, f"http://127.0.0.1:5000/AIBox/cve/{cve['CVE']}.json", timeout=10): cve for cve in recent_cves} # noqa: E501
+
+        with ThreadPoolExecutor(max_workers=20, thread_name_prefix='CVE_Detail_Fetcher_Local') as executor:
+            future_to_cve = {executor.submit(self._make_get_request_with_retry, f"http://127.0.0.1/AIBox/cve/{cve['CVE']}.json", timeout=10): cve for cve in recent_cves}
             for future in as_completed(future_to_cve):
                 cve_summary = future_to_cve[future]
                 try:
                     response = future.result()
-                    if response.ok:
+                    if response and response.ok:
                         detail_data = response.json()
                         # [BUG FIX] 상세 정보의 CVE ID 키가 'name'으로 되어 있어 'CVE'로 통일합니다.
                         # 이렇게 하지 않으면, 기존 cve_summary의 'name' 필드(패키지명)를 덮어쓰게 됩니다.
@@ -1924,20 +1884,22 @@ class AIAnalyzer:
                         with cve_details_lock:
                             # [BUG FIX] 원본 요약 정보와 상세 정보를 병합하여 CVE ID 누락 방지
                             cves_with_details.append({**cve_summary, **detail_data})
-                except requests.RequestException as e:
-                    logging.warning(f"    -> 로컬 CVE 상세 정보 조회 실패: {cve_summary.get('CVE')}, 오류: {e}")
+                    else:
+                        failed_cve_ids.append(cve_summary)
+                except Exception as e:
+                    logging.warning(f"    -> 로컬 CVE 상세 정보 조회 중 예외 발생: {cve_summary.get('CVE')}, 오류: {e}")
                     failed_cve_ids.append(cve_summary)
         
         # 2단계: 로컬 조회 실패 건에 대해 Red Hat 공식 API로 재시도
         if failed_cve_ids:
             logging.info(f"  - 로컬 조회 실패 {len(failed_cve_ids)}건에 대해 외부 API로 재시도합니다...")
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                future_to_cve = {executor.submit(requests.get, f"https://access.redhat.com/hydra/rest/securitydata/cve/{cve['CVE']}.json", timeout=20): cve for cve in failed_cve_ids}
+            with ThreadPoolExecutor(max_workers=10, thread_name_prefix='CVE_Detail_Fetcher_Remote') as executor:
+                future_to_cve = {executor.submit(self._make_get_request_with_retry, f"https://access.redhat.com/hydra/rest/securitydata/cve/{cve['CVE']}.json", timeout=20): cve for cve in failed_cve_ids}
                 for future in as_completed(future_to_cve):
                     cve_summary = future_to_cve[future]
                     try:
                         response = future.result()
-                        if response.ok:
+                        if response and response.ok:
                             detail_data = response.json()
                             # 외부 API 조회 결과에 대해서도 동일한 키 통일 작업을 수행합니다.
                             if 'name' in detail_data and detail_data['name'].startswith('CVE-'):
@@ -1945,151 +1907,129 @@ class AIAnalyzer:
 
                             with cve_details_lock:
                                 cves_with_details.append({**cve_summary, **detail_data})
-                    except requests.RequestException as e:
+                    except Exception as e:
                         logging.error(f"    -> 외부 API 조회 최종 실패: {cve_summary.get('CVE')}, 오류: {e}")
 
         logging.info(f"  - CVE 상세 정보 수집 완료: {len(cves_with_details)}개")
 
+        # [사용자 요청] 2단계 필터링을 security.py 로직에 맞춰 CVSS 점수(>=7.0) 및 심각도 기준으로 변경
+        logging.info(f"  - 2차 분류: {len(cves_with_details)}개 CVE 중 CVSS 점수(>=7.0) 및 심각도(Critical/Important) 기준으로 후보군 선정...")
         cves_after_2nd_filter = []
         for cve in cves_with_details:
             # [BUG FIX] CVE JSON 데이터의 심각도 필드 이름이 'threat_severity'이므로, 이를 참조하도록 수정합니다.
             # 'severity' 필드는 존재하지 않아 필터링이 제대로 동작하지 않았습니다.
             severity = cve.get('threat_severity', '').lower()
             
-            # [사용자 요청 반영] security.py의 안정적인 점수 파싱 로직을 그대로 적용합니다.
-            # cvss3 필드가 딕셔너리가 아닌 경우도 처리하여 정확도를 높입니다.
+            # [사용자 요청] security.py의 안정적인 CVSS 점수 파싱 로직을 적용합니다.
+            # 1. cvss3.cvss3_base_score를 우선적으로 확인합니다.
+            # 2. 1번이 없을 경우, 최상위 레벨의 cvss3_score를 확인합니다.
+            # 3. 모든 값이 없거나 유효하지 않으면 0.0으로 처리합니다.
             cvss3_score = 0.0
             cvss3_data = cve.get('cvss3', {})
-            score_str = None
-            if isinstance(cvss3_data, dict): # cvss3가 딕셔너리인 경우
-                score_str = cvss3_data.get('cvss3_base_score')
-            if not score_str: # cvss3_base_score가 없거나, cvss3가 딕셔너리가 아닌 경우
-                score_str = cve.get('cvss3_score') # 최상위 레벨의 cvss3_score 확인
-            if score_str:
-                cvss3_score = self._safe_float(score_str)
+            if isinstance(cvss3_data, dict):
+                try:
+                    score_str = cvss3_data.get('cvss3_base_score') or cve.get('cvss3_score')
+                    if score_str:
+                        cvss3_score = float(score_str)
+                except (ValueError, TypeError):
+                    pass # 점수 파싱 실패 시 0.0 유지
 
+            # [사용자 요청] security.py와 동일하게 CVSS 7.0 이상을 기준으로 필터링합니다.
             if severity in ['critical', 'important'] and cvss3_score >= 7.0:
                 cves_after_2nd_filter.append(cve)
+        
         logging.info(f"  - 2차 분류(Severity/CVSS) 완료. 후보 CVE: {len(cves_after_2nd_filter)}개")
 
-        # --- 3단계: 시스템 패키지 연관성 분석 (3차 분류) ---
-        logging.info(Color.info("\n--- 3단계: 시스템 패키지 연관성 분석 (3차 분류) ---"))
-        # [요청 반영] AI 분석의 정확도를 높이기 위해, 'name'과 'version'을 조합한 전체 패키지 문자열 목록을 생성합니다.
-        # 예: 'NetworkManager-1.18.8-1.el7.x86_64'        
-        installed_package_full_names = {f"{pkg['name']}-{pkg['version']}" for pkg in installed_packages}
-        installed_package_names_only = {pkg['name'] for pkg in installed_packages}
-        
-        cves_after_3rd_filter = []
-        # [사용자 요청] 어떤 패키지로 인해 CVE가 선정되었는지 추적하기 위한 디버그 로그를 추가합니다.
-        for cve in cves_after_2nd_filter:
-            is_relevant = False
-            relevant_package_for_debug = "N/A"
-            # [BUG FIX] cve.get('package_state')가 None을 반환할 경우 TypeError가 발생하는 문제를 해결합니다.
-            # 'or []'를 사용하여 None일 경우 빈 리스트로 처리하도록 합니다.
-            for state in (cve.get('package_state') or []):
-                # [핵심 개선] 'Affected' 상태인 패키지에 대해서만 연관성을 검사합니다.
-                if state.get('fix_state') == 'Affected':                    
-                    # CVE 데이터의 패키지 이름(예: 'httpd-tools-2.4.37-56.el8_8.3.x86_64')에서
-                    # 버전과 아키텍처를 제외한 순수 패키지 이름(예: 'httpd-tools')을 추출합니다.
-                    # 정규식은 이름 뒤에 오는 첫 번째 숫자 또는 하이픈+숫자 부분을 버전의 시작으로 간주합니다.
-                    cve_pkg_name_match = re.match(r'^[a-zA-Z0-9_.-]+(?=-\d)', state.get('package_name', ''))
-                    if cve_pkg_name_match:
-                        cve_pkg_name = cve_pkg_name_match.group(0)
-                    else:
-                        # 버전 정보가 없는 패키지 이름(예: 'kernel')의 경우, 전체 이름을 사용합니다.
-                        cve_pkg_name = state.get('package_name', '')
-
-                    # 추출된 CVE 패키지 이름이 시스템에 설치된 패키지 이름 목록과 정확히 일치하는지 확인합니다.
-                    if cve_pkg_name and cve_pkg_name in installed_package_names_only:
-                        is_relevant = True
-                        relevant_package_for_debug = cve_pkg_name
-                        break
-            if is_relevant:
-                logging.info(f"    [DEBUG] CVE {cve.get('CVE')} is relevant due to package: {relevant_package_for_debug}")
-
-            if is_relevant:
-                cves_after_3rd_filter.append(cve)
-        logging.info(f"  - 3차 분류(패키지 연관성) 완료. 최종 AI 분석 대상 CVE: {len(cves_after_3rd_filter)}개")
-
-        if not cves_after_3rd_filter:
+        if not cves_after_2nd_filter:
             logging.warning(Color.warn("  - 시스템에 영향을 미칠 가능성이 있는 CVE를 찾지 못했습니다."))
             return []
         
-        # --- 4단계: AI 최종 분석 및 선정 ---
-        logging.info(Color.info("\n--- 4단계: AI 최종 분석 및 선정 ---"))
-
-        # [사용자 요청] 2단계 AI 분석 프로세스 도입
-        # 1단계: 예선 분석 - 각 청크에서 중요한 CVE 후보를 선별
-        logging.info(f"  - [1/2] 예선 분석: {len(cves_after_3rd_filter)}개 CVE를 묶음으로 나누어 주요 후보 선별...")
+        # --- 3단계: 최종 30개 CVE 선정 (패키지당 1개) ---
+        logging.info(Color.info("\n--- 3단계: 최종 30개 CVE 선정 (패키지당 1개) ---"))
+        logging.info(f"  - {len(cves_after_2nd_filter)}개 CVE를 대상으로 AI를 사용하여 최종 후보 30개 선정...")
         preliminary_candidates = []
-        preliminary_candidates_lock = threading.Lock()
+        preliminary_candidates_ids = set()
         
-        CHUNK_SIZE = 20
-        cve_chunks = [cves_after_3rd_filter[i:i + CHUNK_SIZE] for i in range(0, len(cves_after_3rd_filter), CHUNK_SIZE)]
+        # [사용자 요청] security.py의 예선 분석 로직을 참고하여 5개씩 묶어 병렬 처리
+        CHUNK_SIZE = 5
+        cve_chunks = [cves_after_2nd_filter[i:i + CHUNK_SIZE] for i in range(0, len(cves_after_2nd_filter), CHUNK_SIZE)]
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_chunk = {executor.submit(self._preliminary_cve_analysis, chunk): chunk for chunk in cve_chunks}
-            # [BUG FIX] NameError: name 'future_to_chunk_index' is not defined 오류 수정
-            for future in as_completed(future_to_chunk):
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            # reasoning-model을 사용하도록 is_reasoning=True 전달
+            future_to_chunk = {executor.submit(self._preliminary_cve_analysis, chunk, is_reasoning=True): chunk for chunk in cve_chunks}
+            for i, future in enumerate(as_completed(future_to_chunk), 1):
                 chunk = future_to_chunk[future]
+                chunk_cve_ids = [cve.get('CVE') for cve in chunk if cve.get('CVE')]
+                logging.info(f"  - 3단계 {i}/{len(cve_chunks)}번째 묶음 처리 완료. (대상: {len(chunk_cve_ids)}개)")
                 try:
                     # AI는 이 청크에서 중요하다고 판단한 CVE ID 목록을 반환
-                    selected_cve_ids = future.result()
-                    logging.info(f"    -> 예선 묶음 분석 완료. AI가 {len(selected_cve_ids)}개 후보 선정: {selected_cve_ids}")
-                    with preliminary_candidates_lock:
-                        # 원본 CVE 데이터를 후보 목록에 추가
-                        for cve in chunk:
-                            if cve.get('CVE') in selected_cve_ids:
-                                preliminary_candidates.append(cve)
+                    selected_cve_ids = future.result() # AI 서버 응답
+                    # [BUG FIX] AI 서버가 None을 반환할 경우 'NoneType' is not iterable 오류가 발생하므로,
+                    # 이 경우 경고를 기록하고 빈 리스트로 처리하여 안정성을 높입니다.
+                    if selected_cve_ids is None:
+                        logging.warning(f"    -> AI 서버로부터 None 응답을 수신하여 이 묶음의 분석을 건너뜁니다. (대상: {chunk_cve_ids})")
+                        selected_cve_ids = []
+
+                    if isinstance(selected_cve_ids, list):
+                        logging.info(f"    -> AI가 {len(selected_cve_ids)}개 선정: {', '.join(selected_cve_ids[:5])}...")
+                        preliminary_candidates_ids.update(selected_cve_ids)
+                    else:
+                        # [안정성 강화] AI 응답이 예상과 다른 형식일 경우를 대비한 처리
+                        error_details = str(selected_cve_ids)
+                        raw_text = str(selected_cve_ids)
+                        extracted_cves = re.findall(r'CVE-\d{4}-\d{4,}', raw_text)
+                        if extracted_cves:
+                            logging.warning(f"    -> AI 응답이 리스트가 아니었지만, 텍스트에서 {len(extracted_cves)}개의 CVE 목록을 추출했습니다.")
+                            preliminary_candidates_ids.update(extracted_cves)
+                        else:
+                            logging.warning(f"    -> AI 응답이 예상과 다름 (리스트가 아님): {error_details[:250]}...")
                 except Exception as e:
-                    logging.error(f"    -> 예선 묶음 분석 중 오류 발생: {e}")
+                    logging.error(f"    -> 3단계 묶음 분석 중 오류 발생: {e}")
 
         # 중복 제거 (다른 청크에서 동일 CVE가 선택될 수 있음)
-        preliminary_finalists = list({cve['CVE']: cve for cve in preliminary_candidates}.values())
-        logging.info(f"  - 예선 분석 완료. 총 {len(preliminary_finalists)}개의 최종 후보가 선정되었습니다.")
+        preliminary_finalists_ids = sorted(list(preliminary_candidates_ids))[:30]
+        preliminary_finalists = [cve for cve in cves_after_2nd_filter if cve.get('CVE') in preliminary_finalists_ids]
+        # AI가 30개를 초과하여 선정할 경우를 대비하여 30개로 제한
+        logging.info(f"  - 3단계 분석 완료. 총 {len(preliminary_finalists)}개의 최종 후보가 선정되었습니다.")
 
         if not preliminary_finalists:
             logging.warning(Color.warn("  - AI가 시스템에 영향을 미칠 가능성이 있는 CVE를 찾지 못했습니다."))
             return []
 
-        # 2단계: 결선 분석 - 예선 통과자들을 대상으로 최종 분석 및 "패키지당 1개" 규칙 적용
-        logging.info(f"  - [2/2] 결선 분석: {len(preliminary_finalists)}개 후보를 대상으로 최종 우선순위 선정...")
-        final_cves = self._final_cve_analysis(preliminary_finalists, installed_package_full_names, metadata)
+        # --- 4단계: 최종 CVE 선정 (시스템 연관성 고려) ---
+        logging.info(Color.info("\n--- 4단계: 최종 CVE 선정 (시스템 연관성 고려) ---"))
+        logging.info(f"  - {len(preliminary_finalists)}개 후보를 대상으로 시스템 연관성 분석 및 최종 순위 선정...")
+        installed_package_full_names = {f"{pkg['name']}-{pkg['version']}" for pkg in installed_packages} # type: ignore
+        
+        # 3단계에서 선정된 30개 CVE를 대상으로 시스템 연관성 분석
+        final_cves_with_analysis = self._final_cve_analysis(preliminary_finalists, installed_package_full_names, metadata) # type: ignore
 
-        # [BUG FIX] AI가 반환한 정보에 원본 CVE의 상세 정보(공개일, CVSS 점수 등)를 병합합니다.
-        # 이렇게 해야 HTML 템플릿에서 올바른 데이터를 사용할 수 있습니다.
-        cve_details_map = {cve['CVE']: cve for cve in preliminary_finalists if 'CVE' in cve}
-        enriched_final_cves = []
-        for advisory in final_cves:
-            cve_id = advisory.get('cve_id')
-            if cve_id in cve_details_map:
-                # 원본 상세 정보 위에 AI 분석 결과를 덮어씁니다.
-                enriched_advisory = {**cve_details_map[cve_id], **advisory}
-                enriched_final_cves.append(enriched_advisory)
+        # AI 분석 결과와 원본 CVE 상세 정보를 병합
+        logging.info(f"  - 4단계 AI 분석 완료. {len(final_cves_with_analysis)}개의 CVE에 대한 최종 분석 및 순위 선정 완료.")
+        cve_details_map = {cve['CVE']: cve for cve in cves_with_details if 'CVE' in cve}
+        enriched_final_cves = [
+            {**cve_details_map.get(cve.get('cve_id'), {}), **cve}
+            for cve in final_cves_with_analysis
+        ]
 
-        # [사용자 요청] 패키지당 하나의 CVE만 선정하도록 최종 필터링 로직 추가
+        # 최종 리포트에 포함할 CVE 목록 (시스템에 실제 영향을 주는 것)
         final_report_cves = []
-        seen_packages = set()
+        installed_package_names = {pkg['name'] for pkg in installed_packages} # type: ignore
 
-        # AI가 정렬한 순서대로 순회
-        for cve in enriched_final_cves:
-            # AI 분석 결과에서 패키지 이름을 가져옴
-            package_name = cve.get('package')
-            if not package_name:
-                continue
-
-            # 이미 이 패키지에 대한 CVE가 선정되지 않았다면
-            if package_name not in seen_packages:
+        for cve in enriched_final_cves: # AI가 우선순위로 정렬한 목록
+            # AI가 분석한 패키지 이름
+            ai_package_name = cve.get('package')
+            if ai_package_name and ai_package_name in installed_package_names:
                 final_report_cves.append(cve)
-                seen_packages.add(package_name)
 
         # 최종 정렬 (심각도, CVSS 점수 순) 및 상위 20개 반환
+        logging.info(f"  - 시스템에 설치된 패키지와의 연관성 필터링 후 {len(final_report_cves)}개의 CVE가 최종 후보로 선정되었습니다.")
         final_report_cves.sort(key=lambda x: (x.get('severity') == 'critical', self._safe_float(x.get('cvss_score', 0.0))), reverse=True)
-        logging.info(Color.success(f"\nAI 종합 분석 완료. 최종 {len(final_report_cves)}개의 고유 패키지 기반 긴급 보안 위협을 선정했습니다."))
+        logging.info(Color.success(f"\nAI 종합 분석 완료. 최종 {len(final_report_cves[:20])}개의 시스템 관련 긴급 보안 위협을 선정했습니다."))
         return final_report_cves[:20]
     
     def _add_installed_version_to_advisories(self, advisories: List[Dict], installed_packages: List[Dict]) -> List[Dict]:
-        """[신규] AI가 선정한 보안 권고 목록에 실제 설치된 패키지 버전 정보를 추가합니다."""
+        """[수정] AI가 선정한 보안 권고 목록에 실제 설치된 패키지 버전 정보를 추가합니다."""
         # 패키지 이름으로 버전을 빠르게 찾기 위한 맵 생성
         # 예: {'kernel': '3.10.0-1160.el7.x86_64', 'openssh': '7.4p1-21.el7.x86_64'}
         package_version_map = {pkg['name']: pkg['version'] for pkg in installed_packages}
@@ -2103,8 +2043,8 @@ class AIAnalyzer:
         return advisories
 
 
-    def _preliminary_cve_analysis(self, cve_chunk: List[Dict]) -> List[str]:
-        """[신규] 1단계 예선 분석을 위한 프롬프트를 생성하고 AI를 호출합니다."""
+    def _preliminary_cve_analysis(self, cve_chunk: List[Dict], is_reasoning: bool = False) -> List[str]:
+        """[수정] 2단계/3단계 분석을 위한 프롬프트를 생성하고 AI를 호출합니다."""
         # AI에게 전달할 데이터 형식에 맞게 입력 데이터를 가공합니다.
         cves_for_prompt = []
         for cve in cve_chunk:
@@ -2118,7 +2058,13 @@ class AIAnalyzer:
             cvss_score = (cve.get('cvss3', {}) or {}).get('cvss3_base_score') or cve.get('cvss3_score') or 'N/A'
             cvss_vector = (cve.get('cvss3', {}) or {}).get('cvss3_vector') or 'N/A'
             summary = " ".join(cve.get('details', [])) or cve.get('statement', '')
-            affected_packages = list(set(re.match(r'([^-\s]+)', p.get('package_name', '')).group(1) for p in cve.get('package_state', []) if p.get('fix_state') == 'Affected' and re.match(r'([^-\s]+)', p.get('package_name', ''))))
+
+            # [BUG FIX] 'package_state'가 None인 경우 빈 리스트로 대체하여 'NoneType not iterable' 오류 방지
+            package_state = cve.get('package_state') or []
+            if 'package_state' in cve and cve['package_state'] is None:
+                logging.debug(f"CVE {cve.get('CVE', 'N/A')}의 'package_state'가 None입니다. 빈 리스트로 대체합니다.")
+
+            affected_packages = list(set(re.match(r'([^-\s]+)', p.get('package_name', '')).group(1) for p in package_state if p.get('fix_state') == 'Affected' and re.match(r'([^-\s]+)', p.get('package_name', ''))))
 
             cves_for_prompt.append({
                 "cve_id": cve.get('CVE', 'N/A'),
@@ -2129,14 +2075,18 @@ class AIAnalyzer:
                 "affected_packages": affected_packages
             })
 
+        model_selector = "reasoning-model" if is_reasoning else "fast-model"
+        task_description = "가장 중요하고 시급하다고 판단되는 CVE의 ID 목록" if is_reasoning else "CVSS 점수, 심각도를 고려하여 관련성이 높은 CVE의 ID 목록"
+        limit_rule = "- **패키지별 대표 선정:** 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중 가장 위험한 **단 하나의 CVE만** 대표로 선정해야 합니다." if is_reasoning else ""
+
         prompt = f"""[시스템 역할]
 당신은 Red Hat Enterprise Linux(RHEL) 시스템의 보안을 책임지는 최고 수준의 사이버 보안 분석가입니다.
 
 [임무]
-아래에 제공된 CVE 목록 중에서, CVSS 점수, 심각도, 패키지 중요도('kernel', 'glibc', 'openssh' 등)를 종합적으로 고려하여, **가장 중요하고 시급하다고 판단되는 CVE의 ID 목록**을 반환하십시오.
+아래에 제공된 CVE 목록 중에서, {task_description}을 반환하십시오.
 
 [제한 조건]
-- **패키지별 대표 선정:** 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중 가장 위험한 **단 하나의 CVE만** 대표로 선정해야 합니다.
+{limit_rule}
 
 [입력 데이터: CVE 목록]
 ```json
@@ -2150,6 +2100,7 @@ class AIAnalyzer:
 ```"""
         response = self._make_request('cve/analyze', {"prompt": prompt})
         # AI 응답이 JSON 배열이 아닐 경우를 대비하여 안전하게 처리
+
         # [BUG FIX] AI가 JSON 객체(dict)로 응답하는 경우, 'raw_response'나 다른 키에서 CVE 목록을 추출하도록 수정합니다.
         if isinstance(response, list): # 가장 이상적인 경우
             return response
@@ -2167,19 +2118,18 @@ class AIAnalyzer:
         logging.warning(f"AI 예선 분석에서 유효한 CVE 목록을 추출하지 못했습니다. 응답: {str(response)[:200]}")
         return []
 
-    def _final_cve_analysis(self, cve_candidates: List[Dict], installed_package_full_names: set, metadata: Dict) -> List[Dict]:
-        """[신규] 2단계 결선 분석을 위한 프롬프트를 생성하고 AI를 호출합니다."""
-        cves_for_prompt = []
-        for cve in cve_candidates:
-            cvss_score = (cve.get('cvss3', {}) or {}).get('cvss3_base_score') or cve.get('cvss3_score') or 'N/A'
-            cves_for_prompt.append({
+    def _create_final_analysis_prompt_for_chunk(self, cve_chunk: List[Dict], installed_package_full_names: set, metadata: Dict) -> str:
+        """[신규] 최종 분석을 위한 프롬프트를 청크 단위로 생성합니다."""
+        cves_for_prompt = [
+            {
                 "cve_id": cve.get('CVE', 'N/A'),
                 "severity": cve.get('threat_severity', 'N/A'),
-                "cvss_score": cvss_score,
+                "cvss_score": (cve.get('cvss3', {}) or {}).get('cvss3_base_score') or cve.get('cvss3_score') or 'N/A',
                 "package_state": cve.get('package_state', [])
-            })
+            } for cve in cve_chunk
+        ]
 
-        prompt = f"""[시스템 역할]
+        return f"""[시스템 역할]
 당신은 Red Hat Enterprise Linux의 보안 전문가입니다. 주어진 CVE 목록과 시스템에 설치된 패키지 정보를 바탕으로, **현재 시스템에 가장 시급하게 패치가 필요한 보안 위협**을 분석하고 선정해야 합니다.
 
 [분석 가이드라인]
@@ -2198,7 +2148,7 @@ class AIAnalyzer:
 - **시스템 정보:**
   - OS Version: {metadata.get('system_info', {}).get('os_release', 'N/A')}
   - Kernel: {metadata.get('system_info', {}).get('kernel', 'N/A')}
-  - 설치된 패키지 목록 (일부): {json.dumps(list(installed_package_full_names)[:10], indent=2, ensure_ascii=False, default=str)} # noqa: E501
+  - 설치된 패키지 목록 (일부): {json.dumps(list(installed_package_full_names)[:10], indent=2, ensure_ascii=False, default=str)}
 - **분석 대상 CVE 후보 목록:**
 ```json
 {json.dumps(cves_for_prompt, indent=2, ensure_ascii=False, default=str)}
@@ -2218,6 +2168,35 @@ class AIAnalyzer:
         logging.debug(f"AI Security Analysis Response:\n{json.dumps(response, indent=2, ensure_ascii=False)}")
         advisories = response.get('security_advisories', []) or []
         return advisories
+
+    def _final_cve_analysis(self, cve_candidates: List[Dict], installed_package_full_names: set, metadata: Dict) -> List[Dict]:
+        """[신규] 4단계 최종 분석을 병렬 청크 방식으로 수행합니다."""
+        final_advisories = []
+        
+        # 1. 후보 CVE를 5개씩 묶음(chunk)으로 나눕니다.
+        CHUNK_SIZE = 5
+        cve_chunks = [cve_candidates[i:i + CHUNK_SIZE] for i in range(0, len(cve_candidates), CHUNK_SIZE)]
+
+        # 2. ThreadPoolExecutor를 사용하여 각 묶음을 병렬로 분석합니다.
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix='FinalCVE_Analyzer') as executor:
+            # 각 청크에 대한 분석 작업을 제출합니다.
+            future_to_chunk = {
+                executor.submit(self._create_final_analysis_prompt_for_chunk, chunk, installed_package_full_names, metadata): chunk
+                for chunk in cve_chunks
+            }
+
+            for i, future in enumerate(as_completed(future_to_chunk), 1):
+                chunk_cve_ids = [cve.get('CVE', 'N/A') for cve in future_to_chunk[future]]
+                logging.info(f"  - 4단계 {i}/{len(cve_chunks)}번째 묶음 분석 완료. (대상: {len(chunk_cve_ids)}개)")
+                try:
+                    # 각 청크의 분석 결과를 최종 목록에 추가합니다.
+                    chunk_advisories = future.result()
+                    if chunk_advisories:
+                        final_advisories.extend(chunk_advisories)
+                except Exception as e:
+                    logging.error(f"    -> 4단계 묶음 분석 중 오류 발생: {e}")
+
+        return final_advisories
 
 def _initialize_matplotlib_font():
     """
@@ -2336,7 +2315,9 @@ def main(args: argparse.Namespace):
         
         report_path = output_dir / f"report-{hostname}.html"
         report_path.write_text(html_content, encoding='utf-8')
-        logging.info(Color.success(f"  - 메인 HTML 보고서 저장 완료: {report_path}"))
+        # [BUG FIX] AIBox_Server.py가 성공을 감지할 수 있도록 로그 메시지에서 '메인'을 제거합니다.
+        # 서버는 'HTML 보고서 저장 완료' 문자열을 기준으로 성공 여부를 판단합니다.
+        logging.info(Color.success(f"HTML 보고서 저장 완료: {report_path}"))
         
         # [사용자 요청] 동적 그래프 팝업 HTML 파일 저장
         for key, result in generated_graphs.items():
@@ -2404,6 +2385,9 @@ if __name__ == '__main__':
     # [BUG FIX] 필수 인자인 tar_path와 server_url이 모두 제공되었는지 확인합니다.
     if not args.tar_path or not args.server_url:
         logging.error(Color.error("치명적인 오류: 스크립트 실행 시 'tar_path'와 '--server-url' 인자가 모두 필요합니다."))
+        # [BUG FIX] 서버가 실패를 감지할 수 있도록 표준 출력으로 명확한 실패 메시지를 남깁니다.
+        # 이 메시지는 AIBox_Server.py의 run_analysis_in_background 함수에서 감지됩니다.
+        print("ANALYSIS_FAILED: Missing required arguments.")
         sys.exit(1)
 
     if args.debug:
@@ -2413,4 +2397,8 @@ if __name__ == '__main__':
     # [개선] 프로그램 시작 시 Matplotlib 폰트를 한 번만 설정합니다.
     _initialize_matplotlib_font()
     
-    main(args)
+    try:
+        main(args)
+    except Exception as e:
+        logging.error(Color.error(f"분석 프로세스 중 예기치 않은 오류 발생: {e}"), exc_info=True)
+        print(f"ANALYSIS_FAILED: An unexpected error occurred during analysis: {e}")

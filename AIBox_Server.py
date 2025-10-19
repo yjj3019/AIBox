@@ -107,7 +107,7 @@ CORS(app, resources={r"/AIBox/api/*": {"origins": "*"}})
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG = {}
 PROMPTS = {}
-PROMPTS_FILE = os.path.join(SCRIPT_DIR, 'prompts.json')
+PROMPTS_FILE = os.path.join(SCRIPT_DIR, 'meta/prompts.json')
 SERVER_INSTANCE_ID = str(uuid.uuid4())
 PROMPT_SEPARATOR = "\n---USER_TEMPLATE---\n"
 PROMPT_FILE_MTIME = 0
@@ -125,61 +125,22 @@ EPSS_FOLDER = '/data/iso/AIBox/epss'
 ANALYSIS_STATUS = {}
 ANALYSIS_LOCK = Lock()
 ANALYSIS_CLEANUP_INTERVAL_SECONDS = 3600 # 1시간마다 오래된 상태 정리
- 
-# [사용자 요청] LLM 요청을 순차적으로 처리하기 위한 큐(Queue) 시스템 도입
-# 모든 LLM 요청은 이 큐에 쌓이고, 단일 워커 스레드가 순서대로 처리합니다.
-LLM_REQUEST_QUEUE = queue.Queue()
+
+# [성능 개선] LLM 요청을 병렬로 처리하기 위한 스레드 풀
 LLM_WORKER_EXECUTOR = None # 서버 시작 시 인자에 따라 초기화됩니다.
-LLM_WORKER_FUTURE = None # 워커 스레드의 Future 객체를 저장
-
-def llm_worker():
-    """[신규] LLM 요청 큐를 처리하는 워커 함수."""
-    logging.info("LLM 워커 스레드가 시작되었습니다. 요청을 기다립니다...")
-    while True:
-        try:
-            # 큐에서 작업 가져오기 (블로킹)
-            # [개선] 요청 ID와 제출 시간을 함께 받습니다.
-            request_id, submit_time, future, func, args, kwargs = LLM_REQUEST_QUEUE.get()
-            if future is None: # 종료 신호
-                logging.info("LLM 워커 스레드 종료 신호를 받았습니다.")
-                break
-
-            # [개선] 대기 시간 및 처리 시간 로깅
-            start_time = time.time()
-            wait_time = start_time - submit_time
-            logging.info(f"[{request_id}] LLM 큐에서 작업을 가져와 처리를 시작합니다. (대기 시간: {wait_time:.2f}초, 남은 작업: {LLM_REQUEST_QUEUE.qsize()})")
-            
-            # 실제 LLM 호출 함수 실행
-            result = func(*args, **kwargs)
-            
-            # 결과 설정
-            future.set_result(result)
-            
-            end_time = time.time()
-            processing_time = end_time - start_time
-            logging.info(f"[{request_id}] LLM 작업 처리를 완료하고 결과를 반환했습니다. (처리 시간: {processing_time:.2f}초)")
-
-        except Exception as e:
-            # [개선] 오류 로그에도 요청 ID를 포함합니다.
-            req_id_for_log = request_id if 'request_id' in locals() else "UNKNOWN"
-            logging.error(f"[{req_id_for_log}] LLM 워커 처리 중 오류 발생: {e}", exc_info=True)
-            if 'future' in locals() and future and not future.done():
-                future.set_exception(e)
-        finally:
-            # 작업 완료 표시
-            LLM_REQUEST_QUEUE.task_done()
 
 def submit_llm_request(func, *args, **kwargs):
-    """[신규] LLM 요청을 큐에 추가하고 결과를 기다리는 함수."""
-    # [개선] 요청 ID와 제출 시간을 생성하여 큐에 함께 전달합니다.
+    """[구조 변경] LLM 요청을 스레드 풀에 제출하고 결과를 기다리는 함수."""
     request_id = str(uuid.uuid4())[:8]
-    submit_time = time.time()
-    future = Future() # [BUG FIX] concurrent.futures.Future 객체를 직접 생성합니다.
-    LLM_REQUEST_QUEUE.put((request_id, submit_time, future, func, args, kwargs))
-    # [사용자 요청] 로그에 현재 Queue의 제한을 함께 표기합니다.
-    limit = CONFIG.get('llm_max_workers', 'N/A')
-    limit_str = 'unlimited' if limit == 0 else limit
-    logging.info(f"[{request_id}] 새로운 LLM 요청을 큐에 추가했습니다. 현재 대기열 크기: {LLM_REQUEST_QUEUE.qsize()}/{limit_str}")
+    
+    if not LLM_WORKER_EXECUTOR:
+        raise RuntimeError("LLM 워커 스레드 풀이 초기화되지 않았습니다.")
+
+    logging.info(f"[{request_id}] 새로운 LLM 요청을 스레드 풀에 제출합니다.")
+    # func에 request_id를 전달하여 로깅 추적을 용이하게 합니다.
+    future = LLM_WORKER_EXECUTOR.submit(func, *args, **kwargs, request_id=request_id)
+    
+    # future.result()는 작업이 완료될 때까지 블로킹하며 결과를 반환합니다.
     return future.result()
 
 
@@ -236,15 +197,26 @@ class LLMChunker:
 
         if isinstance(data, str):
             if self.get_token_count(data) > available_tokens:
-                logging.warning(f"데이터(문자열)가 너무 커서 분할합니다. (토큰: {self.get_token_count(data)})")
-                # 문자열을 문단 단위로 분할 (간단한 예시)
-                paragraphs = data.split('\n\n')
+                logging.warning(f"데이터(문자열)가 너무 커서 분할합니다. (토큰: {self.get_token_count(data)})") # noqa: E501
+                
+                # [BUG FIX] 매우 큰 텍스트를 효과적으로 분할하기 위해 줄 단위 분할 로직을 추가합니다.
+                # 1. 먼저 줄 단위로 분할합니다.
+                lines = data.split('\n')
+                # 2. 500줄 단위로 청크를 만듭니다.
+                LINE_CHUNK_SIZE = 500
                 current_chunk = ""
-                for p in paragraphs:
-                    if self.get_token_count(current_chunk + p) > available_tokens and current_chunk:
-                        yield current_chunk; current_chunk = ""
-                    current_chunk += p + "\n\n"
-                if current_chunk: yield current_chunk
+                for i in range(0, len(lines), LINE_CHUNK_SIZE):
+                    chunk_lines = lines[i:i + LINE_CHUNK_SIZE]
+                    chunk_text = "\n".join(chunk_lines)
+                    
+                    # [안정성 강화] 생성된 청크가 컨텍스트 창을 초과하지 않는지 다시 확인합니다.
+                    # 대부분의 경우 이 조건은 만족하지만, 한 줄이 매우 긴 예외적인 경우를 대비합니다.
+                    if self.get_token_count(current_chunk + chunk_text) > available_tokens and current_chunk:
+                        yield current_chunk
+                        current_chunk = ""
+                    current_chunk += chunk_text + "\n"
+                if current_chunk:
+                    yield current_chunk
             else:
                 yield data
         elif isinstance(data, list):
@@ -304,6 +276,7 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
         )
 
         if process.stdout:
+            analysis_failed_flag = False
             for line in iter(process.stdout.readline, ''):
                 line = line.strip()
                 if not line: continue
@@ -318,6 +291,11 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
                     elif "[STEP] GENERATING_REPORT" in line:
                         ANALYSIS_STATUS[log_key]["status"] = "generating_report"
                     
+                    # [BUG FIX] sos_analyzer.py에서 "ANALYSIS_FAILED" 문자열을 감지하면 즉시 실패 처리
+                    if line.startswith("ANALYSIS_FAILED"):
+                        analysis_failed_flag = True
+                        logging.error(f"Analysis {analysis_id} failed explicitly: {line}")
+
                     ANALYSIS_STATUS[log_key]["log"].append(line)
         
         process.wait()
@@ -327,7 +305,11 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
             # 1. 프로세스 종료 코드가 0 (성공)인지 확인합니다.
             # 2. 로그에 'HTML 보고서 저장 완료' 메시지가 있는지 확인합니다.
             # 두 조건이 모두 충족되어야 최종 성공으로 처리합니다.
-            final_log = "\n".join(ANALYSIS_STATUS[log_key].get("log", []))
+            # [BUG FIX] 로그에 포함된 ANSI 색상 코드로 인해 성공 문자열 감지에 실패하는 문제를 해결합니다.
+            # 정규식을 사용하여 색상 코드를 제거한 후, 'HTML 보고서 저장 완료' 문자열이 있는지 확인합니다.
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            final_log_raw = "\n".join(ANALYSIS_STATUS[log_key].get("log", [])) # type: ignore
+            final_log = ansi_escape.sub('', final_log_raw)
             is_success = process.returncode == 0 and "HTML 보고서 저장 완료" in final_log
 
             if is_success:
@@ -337,24 +319,24 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
                 if match:
                     report_full_path = match.group(1)
                     ANALYSIS_STATUS[log_key]["report_file"] = os.path.basename(report_full_path)
+                
+                # [BUG FIX] 성공 시에만 메타데이터를 저장하도록 로직을 이동합니다.
+                if "report_file" in ANALYSIS_STATUS[log_key]:
+                    end_time = time.time()
+                    start_time = ANALYSIS_STATUS[log_key].get("start_time", end_time)
+                    duration = end_time - start_time
+                    
+                    report_basename = os.path.splitext(ANALYSIS_STATUS[log_key]["report_file"])[0]
+                    meta_filename = f"{report_basename}.json"
+                    meta_filepath = os.path.join(app.config['OUTPUT_FOLDER'], meta_filename)
+                    
+                    meta_data = {"creation_timestamp": end_time, "duration_seconds": duration}
+                    with open(meta_filepath, 'w', encoding='utf-8') as f:
+                        json.dump(meta_data, f)
+                    logging.info(f"분석 메타데이터 저장 완료: {meta_filepath}")
             else:
+                # [BUG FIX] 분석 실패 시에만 실패 메시지를 생성하도록 로직을 이동합니다.
                 ANALYSIS_STATUS[log_key]["status"] = "failed"
-            
-            # [사용자 요청] 분석 완료 시, 생성 시간 및 소요 시간 메타데이터를 JSON 파일로 저장합니다.
-            if is_success and "report_file" in ANALYSIS_STATUS[log_key]:
-                end_time = time.time()
-                start_time = ANALYSIS_STATUS[log_key].get("start_time", end_time)
-                duration = end_time - start_time
-                
-                report_basename = os.path.splitext(ANALYSIS_STATUS[log_key]["report_file"])[0]
-                meta_filename = f"{report_basename}.json"
-                meta_filepath = os.path.join(app.config['OUTPUT_FOLDER'], meta_filename)
-                
-                meta_data = {"creation_timestamp": end_time, "duration_seconds": duration}
-                with open(meta_filepath, 'w', encoding='utf-8') as f:
-                    json.dump(meta_data, f)
-                logging.info(f"분석 메타데이터 저장 완료: {meta_filepath}")
-                # [사용자 요청] 분석 실패 시, 마지막 로그를 함께 기록하여 원인 파악을 돕습니다.
                 last_log_line = ANALYSIS_STATUS[log_key]["log"][-1] if ANALYSIS_STATUS[log_key]["log"] else "로그 없음"
                 fail_message = (
                     f"분석 실패 (종료 코드: {process.returncode}). 최종 로그: {last_log_line}"
@@ -399,13 +381,9 @@ def log_server_status():
     
     # [수정] Queue 크기와 함께 최대 워커 수를 로깅하여 제한을 함께 표시합니다.
     limit = CONFIG.get('llm_max_workers', 'N/A')
-    limit_str = 'unlimited' if limit == 0 else limit
-
-    status_log = (
-        f"[SERVER STATUS] Active Threads: {threading.active_count()}, "
-        f"Running Analyses: {running_analyses}, "
-        f"LLM Queue Size: {LLM_REQUEST_QUEUE.qsize()}/{limit_str}"
-    )
+    limit_str = 'unlimited' if limit is None else limit
+    active_workers = LLM_WORKER_EXECUTOR._work_queue.qsize() if LLM_WORKER_EXECUTOR else 0
+    status_log = f"[SERVER STATUS] Active Threads: {threading.active_count()}, Running Analyses: {running_analyses}, LLM Workers: {active_workers}/{limit_str}"
  
     # psutil이 설치된 경우에만 메모리 사용량 정보를 추가합니다.
     if IS_PSUTIL_AVAILABLE:
@@ -417,15 +395,20 @@ def log_server_status():
     logging.info(status_log)
 
 def resolve_chat_endpoint(llm_url, token):
+    """[BUG FIX] LLM 서버의 chat completion 엔드포인트를 안정적으로 확인합니다."""
     if llm_url.endswith(('/v1/chat/completions', '/api/chat')): return llm_url
     headers = {'Content-Type': 'application/json'}
     if token: headers['Authorization'] = f'Bearer {token}'
     base_url = llm_url.rstrip('/')
+    
+    # [BUG FIX] OpenAI 호환 엔드포인트(/v1/chat/completions)를 우선적으로 확인합니다.
+    # 일부 LLM 서버가 /api/tags를 지원하면서도 /api/chat이 아닌 /v1/chat/completions를 사용하는 경우가 있어,
+    # 이로 인한 404 오류를 방지하기 위해 확인 순서를 변경합니다.
     try:
         if requests.head(f"{base_url}/v1/models", headers=headers, timeout=3).status_code < 500: return f"{base_url}/v1/chat/completions"
     except requests.exceptions.RequestException: pass
     try:
-        if requests.head(f"{base_url}/api/tags", headers=headers, timeout=3).status_code < 500: return f"{base_url}/api/chat"
+        if requests.head(f"{base_url}/api/tags", headers=headers, timeout=3).status_code < 500: return f"{base_url}/api/chat" # Ollama 호환
     except requests.exceptions.RequestException: pass
     return None
 
@@ -446,60 +429,73 @@ def get_available_models(llm_url, token):
     except Exception: return []
 
 def make_request_generic(method, url, **kwargs):
-    try:
-        kwargs.setdefault('timeout', 20)
-        # [BUG FIX] 프록시 환경에서 발생할 수 있는 SSL 인증서 검증 오류를 방지하기 위해
-        # verify=False 옵션을 추가합니다. 이는 시스템이 프록시의 자체 서명 인증서를
-        # 신뢰하지 못할 때 발생합니다.
-        kwargs.setdefault('verify', False)
-        response = requests.request(method, url, **kwargs)
-        response.raise_for_status()
-        return response
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Generic request failed for {url}: {e}")
-        return None
+    """[수정] 재시도 및 성공 로그 로직이 추가된 범용 요청 함수 (v2)"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            kwargs.setdefault('timeout', 20)
+            kwargs.setdefault('verify', False)
+            response = requests.request(method, url, **kwargs)
+
+            # [사용자 요청] 재시도(attempt > 0) 후 요청이 성공했을 경우, 성공 로그를 명확히 남깁니다.
+            if attempt > 0:
+                # 4xx, 5xx 응답도 성공적인 '연결'로 간주하고 로그를 남깁니다.
+                # raise_for_status()는 이 이후에 호출됩니다.
+                logging.info(f"범용 요청 재시도 성공 (시도 {attempt + 1}/{max_retries}): {url}")
+
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"범용 요청 실패 (시도 {attempt + 1}/{max_retries}): {url}, 오류: {e}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            else:
+                logging.error(f"범용 요청이 모든 재시도({max_retries}회) 후에도 최종 실패했습니다: {url}")
+                return None
+    return None
 
 def get_cache_key(system_message, user_message):
     """요청 내용을 기반으로 고유한 캐시 키를 생성합니다."""
     return hashlib.sha256((system_message + user_message).encode('utf-8')).hexdigest()
 # [개선] diskcache 인스턴스를 전역적으로 생성합니다.
 cache = None # 전역 변수로 선언
-
+ 
 def _create_final_summary_prompt(summaries: List[str]) -> str:
-    """
-    [신규] 여러 개의 부분 요약본을 받아, 이를 종합하여 최종 분석을 요청하는 프롬프트를 생성합니다.
-    """
-    summaries_text = "\n\n".join(f"--- Chunk {i+1} Summary ---\n{summary}" for i, summary in enumerate(summaries))
-    return f"""[System Role]
-You are an expert AI tasked with synthesizing multiple partial analysis reports into a single, final, comprehensive report.
-
-[Task]
-The user has provided several summaries from different chunks of a larger dataset. Your job is to combine these summaries into one cohesive final analysis. You must return the result in the same format as the partial summaries (e.g., a single JSON object).
-
-[Partial Summaries]
-{summaries_text}
-
-[Final Analysis Request]
-Please synthesize the above summaries into a single, final JSON object. Do not add any explanatory text outside of the JSON structure.
-"""
-
+     """
+     [신규] 여러 개의 부분 요약본을 받아, 이를 종합하여 최종 분석을 요청하는 프롬프트를 생성합니다.
+     """
+     summaries_text = "\n\n".join(f"--- Chunk {i+1} Summary ---\n{summary}" for i, summary in enumerate(summaries))
+     return f"""[System Role]
+ You are an expert AI tasked with synthesizing multiple partial analysis reports into a single, final, comprehensive report.
+ 
+ [Task]
+ The user has provided several summaries from different chunks of a larger dataset. Your job is to combine these summaries into one cohesive final analysis. You must return the result in the same format as the partial summaries (e.g., a single JSON object).
+ 
+ [Partial Summaries]
+ {summaries_text}
+ 
+ [Final Analysis Request]
+ Please synthesize the above summaries into a single, final JSON object. Do not add any explanatory text outside of the JSON structure.
+ """
+ 
 def _create_chunk_summary_prompt(chunk_data: str) -> str:
-    """
-    [신규] 데이터 청크(묶음)를 요약하기 위한 프롬프트를 생성합니다.
-    """
-    return f"""[System Role]
-You are an expert AI that analyzes a piece of a larger dataset and provides a summary.
-
-[Task]
-The user has provided a chunk of data. Analyze it and return a summary of your findings. The format of your response should be a single JSON object, as the final output will be constructed from these summaries.
-
-[Data Chunk to Summarize]
-```
-{chunk_data}
-```
-"""
-
-def call_llm_blocking(system_message, user_message, max_tokens=16384):
+     """
+     [신규] 데이터 청크(묶음)를 요약하기 위한 프롬프트를 생성합니다.
+     """
+     return f"""[System Role]
+ You are an expert AI that analyzes a piece of a larger dataset and provides a summary.
+ 
+ [Task]
+ The user has provided a chunk of data. Analyze it and return a summary of your findings. The format of your response should be a single JSON object, as the final output will be constructed from these summaries.
+ 
+ [Data Chunk to Summarize]
+ ```
+ {chunk_data}
+ ```
+ """
+ 
+def call_llm_blocking(system_message, user_message, max_tokens=16384, model_override=None):
     """
     [개선] LLM을 호출하고 결과를 캐싱하는 블로킹 함수.
     동일한 요청에 대해서는 캐시된 결과를 반환하여 API 호출을 줄입니다.
@@ -509,12 +505,26 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
     cache_ttl_seconds = CONFIG.get('cache_ttl_days', 7) * 24 * 60 * 60
 
     # [신규] 프롬프트 내용에 따라 사용할 모델을 결정합니다.
-    # 'deep_dive', '종합 분석', 'Executive Summary' 등 복잡한 추론이 필요하면 reasoning_model을 사용합니다.
-    if any(keyword in user_message for keyword in ['deep_dive', '종합 분석', 'Executive Summary', 'security report']):
-        model_to_use = CONFIG.get("reasoning_model", CONFIG["model"])
+    # [BUG FIX] model_override가 있으면 모델 선택 로직을 건너뜁니다.
+    if model_override:
+        model_to_use = model_override
+        # [BUG FIX] 폴백 모델의 컨텍스트 크기를 올바르게 가져옵니다.
+        if model_to_use == CONFIG.get('fallbacks_model'):
+            context_window_kb = CONFIG.get('fallbacks_model_context', 0)
+        elif model_to_use == CONFIG.get('reasoning_model'):
+            context_window_kb = CONFIG.get('reasoning_model_context', 0)
+        else:
+            context_window_kb = CONFIG.get('fast_model_context', 0)
     else:
-        model_to_use = CONFIG.get("fast_model", CONFIG["model"])
-
+        # 'deep_dive', '종합 분석', 'Executive Summary' 등 복잡한 추론이 필요하면 reasoning_model을 사용합니다.
+        if any(keyword in user_message for keyword in ['deep_dive', '종합 분석', 'Executive Summary', 'security report']):
+            model_to_use = CONFIG.get("reasoning_model", CONFIG.get("model")) # type: ignore
+            # [사용자 요청] KB 단위로 받은 컨텍스트 크기를 토큰 단위로 변환 (1KB = 1000 토큰으로 간주)
+            context_window_kb = CONFIG.get('reasoning_model_context', 0)
+        else:
+            model_to_use = CONFIG.get("fast_model", CONFIG.get("model")) # type: ignore
+            context_window_kb = CONFIG.get('fast_model_context', 0)
+ 
     # 1. 캐시 확인
     cached_response = cache.get(cache_key)
     if cached_response is not None:
@@ -529,18 +539,56 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
     # [핵심 개선] 모든 LLM 요청을 중앙 큐에서 관리하기 위해 submit_llm_request를 사용합니다.
     # 블로킹 요청도 큐를 통해 순차적으로 처리하여 LLM 서버의 과부하를 방지하고 안정성을 높입니다.
     # submit_llm_request는 Future 객체의 결과를 기다리므로, 이 함수는 블로킹으로 동작합니다.
-    raw_response_str = submit_llm_request(_call_llm_single_blocking, system_message, user_message, model_to_use, max_tokens, cache_key)
+    # [사용자 요청] 컨텍스트 크기가 0(무제한)이 아닐 경우에만 Map-Reduce 로직을 수행합니다.
+    if context_window_kb > 0:
+        context_window_size = context_window_kb * 1000
+        chunker = LLMChunker(max_tokens=context_window_size)
+        base_prompt_tokens = chunker.get_token_count(system_message)
+        user_message_tokens = chunker.get_token_count(user_message)
+
+        # 컨텍스트 창을 초과하면 Map-Reduce를 수행합니다.
+        if base_prompt_tokens + user_message_tokens > chunker.max_tokens - 500: # 안전 마진
+            logging.info(f"요청이 컨텍스트 창({context_window_kb}k)을 초과하여 Map-Reduce 방식으로 처리합니다. (토큰: {user_message_tokens})")
+            
+            # Map 단계: 데이터를 여러 청크로 나누어 병렬로 요약
+            chunk_summaries = []
+            max_workers_val = CONFIG.get('llm_max_workers', 6)
+            with ThreadPoolExecutor(max_workers=max_workers_val if max_workers_val > 0 else None) as executor:
+                data_chunks = list(chunker.split_data(user_message, base_prompt_tokens))
+                
+                future_to_chunk = {
+                    executor.submit(
+                        _call_llm_single_blocking, 
+                        _create_chunk_summary_prompt(""), # 청크 요약용 시스템 프롬프트
+                        chunk, 
+                        model_to_use, # [BUG FIX] Map-Reduce의 각 청크 처리 시 폴백 모델을 사용하도록 model_to_use를 전달합니다.
+                        max_tokens
+                    ): i
+                    for i, chunk in enumerate(data_chunks)
+                }
+
+                for future in as_completed(future_to_chunk):
+                    try:
+                        summary = future.result()
+                        chunk_summaries.append(summary)
+                    except Exception as e:
+                        logging.error(f"Map-Reduce의 Map 단계 중 오류 발생: {e}")
+
+            # Reduce 단계: 요약본들을 모아 최종 분석 요청
+            logging.info(f"Map 단계 완료. {len(chunk_summaries)}개의 요약본으로 최종 분석을 요청합니다.")
+            final_prompt = _create_final_summary_prompt(chunk_summaries)
+            raw_response_str = submit_llm_request(_call_llm_single_blocking, final_prompt, "", model_to_use, max_tokens)
+        else: # 컨텍스트 창을 초과하지 않으면 직접 호출합니다.
+            raw_response_str = submit_llm_request(_call_llm_single_blocking, system_message, user_message, model_to_use, max_tokens)
+    else: # 컨텍스트 크기가 0(무제한)이면 직접 호출합니다.
+        logging.info("컨텍스트 크기가 무제한(0)으로 설정되어 Map-Reduce를 건너뛰고 직접 호출합니다.")
+        raw_response_str = submit_llm_request(_call_llm_single_blocking, system_message, user_message, model_to_use, max_tokens)
         
     # 3. LLM 응답 파싱 및 객체 변환
     # [BUG FIX] LLM 응답 파싱 실패 시, 클라이언트가 AttributeError를 일으키지 않도록
     #           항상 일관된 JSON 객체 형식으로 오류를 반환합니다.
     try:
-        # [BUG FIX] LLM이 생성한 JSON 문자열 내의 이스케이프되지 않은 줄 바꿈 문자를 보정합니다.
-        corrected_str = _correct_json_string(raw_response_str)
-        final_object = _parse_llm_json_response(corrected_str)
-        # [BUG FIX] 파싱은 성공했으나 결과가 문자열인 경우, 이를 JSON 객체로 감싸줍니다.
-        if isinstance(final_object, str):
-            final_object = {"analysis_report": final_object}
+        final_object = _parse_llm_json_response(raw_response_str)
     except ValueError as e:
         logging.error(f"최종 LLM 응답 파싱 실패: {e}")
         final_object = {"error": "Final LLM response parsing failed", "details": str(e), "raw_response": raw_response_str}
@@ -552,14 +600,11 @@ def call_llm_blocking(system_message, user_message, max_tokens=16384):
 
     return final_object
 
-def _call_llm_single_blocking(system_message, user_message, model_name, max_tokens=16384, cache_key=None):
+def _call_llm_single_blocking(system_message, user_message, model_name, max_tokens=16384, request_id="N/A"):
     """단일 LLM 호출을 처리하는 내부 블로킹 함수."""
     # [BUG FIX] 데드락을 유발하는 재귀적 Map-Reduce 로직을 제거합니다.
     # 이제 데이터 청킹은 전적으로 클라이언트(security.py 등)의 책임이며,
     # 서버는 주어진 요청을 그대로 처리하는 역할만 수행합니다.
-
-    # [개선] 요청별 고유 ID를 생성하여 로깅을 추적합니다.
-    request_id = str(uuid.uuid4())[:8]
 
     max_retries = 3
     last_exception = None  # [신규] 마지막으로 발생한 예외를 저장하기 위한 변수
@@ -572,13 +617,11 @@ def _call_llm_single_blocking(system_message, user_message, model_name, max_toke
             # [BUG FIX] LLM URL이 외부 주소일 경우 시스템 프록시를 사용하도록 수정합니다.
             # 로컬 주소(127.0.0.1, localhost)일 경우에만 프록시를 명시적으로 비활성화합니다.
             llm_url = CONFIG["llm_url"]
-            # [개선] requests 라이브러리가 시스템 환경 변수(http_proxy, https_proxy, no_proxy)를
-            # 자동으로 사용하도록 proxies 인자를 명시적으로 설정하지 않습니다.
-            # 이렇게 하면 다양한 네트워크 환경에 더 유연하게 대응할 수 있습니다.
-            proxies = None
+            is_local_llm = any(host in llm_url for host in ['127.0.0.1', 'localhost'])
+            proxies = {'http': None, 'https': None} if is_local_llm else None
 
             # [신규] LLM 요청 로깅
-            # [개선] 요청 ID를 포함하여 로그를 추적하기 쉽게 만듭니다.
+            # [성능 개선] 요청 ID를 포함하여 로그를 추적하기 쉽게 만듭니다.
             log_prefix = f"[{request_id}]"
             logging.info(f"{log_prefix} LLM 요청 (모델: {model_name}, 시도 {attempt + 1}/{max_retries})...")
             llm_logger.info(f"{log_prefix} --- LLM Request (Blocking, Attempt {attempt + 1}/{max_retries}) ---")
@@ -587,13 +630,21 @@ def _call_llm_single_blocking(system_message, user_message, model_name, max_toke
             
             # cache_misses.inc() # 메트릭 기능이 구현될 때까지 주석 처리
             # [제안 반영] LLM 호출 타임아웃을 600초(10분)로 늘려 긴 분석 작업(예: CVE 순위 선정)을 지원합니다.
-            response = requests.post(llm_url, headers=headers, json=payload, timeout=600, proxies=proxies)
+            response = requests.post(llm_url, headers=headers, json=payload, timeout=600, proxies=proxies, verify=False)
             logging.info(f"{log_prefix} [LLM RESP] Status Code: {response.status_code} (Attempt {attempt + 1})")
+
+            # [사용자 요청] 재시도(attempt > 0) 후 요청이 성공했을 경우, 성공 로그를 명확히 남깁니다.
+            if attempt > 0:
+                logging.info(f"{log_prefix} Successfully connected to LLM server on attempt {attempt + 1}/{max_retries}")
+
             response.raise_for_status()
             result = response.json()
             content = result.get('choices', [{}])[0].get('message', {}).get('content') or result.get('message', {}).get('content')
+            # [BUG FIX] LLM이 비어있는 content를 반환할 경우, None 대신 빈 JSON 객체를 반환하여
+            # 클라이언트에서 'NoneType' object is not iterable 오류가 발생하는 것을 방지합니다.
             if not content or not content.strip():
-                return json.dumps({"error": "LLM이 빈 응답을 반환했습니다."})
+                logging.warning(f"{log_prefix} LLM이 비어 있거나 공백만 있는 응답을 반환했습니다.")
+                return json.dumps({})
             
             # [신규] LLM 응답 로깅
             llm_logger.debug(f"{log_prefix} --- LLM Response (Blocking) ---\n{content}\n")
@@ -615,9 +666,25 @@ def _call_llm_single_blocking(system_message, user_message, model_name, max_toke
                 time.sleep(2 ** attempt) # Exponential backoff: 1, 2, 4초...
                 continue # 다음 재시도 수행
             # 재시도 대상이 아니거나 모든 재시도 실패 시, 오류 응답을 생성합니다.
-            # [개선] litellm이 반환하는 JSON 형식의 오류 메시지를 파싱하여 더 구체적인 오류를 사용자에게 전달합니다.
+            # [성능 개선] litellm이 반환하는 JSON 형식의 오류 메시지를 파싱하여 더 구체적인 오류를 사용자에게 전달합니다.
             error_message = f"LLM Server Error: {e}"
             if e.response is not None:
+                # [사용자 요청] ContextWindowExceededError 발생 시 폴백 모델로 재시도
+                fallback_model = CONFIG.get("fallbacks_model")
+                raw_response_text_for_fallback = e.response.text
+                if fallback_model and "ContextWindowExceededError" in raw_response_text_for_fallback:
+                    logging.warning(f"{log_prefix} 컨텍스트 크기 초과 오류 감지. 폴백 모델 '{fallback_model}'(으)로 재시도합니다.")
+                    llm_logger.warning(f"{log_prefix} Context window exceeded. Retrying with fallback model: {fallback_model}")
+                    
+                    # 현재 사용 중인 모델 이름을 폴백 모델로 교체하여 재귀 호출
+                    # 이렇게 하면 재시도 횟수(max_retries)를 소진하지 않고 즉시 1회 재시도합니다.
+                    # 단, 무한 재귀를 방지하기 위해 폴백 모델 자체에서 또 오류가 발생하면 재시도하지 않습니다.
+                    if model_name != fallback_model:  # 무한 재귀 방지
+                        # [BUG FIX] model_override를 전달하여 폴백 모델을 강제로 사용하도록 수정합니다.
+                        return call_llm_blocking(system_message, user_message, max_tokens, model_override=fallback_model)
+                    else:
+                        logging.error(f"{log_prefix} 폴백 모델 '{fallback_model}'도 컨텍스트 크기 초과 오류가 발생하여 분석을 중단합니다.")
+
                 raw_response_text = e.response.text
                 try:
                     error_json = e.response.json()
@@ -629,13 +696,13 @@ def _call_llm_single_blocking(system_message, user_message, model_name, max_toke
             # [BUG FIX] raw_response 필드를 제거하여 다른 오류 응답과 형식을 통일합니다.
             return json.dumps({"error": "LLM 서버에서 오류가 발생했습니다.", "details": error_message.replace("LLM Internal Error: ", "")})
         except requests.exceptions.RequestException as e:
-            # [사용자 요청] ConnectionError와 같은 네트워크 오류에 대해서도 재시도 로직을 적용합니다.
+            # [사용자 요청] ConnectionError와 같은 네트워크 오류에 대해서도 재시도 로직을 적용합니다. (HTTPError가 아닌 경우)
             last_exception = e
             logging.warning(f"{log_prefix} LLM 연결 오류 발생: {e}. {2**attempt}초 후 재시도합니다... ({attempt + 1}/{max_retries})")
             llm_logger.warning(f"{log_prefix} --- LLM Connection Error (Attempt {attempt + 1}) ---\n{e}")
             time.sleep(2 ** attempt)
             continue # 다음 재시도 수행
-        except Exception as e:
+        except Exception as e: # 그 외 예기치 않은 오류
             last_exception = e
             logging.error(f"{log_prefix} LLM 요청 처리 중 예기치 않은 오류 발생: {e}")
             llm_logger.error(f"{log_prefix} --- LLM Connection Error (Blocking) ---\n{e}\n")
@@ -673,9 +740,11 @@ def _parse_llm_json_response(llm_response_str: str):
     - 코드 블록이 없는 경우, 문자열에서 유효한 JSON 부분을 찾습니다.
     """
     try:
-        # [BUG FIX] LLM 응답이 문자열이 아닌 경우를 처리합니다.
+        # [BUG FIX] LLM 응답이 문자열이 아니거나 비어있는 경우, 'NoneType' 오류를 유발할 수 있으므로
+        # 항상 유효한 JSON 객체 형식의 오류를 반환하도록 수정합니다.
         if not isinstance(llm_response_str, str) or not llm_response_str.strip():
-            raise ValueError("LLM 응답이 비어 있거나 문자열이 아닙니다.")
+            logging.warning("LLM 응답이 비어 있거나 문자열이 아닙니다. 오류 객체를 반환합니다.")
+            return {"error": "LLM response was empty or not a string.", "raw_response": str(llm_response_str)}
 
         # [BUG FIX] LLM이 <think>...</think> 와 같은 불필요한 XML/HTML 태그를 반환하는 경우,
         # 이를 제거하여 순수한 JSON만 남깁니다.
@@ -748,20 +817,21 @@ def call_llm_stream(system_message, user_message):
     # 2. Cache Miss: 실제 LLM API 호출을 큐에 제출
     logging.info(f"[{request_id}] [CACHE MISS][STREAM] LLM 스트리밍 요청을 큐에 추가합니다. (Key: {cache_key[:10]}...)")
     
-    # [사용자 요청] 스트리밍 요청에서도 프롬프트 내용에 따라 모델을 동적으로 선택합니다.
+    # [구조 변경] 스트리밍 요청에서도 프롬프트 내용에 따라 모델을 동적으로 선택합니다.
     if any(keyword in user_message for keyword in ['deep_dive', '종합 분석', 'Executive Summary', 'security report']):
         model_to_use = CONFIG.get("reasoning_model", CONFIG["model"])
     else:
         model_to_use = CONFIG.get("fast_model", CONFIG["model"])
 
     # 스트리밍 응답을 처리하기 위한 내부 제너레이터 함수
-    def _stream_generator():
+    def _stream_worker(q: queue.Queue):
+        """[신규] 스레드 풀에서 실행될 워커. LLM 스트림 결과를 큐에 넣습니다."""
         headers = {'Content-Type': 'application/json'}
         if CONFIG.get("token"): headers['Authorization'] = f'Bearer {CONFIG["token"]}'
         messages = [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}]
         payload = {"model": model_to_use, "messages": messages, "max_tokens": 8192, "temperature": 0.2, "stream": True}
         
-        # [사용자 요청] 스트리밍 요청 로그에도 모델 이름을 포함하여 기록합니다.
+        # [구조 변경] 스트리밍 요청 로그에도 모델 이름을 포함하여 기록합니다.
         logging.info(f"[{request_id}] LLM 스트리밍 요청 (모델: {model_to_use})...")
         llm_logger.info(f"[{request_id}] [REQ][STREAM] POST {CONFIG['llm_url']} (Model: {model_to_use})")
         
@@ -770,6 +840,10 @@ def call_llm_stream(system_message, user_message):
         for attempt in range(max_retries):
             try:
                 response = requests.post(CONFIG["llm_url"], headers=headers, json=payload, timeout=(30, 600), stream=True)
+                # [사용자 요청] 재시도 후 성공 시 로그를 명확히 남깁니다.
+                if attempt > 0:
+                    logging.info(f"[{request_id}] Successfully reconnected to LLM stream on attempt {attempt + 1}/{max_retries}")
+
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if not line: continue
@@ -795,9 +869,13 @@ def call_llm_stream(system_message, user_message):
                 else:
                     logging.error(f"[LLM STREAM ERROR] {e}", exc_info=True)
                     yield f"\n\n**Error:** {e}"
-
-    # 큐를 통해 스트리밍 제너레이터 실행
-    stream_iterator = submit_llm_request(_stream_generator)
+    
+    # [구조 변경] 큐를 통하지 않고, 스레드 풀에 스트리밍 제너레이터 실행을 제출합니다.
+    # submit_llm_request는 블로킹 함수이므로 스트리밍에 직접 사용할 수 없습니다.
+    # 대신, 스레드 풀에 직접 작업을 제출하고 결과를 스트리밍합니다.
+    # 여기서는 단순화를 위해 _stream_generator를 직접 호출합니다.
+    # 실제 고부하 환경에서는 스트리밍 전용 워커풀을 고려할 수 있습니다. 
+    stream_iterator = _stream_worker(queue.Queue()) # _stream_generator() -> _stream_worker()
     
     full_response_accumulator = []
     for chunk in stream_iterator:
@@ -885,8 +963,20 @@ def run_scheduled_script(script_path):
     if not os.path.isfile(script_path):
         log.error(f"Script execution failed: File not found '{script_path}'")
         return
+
+    # [BUG FIX] 스크립트 확장자에 따라 올바른 인터프리터를 선택합니다.
+    # Python 스크립트를 bash로 실행하여 'import: command not found' 오류가 발생하는 문제를 해결합니다.
+    command = []
+    if script_path.endswith('.py'):
+        command = ['/usr/bin/python3.11', script_path]
+    elif script_path.endswith('.sh'):
+        command = ['/bin/bash', script_path]
+    else:
+        log.error(f"Unsupported script type for '{script_path}'. Only .py and .sh are supported for scheduled execution.")
+        return
+
     try:
-        process = subprocess.Popen(['/bin/bash', script_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         stdout, stderr = process.communicate()
         log.info(f"Script '{script_path}' executed (Exit Code: {process.returncode}).")
         if stdout: log.info(f"[stdout]:\n{stdout.strip()}")
@@ -1325,9 +1415,18 @@ def api_cve_analyze():
         cve_data = request.json
         # [BUG FIX] 요청 데이터가 딕셔너리 형태이고 'prompt' 키를 포함하는지 확인합니다.
         if isinstance(cve_data, dict) and "prompt" in cve_data:
-            prompt = cve_data["prompt"]
-            # [사용자 요청] 시스템 메시지를 JSON 출력으로 강제화
-            system_message = "You are an expert assistant. Follow the user's instructions precisely, including the output format."
+            # [BUG FIX] 클라이언트가 보낸 'prompt'와 'cve_data'를 올바르게 조합합니다.
+            # 'cve_data'가 누락되어 AI가 분석에 필요한 데이터를 받지 못하는 문제를 해결합니다.
+            prompt_text = cve_data["prompt"]
+            cve_details = cve_data.get("cve_data", {})
+            prompt = f"{prompt_text}\n\n[CVE Data for Analysis]\n{json.dumps(cve_details, indent=2, ensure_ascii=False)}"
+            # [사용자 요청] 클라이언트가 모델을 선택할 수 있도록 model_selector 키워드를 확인합니다.
+            if cve_data.get('model_selector') == 'deep_dive':
+                # 'deep_dive'가 포함된 프롬프트는 reasoning_model을 사용하도록 유도
+                prompt += "\n[Analysis Type] deep_dive"
+                system_message = "You are an expert assistant. Follow the user's instructions precisely, including the output format."
+            else: # fast-model 또는 기본 모델 사용
+                system_message = "You are an expert assistant. Follow the user's instructions precisely, including the output format."
         else: # 기존 security.py와의 호환성을 위한 폴백
             prompt = f"""[CVE Data]\n{json.dumps(cve_data, indent=2, ensure_ascii=False)}\n\n[Task]\nAnalyze and return JSON with keys: 'threat_tags', 'affected_components', 'concise_summary', 'selection_reason'."""
             system_message = "You are an RHEL security analyst. Return only a single, valid JSON object."
@@ -1472,6 +1571,87 @@ def api_generate_cve_report():
         logging.error(f"리포트 생성 API 처리 중 예외 발생 (CVE: {cve_id}): {e}", exc_info=True)
         return jsonify({"error": "서버 내부 오류가 발생했습니다.", "details": str(e)}), 500
 
+@app.route('/AIBox/api/llm-health', methods=['GET'])
+def api_llm_health_check():
+    """
+    [신규] AIBox 서버와 백엔드 LLM 서버 간의 통신 상태를 실시간으로 점검하는 API.
+    security.py의 --test-connection에서 호출됩니다.
+    """
+    logging.info("LLM 연결 상태 점검 요청 수신...")
+    system_message = "You are a health check assistant."
+    user_message = "Respond with 'OK' if you are operational."
+    
+    try:
+        # 가장 빠른 모델을 사용하여 테스트
+        model_to_use = CONFIG.get("fast_model", CONFIG.get("model"))
+        
+        # [BUG FIX] 서버의 LLM 요청 큐를 사용하도록 수정합니다.
+        # _call_llm_single_blocking을 직접 호출하는 대신 submit_llm_request를 사용해야 합니다.
+        raw_response_str = submit_llm_request(_call_llm_single_blocking, system_message, user_message, model_to_use)
+        
+        # [BUG FIX] LLM 응답이 순수 텍스트("OK")일 수 있으므로, json.loads()를 사용하지 않고 문자열을 직접 확인합니다.
+        # 먼저 응답이 오류를 나타내는 JSON 형식인지 확인합니다.
+        is_error = False
+        try:
+            response_obj = json.loads(raw_response_str)
+            if isinstance(response_obj, dict) and 'error' in response_obj:
+                is_error = True
+                error_details = response_obj.get('details', 'Unknown LLM error')
+        except json.JSONDecodeError:
+            # JSON 파싱 실패는 'OK'와 같은 순수 텍스트 응답이므로 오류가 아님
+            pass
+
+        if is_error:
+            logging.error(f"LLM 상태 점검 실패: {error_details}")
+            return jsonify({
+                "status": "error",
+                "message": "AIBox 서버가 LLM 백엔드와 통신하는 데 실패했습니다.",
+                "details": error_details
+            }), 502 # 502 Bad Gateway
+        
+        logging.info("LLM 연결 상태 양호.")
+        return jsonify({"status": "ok", "message": "LLM 연결이 정상입니다.", "llm_response": raw_response_str})
+
+    except Exception as e:
+        logging.error(f"LLM 상태 점검 중 예기치 않은 오류 발생: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": "서버 내부 오류 발생", "details": str(e)}), 500
+
+def test_llm_connection(config):
+    """
+    [신규] LLM 서버 연결을 테스트하는 함수.
+    --test-llm 인자와 함께 사용됩니다.
+    """
+    logging.info("--- LLM 연결 테스트 시작 ---")
+    logging.info(f"LLM URL: {config.get('llm_url')}")
+    logging.info(f"테스트 모델: {config.get('fast_model', config.get('model'))}")
+    logging.info(f"인증 토큰: {'제공됨' if config.get('token') else '제공되지 않음'}")
+    
+    system_message = "You are a helpful assistant."
+    user_message = "Hello! In one sentence, who are you?"
+    
+    logging.info("LLM에 테스트 메시지를 전송합니다...")
+    
+    try:
+        # 기존의 블로킹 호출 함수를 재사용하여 실제 운영 환경과 동일한 조건으로 테스트
+        model_to_use = config.get("fast_model", config.get("model"))
+        # [BUG FIX] 서버의 LLM 요청 큐를 사용하도록 수정합니다.
+        # _call_llm_single_blocking을 직접 호출하는 대신 submit_llm_request를 사용해야 합니다.
+        raw_response_str = submit_llm_request(_call_llm_single_blocking, system_message, user_message, model_to_use)
+        
+        # 응답이 오류 메시지인지 확인
+        response_obj = json.loads(raw_response_str)
+        if isinstance(response_obj, dict) and 'error' in response_obj:
+            logging.error("LLM 테스트 실패. 서버가 오류를 반환했습니다:")
+            logging.error(f"  오류: {response_obj.get('error')}")
+            logging.error(f"  상세: {response_obj.get('details')}")
+            sys.exit(1)
+        
+        logging.info("LLM 테스트 성공! 다음은 LLM의 응답입니다:")
+        print(f"\n---\n{raw_response_str}\n---")
+    except Exception as e:
+        logging.error(f"LLM 테스트 중 예기치 않은 오류 발생: {e}", exc_info=True)
+        sys.exit(1)
+
 @app.route('/AIBox/api/upload', methods=['POST'])
 def api_upload_and_analyze():
     if 'sosreportFile' not in request.files:
@@ -1518,6 +1698,11 @@ if __name__ == '__main__':
     # [사용자 요청] 추론 모델과 빠른 응답 모델을 별도로 지정할 수 있도록 인자 추가
     parser.add_argument('--reasoning-model', help='LLM model name for complex reasoning tasks (e.g., S-Core/Qwen3-235B-A22B)')
     parser.add_argument('--fast-model', help='LLM model name for fast, structured tasks (e.g., S-Core/Qwen3-235B-A22B-no_think)')
+    parser.add_argument('--fallbacks-model', help='LLM model to use as a fallback for context window errors (e.g., S-Core/Llama-4-Scout-17B-16E-Instruct)')
+    # [사용자 요청] 모델별 컨텍스트 크기를 KB 단위로 지정하고, 기본값을 0(무제한)으로 설정합니다.
+    parser.add_argument('--reasoning-model-context', type=int, default=0, help='Context window size for the reasoning model in KB (e.g., 128 for 128k tokens). 0 for unlimited.')
+    parser.add_argument('--fast-model-context', type=int, default=0, help='Context window size for the fast model in KB (e.g., 128 for 128k tokens). 0 for unlimited.')
+    parser.add_argument('--fallbacks-model-context', type=int, default=0, help='Context window size for the fallback model in KB (e.g., 256 for 256k tokens). 0 for unlimited.')
 
     logging.info("==========================================================")
     logging.info("            Starting AIBox Server Sequence...           ")
@@ -1527,8 +1712,8 @@ if __name__ == '__main__':
     parser.add_argument('--token', default=os.getenv('LLM_API_TOKEN'), help='API token for LLM server')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind the server to')
     parser.add_argument('--port', type=int, default=5000, help='Port to run the server on')
-    parser.add_argument('--schedule-file', default='./schedule.json', help='Path to schedule JSON file')
-    parser.add_argument('--scheduler-log-file', default='./scheduler.log', help='Path to scheduler log file')
+    parser.add_argument('--schedule-file', default='meta/schedule.json', help='Path to schedule JSON file')
+    parser.add_argument('--scheduler-log-file', default='log/scheduler.log', help='Path to scheduler log file')
     parser.add_argument('--cache-ttl-days', type=int, default=7, help='Number of days to keep LLM cache')
     parser.add_argument('--cache-size-gb', type=float, default=1.0, help='Maximum size of the cache in gigabytes')
     # [개선] 서버의 외부 접속 URL을 명시적으로 받기 위한 인자.
@@ -1536,6 +1721,7 @@ if __name__ == '__main__':
     # [사용자 요청] LLM 동시 요청 수를 설정하는 인자 추가
     parser.add_argument('--connection-limit', type=int, default=500, help='Maximum number of open connections for the server')
     parser.add_argument('--base-url', default=os.getenv('AIBOX_BASE_URL'), help='External base URL for the server (e.g., http://aibo.example.com)')
+    parser.add_argument('--test-llm', action='store_true', help='Perform a test call to the LLM server and exit.')
     args = parser.parse_args()
 
     logging.info("[1/8] Command-line arguments parsed.")
@@ -1566,6 +1752,37 @@ if __name__ == '__main__':
     logging.info(f"Reasoning Model: {CONFIG['reasoning_model']}, Fast Model: {CONFIG['fast_model']}")
 
     logging.info("[2/8] Default configuration loaded.")
+
+    # [사용자 요청] 서버 시작 시 각 모델의 연결 상태를 확인하고 로깅합니다.
+    def check_model_availability(model_name):
+        if not model_name:
+            return False, "모델 이름이 지정되지 않았습니다."
+        
+        logging.info(f"  - 모델 '{model_name}' 연결 상태 확인 중...")
+        system_message = "You are a health check assistant."
+        user_message = "Respond with 'OK' if you are operational."
+        
+        try:
+            # LLM_WORKER_EXECUTOR가 초기화되기 전이므로, _call_llm_single_blocking을 직접 호출합니다.
+            raw_response_str = _call_llm_single_blocking(system_message, user_message, model_name, max_tokens=10)
+            
+            # [BUG FIX] LLM이 'OK'라는 순수 텍스트로 응답하므로, json.loads()를 사용하면 오류가 발생합니다.
+            # 1. 먼저 응답이 오류를 나타내는 JSON 형식인지 확인합니다.
+            try:
+                response_obj = json.loads(raw_response_str)
+                if isinstance(response_obj, dict) and 'error' in response_obj:
+                    # LLM 호출 자체가 실패한 경우 (예: 모델 로드 실패)
+                    return False, response_obj.get('details', '알 수 없는 오류')
+            except (json.JSONDecodeError, TypeError):
+                # 2. JSON 파싱에 실패하면, 응답이 'OK'를 포함하는지 확인합니다.
+                if "ok" in raw_response_str.lower():
+                    return True, "연결 성공"
+            
+            # 3. 'OK'가 포함되지 않은 비정상적인 응답
+            return False, f"예상치 못한 응답 수신: {raw_response_str[:100]}"
+        except Exception as e:
+            return False, str(e)
+
     
     # [제안 반영] argparse 대신 환경 변수에서 비밀번호를 로드합니다.
     CONFIG['password'] = os.getenv('AIBOX_PASSWORD')
@@ -1576,9 +1793,20 @@ if __name__ == '__main__':
     
     logging.info("[3/8] AIBOX_PASSWORD environment variable check complete.")
 
-    # [개선] diskcache 인스턴스 초기화
-    cache_size_bytes = int(args.cache_size_gb * (1024**3))
-    cache = Cache(CACHE_FOLDER, size_limit=cache_size_bytes)
+    # [BUG FIX] diskcache 초기화 시 'no such table' 오류를 방지하기 위한 안정성 강화 로직
+    try:
+        cache_size_bytes = int(args.cache_size_gb * (1024**3))
+        cache = Cache(CACHE_FOLDER, size_limit=cache_size_bytes)
+        # 간단한 set/get 작업을 통해 캐시가 정상적으로 동작하는지 확인합니다.
+        cache.set('__init_test__', True, expire=1)
+        cache.get('__init_test__')
+        cache.delete('__init_test__')
+    except Exception as e:
+        logging.warning(f"캐시 초기화 중 오류 발생: {e}. 캐시를 삭제하고 다시 시도합니다.")
+        shutil.rmtree(CACHE_FOLDER, ignore_errors=True)
+        os.makedirs(CACHE_FOLDER, exist_ok=True)
+        cache = Cache(CACHE_FOLDER, size_limit=cache_size_bytes)
+
     logging.info(f"[4/8] DiskCache initialized. Path: {CACHE_FOLDER}, Max Size: {args.cache_size_gb} GB, TTL: {args.cache_ttl_days} days")
 
     resolved_llm_url = resolve_chat_endpoint(CONFIG['llm_url'], CONFIG.get('token'))
@@ -1596,6 +1824,26 @@ if __name__ == '__main__':
             logging.error("Could not find available models from the LLM server. The --model argument is required.")
             parser.error("--model is required as no models could be auto-detected.")
 
+    # [사용자 요청] 각 모델의 연결 상태를 확인하고 로깅합니다.
+    logging.info("[5.5/8] 각 AI 모델 연결 상태 확인 시작...")
+    models_to_check = {
+        "Reasoning Model": CONFIG.get('reasoning_model'),
+        "Fast Model": CONFIG.get('fast_model'),
+        "Fallback Model": CONFIG.get('fallbacks_model')
+    }
+    for model_type, model_name in models_to_check.items():
+        if model_name:
+            is_ok, message = check_model_availability(model_name)
+            status_log = f"  -> {model_type} ('{model_name}'): {'OK' if is_ok else 'FAIL'}"
+            logging.info(status_log)
+            if not is_ok: logging.warning(f"     - 원인: {message}")
+    
+    # [신규] --test-llm 인자가 사용된 경우, 테스트 함수를 실행하고 종료합니다.
+    if args.test_llm:
+        test_llm_connection(CONFIG)
+        logging.info("--- LLM 연결 테스트 완료 ---")
+        sys.exit(0)
+
     CONFIG["schedule_file"] = os.path.abspath(args.schedule_file)
     CONFIG["scheduler_log_file"] = os.path.abspath(args.scheduler_log_file)
 
@@ -1604,18 +1852,14 @@ if __name__ == '__main__':
     # [사용자 요청] --llm-max-workers 인자에 따라 LLM 워커 스레드 풀을 초기화합니다.
     # 0으로 설정하면 "무제한" (파이썬 기본값)으로 동작합니다.
     max_workers_for_llm = args.llm_max_workers if args.llm_max_workers > 0 else None
-    LLM_WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=max_workers_for_llm, thread_name_prefix='LLM_Worker')
+    LLM_WORKER_EXECUTOR = ThreadPoolExecutor(max_workers=max_workers_for_llm, thread_name_prefix='LLM_Worker') # type: ignore
     logging.info(f"LLM worker pool initialized with max_workers={max_workers_for_llm or 'default'}.")
 
     logging.info(f"[6/8] Prompt initialization and monitoring started. ({PROMPTS_FILE})")
     setup_scheduler()
     logging.info(f"[7/8] Scheduler setup complete. (DB: jobs.sqlite, Log: {CONFIG['scheduler_log_file']})")
 
-    # [신규] LLM 요청 처리 워커 스레드 시작
-    LLM_WORKER_FUTURE = LLM_WORKER_EXECUTOR.submit(llm_worker)
-    logging.info("[7.5/8] LLM request worker thread started.")
-
-    # [제안 반영] CORS 설정을 환경 변수에서 가져오도록 수정
+    # [성능 개선] CORS 설정을 환경 변수에서 가져오도록 수정
     cors_origins = os.getenv('CORS_ORIGINS', '*').split(',')
     CORS(app, resources={r"/AIBox/api/*": {"origins": cors_origins}})
     logging.info(f"[8/8] CORS setup complete. Allowed origins: {cors_origins}")

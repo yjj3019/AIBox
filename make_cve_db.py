@@ -4,6 +4,7 @@
 import os
 import json
 import requests
+import time
 import argparse
 from pathlib import Path
 import logging
@@ -35,24 +36,26 @@ REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}
 CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/meta/cve-check_db.json")
 
 def fetch_cve_data(cve_id):
-    """CVE ID에 대한 JSON 데이터를 로컬 서버 우선으로 가져옵니다."""
-    try:
-        # 1. 로컬 서버에서 시도
-        response = requests.get(LOCAL_CVE_URL.format(cve_id=cve_id), timeout=5)
-        response.raise_for_status()
-        # logging.info(f"'{cve_id}' 정보를 로컬 서버에서 가져왔습니다.")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        # logging.warning(f"로컬 서버에서 '{cve_id}' 정보를 가져오는 데 실패했습니다: {e}. Red Hat 사이트에서 다시 시도합니다.")
-        try:
-            # 2. Red Hat 사이트에서 시도
-            response = requests.get(REDHAT_CVE_URL.format(cve_id=cve_id), timeout=10)
-            response.raise_for_status()
-            # logging.info(f"'{cve_id}' 정보를 Red Hat 사이트에서 가져왔습니다.")
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            # logging.error(f"Red Hat 사이트에서도 '{cve_id}' 정보를 가져오는 데 실패했습니다: {e}")
-            return None
+    """[수정] 재시도 로직이 추가된 CVE 데이터 조회 함수"""
+    urls_to_try = [
+        {"url": LOCAL_CVE_URL.format(cve_id=cve_id), "source": "로컬 서버"},
+        {"url": REDHAT_CVE_URL.format(cve_id=cve_id), "source": "Red Hat API"}
+    ]
+    max_retries = 3
+
+    for source_info in urls_to_try:
+        url, source = source_info["url"], source_info["source"]
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=20)
+                if response.status_code == 200:
+                    if attempt > 0: logging.info(f" -> [{cve_id}] {source}에서 재시도 성공 (시도 {attempt + 1}).")
+                    return response.json()
+                if response.status_code == 404: break # 404는 재시도 불필요
+                response.raise_for_status()
+            except requests.RequestException as e:
+                if attempt < max_retries - 1: time.sleep(1)
+    return None
 
 def extract_cve_info(cve_data):
     """CVE JSON 데이터에서 필요한 정보를 추출합니다."""

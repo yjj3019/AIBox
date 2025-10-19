@@ -51,8 +51,7 @@ TARGET_PRODUCT_PATTERNS = [
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support Long-Life Add-On$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Update Services for SAP Solutions$"),
-    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$"),
-    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ Update Services for SAP Solutions$")
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$")
 ]
 
 # --- RPM 버전 비교를 위한 라이브러리 ---
@@ -161,7 +160,7 @@ def parse_cve_package_field(package_field: str):
 
     return package_field, "" # 모든 방법으로 분리 실패 시
 
-def summarize_vulnerability(details, statement):
+def summarize_vulnerability(details, statement, server_url=None):
     """취약점 요약 생성 (LLM 대신 규칙 기반으로 핵심 내용 요약)"""
     # [사용자 요청] AI 서버를 호출하여 한글 요약 및 번역을 수행하도록 수정합니다.
     # 1. 영문 요약본을 먼저 생성합니다.
@@ -175,10 +174,15 @@ def summarize_vulnerability(details, statement):
     if len(english_summary) > 250: # AI에 전달할 요약의 최대 길이
         english_summary = english_summary[:247] + "..."
 
+    # [BUG FIX] 서버 URL이 없으면 AI 요약을 시도하지 않고 영문 요약을 즉시 반환합니다.
+    if not server_url:
+        logging.warning(Color.warn("Warning: AI 서버 URL이 제공되지 않았습니다. 영문 요약을 사용합니다."))
+        return english_summary
+
     # 2. AIBox 서버에 번역 및 요약 요청
     try:
-        # AIBox 서버의 범용 분석 엔드포인트를 사용합니다.
-        api_url = 'http://127.0.0.1:5000/AIBox/api/cve/analyze'
+        # [BUG FIX] 하드코딩된 URL 대신, 인자로 받은 서버 URL을 사용합니다.
+        api_url = f"{server_url.rstrip('/')}/AIBox/api/cve/analyze"
         # [사용자 요청] 취약점 요약이 핵심 내용만 포함하도록 프롬프트를 수정합니다.
         prompt = f"""[SYSTEM ROLE]
 You are a cybersecurity analyst. Your task is to summarize the core threat of the following vulnerability in a single, concise Korean sentence, focusing on the impact (e.g., remote code execution, privilege escalation).
@@ -193,7 +197,7 @@ Example: {{"analysis_report": "특정 조건에서 원격 코드 실행이 가�
         # [사용자 요청] AIBox 서버가 fast-model을 사용하도록 model_selector 추가
         payload = {
             "prompt": prompt,
-            "model_selector": "fast" # 'fast' 또는 다른 키워드를 서버 로직에 맞게 추가
+            "model_selector": "fast_model" # 'fast' 또는 다른 키워드를 서버 로직에 맞게 추가
         }
         
         # 로컬 서버 통신이므로 프록시를 사용하지 않습니다.
@@ -204,16 +208,20 @@ Example: {{"analysis_report": "특정 조건에서 원격 코드 실행이 가�
             try:
                 # AIBox 서버는 JSON 형식으로 응답합니다.
                 result = response.json()
-                # [BUG FIX] AI 서버가 리스트를 반환하는 경우에 대한 처리
-                if isinstance(result, list) and result:
-                    # 리스트의 첫 번째 항목이 딕셔너리인지 확인
-                    first_item = result[0]
-                    if isinstance(first_item, dict):
-                        return first_item.get('analysis_report', str(first_item))
-                    return str(first_item) # 딕셔너리가 아니면 문자열로 변환
-                elif isinstance(result, dict):
-                    return result.get('analysis_report', str(result))
-            except json.JSONDecodeError:
+                # [BUG FIX] AI 서버가 다양한 형식으로 응답하는 경우에 대한 안정성 강화
+                if isinstance(result, dict):
+                    # 가장 이상적인 경우: {"analysis_report": "..."}
+                    summary = result.get('analysis_report')
+                    if summary and isinstance(summary, str):
+                        return summary
+                
+                # AI가 JSON 형식은 맞췄지만, 'analysis_report' 키가 없는 경우 또는 리스트를 반환한 경우
+                # 응답 전체를 문자열로 변환하여 컨텍스트를 확인하고, 숫자만 있는 경우는 제외합니다.
+                raw_response_str = str(result)
+                if not re.fullmatch(r'\[\s*\d+\s*\]', raw_response_str): # 숫자만 있는 리스트 형식은 아닌지 확인
+                    return raw_response_str
+
+            except (json.JSONDecodeError, AttributeError):
                 # JSON 파싱 실패 시, 순수 텍스트로 처리합니다.
                 return response.text.strip().strip('"')
     except requests.RequestException as e:
@@ -535,7 +543,7 @@ def generate_index_html(report_list, total_input_files):
     report_rows = ""
     # [사용자 요청] 개별 삭제 버튼을 위해 report_filename과 hostname을 deleteReport 함수에 전달합니다.
     for i, report in enumerate(sorted(report_list, key=lambda x: x['creation_time'], reverse=True), 1):
-        report_rows += f""" # noqa: E501
+        report_rows += f"""
         <tr id="report-row-{html.escape(report['hostname'])}">
             <td>{i}</td>  <!-- No. 열 추가 -->
             <td>{html.escape(report['hostname'])}</td> 
@@ -710,7 +718,12 @@ def generate_index_html(report_list, total_input_files):
 
 # --- 메인 로직 ---
 
-def main():
+def main(args):
+    # [BUG FIX] 명령줄 인자를 main 함수로 전달받도록 수정
+    server_url = args.server_url
+    if args.no_ai_summary:
+        server_url = None # AI 요약 비활성화
+
     # 디렉토리 준비
     # [사용자 요청] 스크립트 실행 시 output 디렉토리 초기화
     if REPORT_OUTPUT_DIR.exists():
@@ -848,7 +861,7 @@ def main():
                         "public_date": cve_data.get("public_date", "N/A").split('T')[0],
                         "severity": cve_data.get("threat_severity", "N/A"),
                         "score": cve_data.get("cvss3", {}).get("cvss3_base_score", "N/A"),
-                        "summary": summarize_vulnerability(cve_data.get("details"), cve_data.get("statement")),
+                        "summary": summarize_vulnerability(cve_data.get("details"), cve_data.get("statement"), server_url),
                         "findings": []
                     }
                 found_vulnerabilities_map[cve_id]['findings'].extend(cve_findings)
@@ -923,4 +936,10 @@ def main():
     logging.info(Color.header("\n모든 작업이 완료되었습니다."))
 
 if __name__ == "__main__":
-    main()
+    # [BUG FIX] argparse를 추가하여 --server-url 인자를 받도록 합니다.
+    parser = argparse.ArgumentParser(description="CVE 취약점 분석 리포트 생성기")
+    parser.add_argument("--server-url", help="AI 요약 기능을 위한 AIBox 서버 URL (예: http://127.0.0.1:5000)")
+    parser.add_argument("--no-ai-summary", action="store_true", help="AI 요약 기능 없이 영문 요약으로 리포트를 생성합니다.")
+    args = parser.parse_args()
+
+    main(args)

@@ -23,7 +23,7 @@ except ImportError:
 
 # --- 기본 설정 ---
 ANALYSIS_PERIOD_DAYS = 180
-CVE_DATA_FILE = '/data/iso/AIBox/cve_data.json'
+CVE_DATA_FILE = '/data/iso/AIBox/meta/cve_data.json'
 OUTPUT_DIR = '/data/iso/AIBox/output'
 REPORT_FILE_PATH = os.path.join(OUTPUT_DIR, 'rhel_vulnerability_report.html')
 MAX_WORKERS = 10
@@ -50,7 +50,8 @@ TARGET_PRODUCT_PATTERNS = [
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support Long-Life Add-On$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Update Services for SAP Solutions$"),
-    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$")
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ Update Services for SAP Solutions$")
 ]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
@@ -101,23 +102,31 @@ def collect_cve_ids_from_file():
     return sorted(list(cve_ids), reverse=True)
 
 def fetch_cve_details(cve_id):
-    try:
-        response = requests.get(LOCAL_CVE_URL.format(cve_id=cve_id), timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if 'name' not in data: data['name'] = cve_id
-            return data, cve_id
-    except requests.RequestException:
-        pass # Red Hat 서버에서 재시도
-    
-    try:
-        response = requests.get(REDHAT_CVE_URL.format(cve_id=cve_id), timeout=20)
-        if response.status_code == 200:
-            data = response.json()
-            if 'name' not in data: data['name'] = cve_id # type: ignore
-            return data, cve_id
-    except requests.RequestException as e:
-        logging.error(f"[{cve_id}] 모든 소스에서 정보 조회 실패: {e}")
+    """[수정] 재시도 로직이 추가된 CVE 상세 정보 조회 함수"""
+    urls_to_try = [
+        {"url": LOCAL_CVE_URL.format(cve_id=cve_id), "source": "로컬 서버"},
+        {"url": REDHAT_CVE_URL.format(cve_id=cve_id), "source": "Red Hat API"}
+    ]
+    max_retries = 3
+
+    for source_info in urls_to_try:
+        url, source = source_info["url"], source_info["source"]
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=30)
+                if response.status_code == 200:
+                    # [사용자 요청] 재시도 후 성공 시 로그를 명확히 남깁니다.
+                    if attempt > 0: logging.info(f" -> [{cve_id}] Successfully connected to {source} on attempt {attempt + 1}/{max_retries}.")
+                    data = response.json()
+                    if 'name' not in data: data['name'] = cve_id
+                    return data, cve_id
+                if response.status_code == 404: break # 404는 재시도 불필요
+                response.raise_for_status()
+            except requests.RequestException as e:
+                logging.warning(f" -> [{cve_id}] {source} 연결 오류 (시도 {attempt + 1}): {e}")
+                if attempt < max_retries - 1: time.sleep(1)
+
+    logging.error(f"[{cve_id}] 모든 소스에서 정보 조회 실패.")
     return None, cve_id
 
 def process_cve_data(cve_data, skip_filtering=False):
@@ -237,22 +246,28 @@ def get_korean_summaries_with_llm(cve_list):
                 "\n\n[Output Format]"
                 "\nReturn ONLY a single, valid JSON object with keys: 'threat_tags', 'concise_summary'."
             ),
-            "cve_data": cve_for_prompt,
-            "model_selector": "deep_dive" # [수정] 서버가 reasoning_model을 선택하도록 키워드 추가
+            "cve_data": cve_for_prompt, # type: ignore
+            "model_selector": "deep_dive" # [수정] 서버가 reasoning_model을 선택하도록 키워드 추가 # type: ignore
         }
-        try:
-            response = requests.post(LLM_ANALYZE_URL, json=prompt, timeout=180, headers={'Content-Type': 'application/json'}) # type: ignore
-            if response.status_code == 200:
-                try:
-                    result = response.json()
-                    # [수정] 'selection_reason'을 제외한 구조화된 분석 결과를 반환
-                    if all(k in result for k in ['threat_tags', 'concise_summary']): # type: ignore
-                        return cve_id, result
-                except json.JSONDecodeError:
-                    logging.warning(f"[{cve_id}] LLM 응답이 JSON이 아님: {response.text[:100]}")
-            logging.error(f"[{cve_id}] LLM 분석 실패 (상태 코드: {response.status_code})")
-        except requests.RequestException as e:
-            logging.error(f"[{cve_id}] LLM API 요청 오류: {e}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(LLM_ANALYZE_URL, json=prompt, timeout=180, headers={'Content-Type': 'application/json'}) # type: ignore
+                response.raise_for_status()
+                result = response.json()
+                if all(k in result for k in ['threat_tags', 'concise_summary']):
+                    return cve_id, result
+                else:
+                    logging.warning(f"[{cve_id}] LLM이 예상치 못한 형식의 JSON을 반환했습니다: {result}")
+                    return cve_id, None # 형식 오류도 실패로 간주
+            except requests.RequestException as e:
+                logging.warning(f"[{cve_id}] LLM API 요청 오류 (시도 {attempt + 1}): {e}")
+                if attempt < max_retries - 1: time.sleep(1)
+            except json.JSONDecodeError:
+                logging.warning(f"[{cve_id}] LLM 응답이 JSON이 아님: {response.text[:100]}")
+                break # JSON 형식이 아니면 재시도 의미 없음
+
+        logging.error(f"[{cve_id}] LLM 분석 최종 실패.")
         return cve_id, None
 
     # ThreadPoolExecutor를 사용하여 병렬로 각 CVE 분석 요청
@@ -286,6 +301,29 @@ def get_korean_summaries_with_llm(cve_list):
     
     logging.info("LLM 국문 요약 생성 완료.")
     return cve_list
+
+def make_request_with_retry(method, url, max_retries=3, **kwargs):
+    """[신규] 재시도 로직이 포함된 범용 요청 함수"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.request(method, url, **kwargs)
+            response.raise_for_status()
+            # [사용자 요청] 재시도 후 성공 시 로그를 명확히 남깁니다.
+            if attempt > 0:
+                logging.info(f"Successfully connected on attempt {attempt + 1}/{max_retries} for request to {url}")
+            return response
+        except requests.RequestException as e:
+            logging.warning(f"Request failed (Attempt {attempt + 1}/{max_retries}): {url}, Error: {e}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            else:
+                logging.error(f"Request failed after {max_retries} retries: {url}")
+                return None
+    return None
+
+
+
 
 
 def generate_interactive_html_report(cve_list, custom_report_path=None):

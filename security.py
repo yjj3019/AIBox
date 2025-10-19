@@ -33,20 +33,20 @@ except ImportError:
         # 파이썬의 실행 파일(sys.executable)을 사용하여 정확한 pip를 호출합니다.
         # 이렇게 하면 가상 환경 등에서도 올바르게 라이브러리를 설치할 수 있습니다.
         # [BUG FIX] PermissionError: [Errno 13]를 방지하기 위해 --user 플래그를 추가하여
-        # 시스템 디렉토리가 아닌 사용자 디렉토리에 라이브러리를 설치하도록 합니다.
+        # 시스템 디렉토리가 아닌 사용자 디렉토리에 라이브러리를 설치하도록 합니다. (v2)
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "markdown"])
-        from markdown import markdown
 
         # [BUG FIX] 'No module named markdown' 오류 해결
         # pip install --user로 설치한 후, 현재 실행 중인 프로세스가 새 라이브-러리를 즉시 찾지 못하는 문제를 해결합니다.
         # 1. 사용자 site-packages 경로를 sys.path에 추가합니다.
         # 2. importlib를 사용하여 import 캐시를 무효화합니다.
         import site
-        import importlib
         # site.USER_SITE는 --user로 설치된 패키지의 경로입니다.
         if site.USER_SITE not in sys.path:
             sys.path.append(site.USER_SITE)
+        import importlib
         importlib.invalidate_caches()
+        from markdown import markdown
         logging.info("Successfully installed and imported the 'markdown' library.")
     except Exception as e:
         logging.error(f"Failed to auto-install 'markdown' library: {e}")
@@ -83,14 +83,15 @@ TARGET_PRODUCT_PATTERNS = [
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Extended Update Support Long-Life Add-On$"),
     re.compile(r"^Red Hat Enterprise Linux 10\.\d+ Update Services for SAP Solutions$"),
-    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$")
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ for SAP Solutions$"),
+    re.compile(r"^Red Hat Enterprise Linux \d+\.\d+ Update Services for SAP Solutions$")
 ]
 
 # --- Global Configuration ---
 CONFIG = {
     'AIBOX_SERVER_URL': "",
     'PROXIES': None,
-    'HISTORY_FILE': '/data/iso/AIBox/ranking_history.json',
+    'HISTORY_FILE': '/data/iso/AIBox/meta/ranking_history.json',
     'MAX_WORKERS': min(20, (os.cpu_count() or 1) * 2)
 }
 
@@ -122,6 +123,13 @@ def dumps_json(data, indent=False, ensure_ascii=False):
         # 표준 json 라이브러리는 ensure_ascii를 지원합니다.
         return _json_lib_std.dumps(data, indent=2 if indent else None, ensure_ascii=ensure_ascii)
 
+def loads(data):
+    """orjson과 표준 json 라이브러리를 모두 지원하는 JSON 역직렬화 함수."""
+    if _JSON_LIB == "orjson":
+        return orjson.loads(data)
+    else:
+        return _json_lib_std.loads(data)
+
 def make_request(method, url, use_proxy=True, max_retries=3, **kwargs):
     """
     requests 라이브러리를 위한 중앙 집중식 래퍼 함수.
@@ -129,29 +137,36 @@ def make_request(method, url, use_proxy=True, max_retries=3, **kwargs):
     [개선] 제안에 따라 재시도 및 지수 백오프 로직을 추가합니다.
     """
     for attempt in range(max_retries):
+        proxies = None
         try:
             # [개선] use_proxy=False일 때, requests 호출 시 프록시를 명시적으로 비활성화합니다.
             if use_proxy and CONFIG.get('PROXIES'):
-                kwargs['proxies'] = CONFIG['PROXIES']
+                proxies = CONFIG['PROXIES']
             elif not use_proxy:
-                kwargs['proxies'] = {'http': None, 'https': None}
+                proxies = {'http': None, 'https': None}
 
             # [BUG FIX] 프록시 환경에서 발생할 수 있는 SSL 인증서 검증 오류를 방지하기 위해
             # verify=False 옵션을 추가합니다. 이는 시스템이 프록시의 자체 서명 인증서를
             # 신뢰하지 못할 때 발생합니다.
             kwargs.setdefault('verify', False)
 
-            # 기본 타임아웃을 30초로 설정합니다.
-            kwargs.setdefault('timeout', 30)
+            # [BUG FIX] 스트리밍 요청과 일반 요청의 타임아웃을 분리하여 설정합니다.
+            # 스트리밍은 연결(connect)은 빠르게, 읽기(read)는 길게 대기해야 합니다.
+            if kwargs.get('stream'):
+                kwargs.setdefault('timeout', (15, 600)) # connect 15s, read 600s
+            else:
+                kwargs.setdefault('timeout', 30) # 일반 요청 30s
 
-            response = requests.request(method, url, **kwargs)
+            response = requests.request(method, url, proxies=proxies, **kwargs)
             response.raise_for_status()
+            # [사용자 요청] 재시도(attempt > 0) 후 요청이 성공했을 경우, 성공 로그를 명확히 남깁니다.
+            if attempt > 0:
+                logging.info(f"Successfully connected on attempt {attempt + 1}/{max_retries} for request to {url}")
+
             return response # 성공 시 즉시 반환
 
-        except requests.exceptions.ProxyError as e:
-            logging.warning(f"Proxy Error during {method.upper()} request to {url}: {e}")
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Network Error during {method.upper()} request to {url}: {e}")
+        except requests.exceptions.RequestException as e: # 모든 requests 관련 예외를 한 번에 처리
+            logging.warning(f"Network Error during {method.upper()} request to {url} (Attempt {attempt + 1}/{max_retries}): {e}")
 
         # 재시도 전 대기 (지수 백오프)
         if attempt < max_retries - 1:
@@ -167,33 +182,36 @@ def make_request(method, url, use_proxy=True, max_retries=3, **kwargs):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def fetch_external_threat_intel(cve_id: str) -> dict:
-    """[신규] CISA KEV 및 EPSS와 같은 외부 위협 인텔리전스 정보를 수집합니다."""
+    """[사용자 요청 반영] 로컬 cisa_kev.json 파일에서 외부 위협 인텔리전스 정보를 수집합니다."""
+    logging.info(f"'{cve_id}'에 대한 외부 위협 인텔리전스(CISA KEV, EPSS) 조회를 시작합니다...")
     intel = {
         "cisa_kev": {"in_kev": False, "date_added": None},
-        "epss": {"score": None, "percentile": None},
-        "has_poc": False # PoC 정보는 다른 소스에서 가져와야 할 수 있음
+        "epss": {"score": None, "percentile": None}
     }
 
+    # orjson 사용 여부에 따라 처리할 JSON 디코딩 예외를 동적으로 설정
+    json_decode_errors = (_json_lib_std.JSONDecodeError,)
+    if _JSON_LIB == "orjson":
+        json_decode_errors += (orjson.JSONDecodeError,)
+
     # 1. CISA KEV 정보 조회 (로컬 파일)
-    # [사용자 요청] cisa_kev.json 파일에서 CVE ID 등재 여부 확인
-    kev_file_path = "/data/iso/AIBox/data/cisa_kev.json" # AIBox_Server.py와 경로 통일
+    kev_file_path = "/data/iso/AIBox/meta/cisa_kev.json"
     try:
         with open(kev_file_path, 'rb') as f:
-            kev_data = orjson.loads(f.read()) if _JSON_LIB == "orjson" else _json_lib_std.load(f)
+            kev_data = loads(f.read())
         for vuln in kev_data.get("vulnerabilities", []):
             if vuln.get("cveID") == cve_id:
                 intel["cisa_kev"]["in_kev"] = True
                 intel["cisa_kev"]["date_added"] = vuln.get("dateAdded")
-                logging.info(f"-> 로컬 KEV 파일에서 '{cve_id}'를 찾았습니다.")
+                logging.info(f"-> 로컬 KEV 파일에서 '{cve_id}'를 찾았습니다 (추가된 날짜: {vuln.get('dateAdded')}).") # noqa: E501
                 break
-    except (FileNotFoundError, _json_lib_std.JSONDecodeError, IOError) as e:
+    except (FileNotFoundError, *json_decode_errors) as e:
         logging.warning(f"로컬 CISA KEV 데이터({kev_file_path}) 조회 중 오류 발생: {e}")
 
-    # 2. EPSS 점수 조회 (외부 API)
-    # [사용자 요청] EPSS 점수 조회 시 로컬 캐시 우선 확인
-    local_epss_url = f"http://127.0.0.1:5000/AIBox/epss/{cve_id}"
-    logging.info(f"로컬 서버에서 '{cve_id}' EPSS 데이터 조회를 시도합니다...")
     try:
+        # 2. EPSS 점수 조회 (로컬 캐시 우선)
+        local_epss_url = f"http://127.0.0.1/AIBox/epss/{cve_id}"
+        logging.info(f"로컬 서버에서 '{cve_id}' EPSS 데이터 조회를 시도합니다...")
         # 로컬 통신이므로 프록시 비활성화
         response = make_request('get', local_epss_url, use_proxy=False, timeout=10)
         if response and response.status_code == 200:
@@ -209,38 +227,41 @@ def fetch_external_threat_intel(cve_id: str) -> dict:
     # 로컬 조회 실패 시 외부 EPSS API에서 조회
     external_epss_url = f"https://api.first.org/data/v1/epss?cve={cve_id}"
     logging.info(f"EPSS API에서 '{cve_id}' 데이터 조회를 시도합니다...")
-    response = make_request('get', external_epss_url, use_proxy=True, timeout=20)
-    if response and response.status_code == 200:
-        epss_response_data = response.json()
-        if epss_response_data.get("status") == "OK" and epss_response_data.get("data"):
-            epss_item = next((item for item in epss_response_data["data"] if item.get("cve") == cve_id), None)
-            if epss_item:
-                intel["epss"]["score"] = epss_item.get("epss")
-                intel["epss"]["percentile"] = epss_item.get("percentile")
-                logging.info(f"-> EPSS API에서 '{cve_id}' 점수를 찾았습니다 (EPSS: {epss_item.get('epss')}).")
+    try:
+        response = make_request('get', external_epss_url, use_proxy=True, timeout=20)
+        if response and response.status_code == 200:
+            epss_response_data = response.json()
+            if epss_response_data.get("status") == "OK" and epss_response_data.get("data"):
+                epss_item = next((item for item in epss_response_data["data"] if item.get("cve") == cve_id), None)
+                if epss_item:
+                    intel["epss"]["score"] = epss_item.get("epss")
+                    intel["epss"]["percentile"] = epss_item.get("percentile")
+                    logging.info(f"-> EPSS API에서 '{cve_id}' 점수를 찾았습니다 (EPSS: {epss_item.get('epss')}, Percentile: {epss_item.get('percentile')}).") # noqa: E501
 
-                # 서버에 파일 저장을 요청하는 API 호출
-                save_epss_url = f"http://127.0.0.1:5000/AIBox/api/cache/epss"
-                save_payload = {
-                    "cve_id": cve_id,
-                    "data": {"epss": intel["epss"]["score"], "percentile": intel["epss"]["percentile"]}
-                }
-                try:
-                    # 서버에 저장을 요청하고 응답을 기다리지 않음 (fire and forget)
-                    make_request('post', save_epss_url, use_proxy=False, json=save_payload, timeout=5)
-                    logging.info(f"-> '{cve_id}' EPSS 데이터를 로컬 서버에 저장하도록 요청했습니다.")
-                except Exception as save_e:
-                    logging.warning(f"-> 로컬 서버에 EPSS 데이터 저장 요청 실패: {save_e}")
-            else:
-                logging.info(f"-> EPSS API에서 '{cve_id}' 정보를 찾을 수 없습니다.")
-    elif response:
-        logging.warning(f"EPSS API 조회 실패 (HTTP {response.status_code}).")
+                    # 서버에 파일 저장을 요청하는 API 호출
+                    save_epss_url = f"http://127.0.0.1:5000/AIBox/api/cache/epss"
+                    save_payload = {
+                        "cve_id": cve_id,
+                        "data": {"epss": intel["epss"]["score"], "percentile": intel["epss"]["percentile"]}
+                    }
+                    try:
+                        # 서버에 저장을 요청하고 응답을 기다리지 않음 (fire and forget)
+                        make_request('post', save_epss_url, use_proxy=False, json=save_payload, timeout=5) # noqa: E501
+                        logging.info(f"-> '{cve_id}' EPSS 데이터를 로컬 서버에 저장하도록 요청했습니다.")
+                    except requests.RequestException as save_e:
+                        logging.warning(f"-> 로컬 서버에 EPSS 데이터 저장 요청 실패: {save_e}")
+                else:
+                    logging.info(f"-> EPSS API에서 '{cve_id}' 정보를 찾을 수 없습니다.")
+        else:
+            logging.warning(f"EPSS API 조회 실패.")
+    except requests.RequestException as e:
+        logging.warning(f"EPSS API 네트워크 오류: {e}")
 
     return intel
 
 def fetch_redhat_cves(start_date):
     """Step 1: 로컬 파일에서 모든 CVE 목록을 가져옵니다. (JSON 파싱 강화)"""
-    cve_file_path = '/data/iso/AIBox/cve_data.json'
+    cve_file_path = '/data/iso/AIBox/meta/cve_data.json'
     logging.info(f"\n{Color.header('Step 1: 로컬 파일에서 모든 CVE 목록 가져오기')}...\n")
 
     if not os.path.exists(cve_file_path):
@@ -482,7 +503,7 @@ def _create_preliminary_analysis_prompt(cves_chunk: list) -> str:
 당신은 주어진 지침을 정확히 따르는, 출력을 제어하는 AI 어시스턴트입니다.
 
 [임무]
-아래에 제공된 CVE 목록 중에서, 가장 중요하고 시급하다고 판단되는 CVE의 ID 목록을 **JSON 배열 형식으로만 반환**하십시오.
+아래에 제공된 CVE 목록 중에서, 가장 중요하고 시급하다고 판단되는 **최대 30개의 CVE ID 목록**을 **JSON 배열 형식으로만 반환**하십시오.
 
 [평가 기준]
 **CISA KEV 등재 여부**와 **EPSS 점수**를 최우선으로 고려하고, 그 다음으로 CVSS 점수, 심각도, 패키지 중요도('kernel', 'glibc', 'openssh' 등)를 종합적으로 고려하여 실제 위협이 되는 CVE를 선정해야 합니다.
@@ -509,14 +530,14 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
     for cve in cves_chunk:
         threat_intel = cve.get('threat_intel', {})
         cvss3_score = cve.get('cvss3', {}).get('cvss3_base_score', 'N/A') if isinstance(cve.get('cvss3'), dict) else 'N/A'
-        summary = extract_summary_from_cve(cve)
+        summary = extract_summary_from_cve(cve) # noqa: E501
         cves_for_prompt.append({
             "cve_id": cve.get('CVE'),
             "severity": cve.get('severity', 'N/A'),
             "cvss_score": cvss3_score,
             "summary": summary,
             "affected_packages": cve.get('affected_package_names', []),
-            # [사용자 요청] 최종 분석 프롬프트에도 KEV 및 EPSS 정보를 포함하여 AI가 활용하도록 합니다.
+            # [사용자 요청] 최종 분석 프롬프트에도 KEV 및 EPSS 정보를 포함하여 AI가 활용하도록 합니다. (v2)
             "is_in_kev": threat_intel.get('cisa_kev', {}).get('in_kev', False),
             "epss_score": threat_intel.get('epss', {}).get('score')
         })
@@ -551,8 +572,8 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
     {{ "cve_id": "<가장 중요한 CVE ID>", "threat_tags": [], "affected_components": [], "concise_summary": "", "selection_reason": "" }},
     {{ "cve_id": "<두 번째로 중요한 CVE ID>", "threat_tags": [], "affected_components": [], "concise_summary": "", "selection_reason": "" }}
   ]
-}}
-```"""
+}}```
+"""
 
 def _create_batch_translation_prompt(cves_to_translate: list) -> str:
     """[신규] 여러 CVE 요약을 한번에 번역하기 위한 프롬프트를 생성합니다."""
@@ -703,7 +724,10 @@ def _create_batch_cve_analysis_prompt(cves_chunk: list) -> str:
 def _call_llm_for_batch_analysis(prompt: str) -> dict:
     """[신규] 배치 분석 프롬프트를 AIBox 서버로 보내고 결과를 받습니다."""
     api_url = f'{CONFIG["AIBOX_SERVER_URL"].rstrip("/")}/AIBox/api/cve/analyze'
-    payload = {"prompt": prompt}
+    payload = {
+        "prompt": prompt,
+        "model_selector": "deep_dive" if "deep_dive" in prompt else "fast_model"
+    }
     
     # [핵심 개선] 서버가 스트리밍으로 응답하므로, stream=True로 요청하고 응답을 조립합니다.
     # 타임아웃을 600초(10분)로 늘려 대규모 분석을 지원합니다.
@@ -751,9 +775,9 @@ def _call_llm_for_batch_analysis(prompt: str) -> dict:
 def analyze_and_prioritize_with_llm(cves: list) -> list:
     """[프로세스 통합] Step 4: 최종 후보 CVE를 LLM을 통해 분석하고 우선순위를 선정합니다."""
     # [핵심 수정] 분할 정복(Divide and Conquer) 방식의 AI 분석 로직
-    finalists = []
-    # 1. 후보 CVE가 20개를 초과하면, 예선 분석을 통해 후보군을 줄입니다. (청크 크기: 20)
-    if len(cves) > 20:
+    finalists = [] # noqa: E501
+    # 1. 후보 CVE가 30개를 초과하면, 예선 분석을 통해 후보군을 줄입니다.
+    if len(cves) > 30:
         logging.info(f"\n{Color.header(f'Step 4.1: 예선 분석 (후보 {len(cves)}개 > 최종 후보 선정)')}...")
         preliminary_finalists_ids = set()
         
@@ -801,16 +825,19 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
                 except Exception as e:
                     logging.error(f"CVE 예선 분석 묶음 처리 중 오류 발생: {e}")
 
+        # [사용자 요청] AI가 30개를 초과하여 선정할 경우를 대비하여, 최종 후보를 30개로 제한합니다.
+        preliminary_finalists_ids = sorted(list(preliminary_finalists_ids))[:30]
+
         finalists = [cve for cve in cves if cve.get('CVE') in preliminary_finalists_ids]
         # [사용자 요청] 예선 통과 CVE 목록을 최종적으로 한 번만 출력합니다.
         logging.info(f"-> 예선 분석 완료. 최종 선정된 예선 통과 CVE: {len(finalists)}개 - {', '.join(sorted(list(preliminary_finalists_ids)))}")
 
     # 2. 최종 후보군에 대해 결선 분석을 수행합니다.
-    else: # CVE가 20개 이하이면 예선 없이 바로 결선으로 진행
+    else: # CVE가 30개 이하이면 예선 없이 바로 결선으로 진행
         finalists = cves
 
     # 2. 최종 후보군에 대해 결선 분석을 수행합니다.
-    logging.info(f"\n{Color.header(f'Step 4.2: 결선 분석 ({len(finalists)}개 CVE 최종 순위 및 상세 분석)')}...")
+    logging.info(f"\n{Color.header(f'Step 4.2: 결선 분석 ({len(finalists)}개 CVE 최종 순위 및 상세 분석)')}...") # noqa: E501
 
     analyzed_cves = []
     cve_map = {cve.get('CVE'): cve for cve in finalists if cve.get('CVE')}
@@ -1099,7 +1126,10 @@ def generate_executive_summary(top_cves):
 Executive Summary 텍스트를 여기에 작성하십시오. (HTML 태그 없이 순수 텍스트로)
 """
 
-    payload = {"prompt": summary_prompt}
+    payload = {
+        "prompt": summary_prompt,
+        "model_selector": "deep_dive" # Executive Summary는 reasoning_model 사용
+    }
     api_url = f'{CONFIG["AIBOX_SERVER_URL"].rstrip("/")}/AIBox/api/cve/analyze' # 범용 분석 엔드포인트 사용
     
     # 내부 통신이므로 프록시 비활성화
@@ -1201,9 +1231,9 @@ def generate_report(processed_cves, executive_summary):
                 product_name = release.get('product_name', '')
                 # [핵심 수정] TARGET_PRODUCT_PATTERNS에 해당하는 제품의 RHSA만 추가합니다.
                 if advisory and advisory.startswith("RHSA") and any(pattern.match(product_name) for pattern in TARGET_PRODUCT_PATTERNS):
-                    # [BUG FIX] re.sub에서 백레퍼런스를 사용하려면 백슬래시를 이스케이프해야 합니다.
-                    # r'RHEL \1' -> r'RHEL \\1'로 수정하여 'RHEL 9'와 같이 올바르게 출력되도록 합니다.
-                    short_product_name = re.sub(r'Red Hat Enterprise Linux (\d+).*', r'RHEL \\1', product_name)
+                    # [BUG FIX] 정규식 치환에서 백레퍼런스(\1)가 올바르게 동작하도록 수정합니다.
+                    # r'RHEL \\1'은 'RHEL \1'이라는 문자열을 생성하므로, r'RHEL \1'로 변경해야 합니다.
+                    short_product_name = re.sub(r'Red Hat Enterprise Linux (\d+).*', r'RHEL \1', product_name)
                     rhsa_product_map.setdefault(advisory, set()).add(short_product_name)
 
         remediation_html = ""
@@ -1275,39 +1305,36 @@ def generate_report(processed_cves, executive_summary):
         rank_change_class = f"rank-{cve.get('rank_change', 'same')}"
         days_in_rank = cve.get('days_in_rank', 1)
         
-        cvss3_score = 0.0
+        # CVSS 점수 추출
+        cvss3_score_str = 'N/A'
         cvss3_data = cve.get('cvss3', {})
         if isinstance(cvss3_data, dict):
              try:
                 score_str = cvss3_data.get('cvss3_base_score') or cve.get('cvss3_score')
-                if score_str: cvss3_score = float(score_str)
+                if score_str: cvss3_score_str = f"{float(score_str):.1f}"
              except (ValueError, TypeError): pass
 
-        # [사용자 요청] CISA, EPSS 정보 추가
-        # [BUG FIX] CISA/EPSS 정보가 리포트에 누락되는 문제를 해결합니다.
-        # threat_intel 데이터를 사용하여 cisa_info와 epss_info를 생성합니다.
+        # [사용자 요청] CISA 및 EPSS 정보가 있을 때만 표시하도록 수정
         threat_intel = cve.get('threat_intel', {})
         cisa_kev_info = threat_intel.get('cisa_kev', {})
-        if cisa_kev_info.get('in_kev'):
-            cisa_info = cisa_kev_info.get('date_added', '등재됨')
-        else:
-            cisa_info = "해당 없음"
+        cisa_html = ""
+        if cisa_kev_info and cisa_kev_info.get('in_kev'):
+            cisa_date_added = cisa_kev_info.get('date_added', '등재됨')
+            cisa_html = f'<span style="color: #dc3545;">CISA: {cisa_date_added}</span>'
         
-        epss_info = "N/A"
+        epss_html = ""
         epss_score = threat_intel.get('epss', {}).get('score')
-        # [BUG FIX] epss_score가 숫자인 경우에만 포맷팅을 적용하여 ValueError를 방지합니다.
-        epss_info = "N/A"
-        if epss_score is not None and isinstance(epss_score, (int, float)):
+        if epss_score is not None:
             try:
                 epss_info = f"{float(epss_score):.5f}"
-            except (ValueError, TypeError):
-                pass # 숫자로 변환할 수 없으면 "N/A" 유지
+                epss_html = f'<span>EPSS: {epss_info}</span>'
+            except (ValueError, TypeError): pass
         
         score_details_html = f"""
-            <div class="score-details">
-                <span>CVSS: {cvss3_score if cvss3_score > 0 else 'N/A'}</span>
-                <span>CISA: {cisa_info}</span>
-                <span>EPSS: {epss_info}</span>
+            <div class="score-details" style="text-align: left; margin-left: auto; margin-right: auto; display: inline-block;">
+                <span>CVSS: {cvss3_score_str}</span>
+                {cisa_html}
+                {epss_html}
             </div>
         """
 
@@ -1487,6 +1514,35 @@ def load_config(args):
         os.environ['no_proxy'] = args.no_proxy
         logging.info(f"Excluding from proxy: {args.no_proxy}")
 
+def test_server_connection(server_url: str):
+    """[신규] AIBox 서버 및 LLM 백엔드와의 연결을 테스트합니다."""
+    logging.info(f"\n{Color.header('AIBox 서버 연결 테스트 시작')}...")
+    
+    test_url = f'{server_url.rstrip("/")}/AIBox/api/llm-health'
+    logging.info(f"테스트 대상 엔드포인트: {test_url}")
+
+    # 로컬 서버와 통신하므로 프록시를 사용하지 않습니다.
+    response = make_request('get', test_url, use_proxy=False, timeout=180)
+
+    if not response:
+        logging.error(Color.error("\n테스트 실패: AIBox 서버에 연결할 수 없습니다."))
+        logging.error(" -> 서버가 실행 중인지, 방화벽 및 네트워크 설정을 확인하세요.")
+        sys.exit(1)
+
+    try:
+        result = response.json()
+        if response.ok and result.get('status') == 'ok':
+            logging.info(Color.success("\n테스트 성공! AIBox 서버와 LLM 백엔드 모두 정상적으로 통신합니다."))
+            logging.info(f" -> LLM 응답: {result.get('llm_response')}")
+        else:
+            logging.error(Color.error("\n테스트 실패: AIBox 서버는 응답했지만, LLM 백엔드와 통신할 수 없습니다."))
+            logging.error(f" -> 서버 오류 메시지: {result.get('message', 'N/A')}")
+            logging.error(f" -> 상세 정보: {result.get('details', 'N/A')}")
+            sys.exit(1)
+    except Exception as e:
+        logging.error(Color.error(f"\n테스트 실패: 서버 응답을 처리하는 중 오류가 발생했습니다: {e}"))
+        logging.error(f" -> 원본 응답: {response.text[:500]}")
+        sys.exit(1)
 
 def main():
     """메인 실행 함수"""
@@ -1501,10 +1557,16 @@ def main():
     parser.add_argument('--packages-file', help='A file containing a list of installed packages, one per line.')
     parser.add_argument('--proxy', help='HTTP/HTTPS proxy server URL (e.g., http://user:pass@host:port)')
     parser.add_argument('--no-proxy', help='Comma-separated list of hosts to exclude from proxy')
+    parser.add_argument('--test-connection', action='store_true', help='Test connection to the AIBox server and its LLM backend.')
     
     args = parser.parse_args()
 
     load_config(args)
+
+    # [신규] --test-connection 인자가 사용된 경우, 테스트를 실행하고 종료합니다.
+    if args.test_connection:
+        test_server_connection(CONFIG['AIBOX_SERVER_URL'])
+        sys.exit(0)
 
     # [개선] 패키지 파일이 제공되면, 내용을 읽어 INSTALLED_PACKAGES 세트에 저장
     if args.packages_file and os.path.exists(args.packages_file):
@@ -1545,7 +1607,7 @@ def main():
     with ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as executor:
         # 각 CVE에 대해 상세 정보 조회와 외부 정보 조회를 동시에 제출
         future_to_cve = {
-            executor.submit(fetch_cve_details, f"http://127.0.0.1:5000/AIBox/cve/{cve_id}.json"): (cve_id, 'details')
+            executor.submit(fetch_cve_details, f"http://127.0.0.1/AIBox/cve/{cve_id}.json"): (cve_id, 'details')
             for cve_id in candidate_cves_map.keys()
         }
         future_to_cve.update({

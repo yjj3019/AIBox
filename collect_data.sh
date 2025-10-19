@@ -14,7 +14,7 @@ PROXY_SERVER="http://30.30.30.27:8080"
 
 # [개선] Set an absolute path for the output file and a dedicated log file for this script
 OUTPUT_DIR="/data/iso/AIBox"
-OUTPUT_FILE="${OUTPUT_DIR}/cve_data.json"
+OUTPUT_FILE="${OUTPUT_DIR}/meta/cve_data.json"
 CVE_DETAIL_DIR="${OUTPUT_DIR}/cve"
 EPSS_DIR="${OUTPUT_DIR}/epss" # [추가] EPSS 데이터 저장 디렉토리
 LOG_DIR="/data/iso/AIBox/log"
