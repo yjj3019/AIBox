@@ -29,6 +29,8 @@ import time
 import traceback
 from typing import Dict, Any, List, Optional
 from collections import Counter
+import yaml
+from datetime import date, timedelta
 import xml.etree.ElementTree as ET
 from datetime import timedelta, date
 import subprocess
@@ -97,6 +99,47 @@ class Color:
     @staticmethod
     def info(text: str) -> str: return f"{Color.CYAN}{text}{Color.END}"
 
+def compare_versions(v1, v2):
+    """
+    [신규] 순수 Python으로 구현된 RPM 버전 비교 함수.
+    'rpm-vercomp' 라이브러리 의존성을 제거하기 위해 cve_check_report.py에서 가져왔습니다.
+    Epoch, Version, Release를 처리합니다.
+    v1이 v2보다 오래되었으면 -1, 같으면 0, 최신이면 1을 반환합니다.
+    """
+    def split_version(version_str):
+        epoch_match = re.match(r"(\d+):", str(version_str))
+        epoch = 0
+        if epoch_match:
+            epoch = int(epoch_match.group(1))
+            version_str = str(version_str)[len(epoch_match.group(0)):]
+        return epoch, str(version_str)
+
+    def compare_strings(s1, s2):
+        parts1 = re.findall(r"([a-zA-Z]+)|(\d+)|(~)", s1)
+        parts2 = re.findall(r"([a-zA-Z]+)|(\d+)|(~)", s2)
+
+        for p1, p2 in zip(parts1, parts2):
+            if p1[2] or p2[2]: # ~ character handling
+                if p1[2] and not p2[2]: return -1
+                if not p1[2] and p2[2]: return 1
+
+            p1_alpha, p1_num, _ = p1
+            p2_alpha, p2_num, _ = p2
+
+            if p1_num and p2_num:
+                diff = int(p1_num) - int(p2_num)
+                if diff != 0: return 1 if diff > 0 else -1
+            elif p1_alpha and p2_alpha:
+                if p1_alpha != p2_alpha: return 1 if p1_alpha > p2_alpha else -1
+            elif p1_num: return 1 # number > alpha
+            elif p2_num: return -1 # alpha < number
+
+        return (len(parts1) > len(parts2)) - (len(parts1) < len(parts2))
+
+    e1, ver_rel1 = split_version(v1); e2, ver_rel2 = split_version(v2)
+    if e1 != e2: return 1 if e1 > e2 else -1
+    return compare_strings(ver_rel1, ver_rel2)
+
 def log_step(message: str) -> None:
     print(f"\n{Color.header(f'===== {message} =====')}")
 
@@ -119,7 +162,6 @@ class SosreportParser:
         self._initialize_cpu_cores() # [BUG FIX] 생성자에서 CPU 코어 수를 먼저 초기화합니다.
         self.device_map = self._create_device_map() # [개선] 장치명 매핑 정보 생성
         self.metadata = {'device_map': self.device_map} # [추가] 메타데이터에 장치 맵 추가
-        self.dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
         # [사용자 요청] HA 클러스터 및 DRBD 정보 파싱 로직 추가
         self.ha_cluster_info = self._parse_ha_cluster_info()
         self.drbd_info = self._parse_drbd_info()
@@ -483,8 +525,7 @@ class SosreportParser:
 
     def _parse_additional_info(self) -> Dict[str, Any]:
         logging.info("  - [5/8] 추가 시스템 정보(커널 파라미터, SELinux 등) 파싱 중...")
-        # [사용자 요청] sysctl -a 의 모든 커널 파라미터를 파싱합니다.
-        all_sysctl_params = {k.strip(): v.strip() for k,v in (l.split('=',1) for l in self._read_file(['sos_commands/kernel/sysctl_-a']).split('\n') if '=' in l)}
+        # [사용자 요청] LLM 부하 감소를 위해 커널 파라미터 수집 로직을 제거합니다.
         sestatus = {k.strip().lower().replace(' ','_'): v.strip() for k,v in (l.split(':',1) for l in self._read_file(['sos_commands/selinux/sestatus_-v']).split('\n') if ':' in l)}
         
         # [보안 분석 추가] 설치된 패키지 목록을 상세 정보(이름, 버전)와 함께 파싱합니다.
@@ -528,7 +569,7 @@ class SosreportParser:
         # [개선] sudoers 파일 내용을 읽어와서 configurations에 추가
         sudoers_content = self._read_file(['etc/sudoers'])
 
-        return { "kernel_parameters": all_sysctl_params, "boot_cmdline": boot_cmdline, "selinux_status": sestatus, "installed_packages": packages, "failed_services": failed_services, "configurations": {"sshd_config": sshd_config, "dmsetup_info": dmsetup_info, "sudoers_content": sudoers_content} }
+        return { "boot_cmdline": boot_cmdline, "selinux_status": sestatus, "installed_packages": packages, "failed_services": failed_services, "configurations": {"sshd_config": sshd_config, "dmsetup_info": dmsetup_info, "sudoers_content": sudoers_content} }
 
     # [사용자 요청] sar 데이터 형식의 비일관성을 해결하기 위해 스키마 기반 파싱을 도입합니다.
     # 각 sar 명령어 옵션에 대해 가능한 헤더 이름과 표준화된 키를 매핑합니다.
@@ -893,63 +934,75 @@ class SosreportParser:
             logging.warning(Color.warn(f"로그 디렉터리 '{log_dir}'를 찾을 수 없습니다. 스마트 로그 분석을 건너뜁니다."))
             return {}
 
-        # [개선] 패턴 정규화 규칙을 강화하여 중복 제거 효율을 극대화합니다.
-        PATTERNS_TO_NORMALIZE = [
-            (re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::\d+)?\b'), '<IP_ADDRESS>'), # IPv4 주소 및 포트
-            (re.compile(r'\[\s*\d+\.\d+\]'), '[<KNL_TIMESTAMP>]'), # 커널 타임스탬프
-            (re.compile(r'\b([a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12})\b', re.IGNORECASE), '<UUID>'), # UUID
-            (re.compile(r'pid\s*=\s*\d+'), 'pid=<PID>'), # "pid=" 형식
-            (re.compile(r'\[\d+\]:'), '[<PID>]:'), # "[pid]:" 형식
-            (re.compile(r'(\b[A-Za-z]{3}\s+\d{1,2}\s+)?\d{2}:\d{2}:\d{2}'), '<TIMESTAMP>'), # "HH:MM:SS" 형식의 시간
-            (re.compile(r'\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?\b'), '<ISO_TIMESTAMP>'), # ISO 8601 타임스탬프
-            (re.compile(r'0x[0-9a-fA-F]+'), '<HEX_ADDR>'), # 16진수 주소/값
-            (re.compile(r'sd[a-z]\d*'), '<DEVICE>'), # 디스크 장치명 (sda, sdb1 등)
-            (re.compile(r'session\s\d+'), 'session <SESSION_ID>'), # 세션 ID
-            # [사용자 요청] Pacemaker/Corosync 관련 패턴 추가
-            (re.compile(r'pengine-[0-9]+'), 'pengine-<PID>'),
-            (re.compile(r'cib-[0-9]+'), 'cib-<PID>'),
-            (re.compile(r'crmd-[0-9]+'), 'crmd-<PID>'),
-            (re.compile(r'pacemaker-schedulerd\[\d+\]'), 'pacemaker-schedulerd[<PID>]'),
-            (re.compile(r'pacemaker-controld\[\d+\]'), 'pacemaker-controld[<PID>]'),
-            (re.compile(r'pacemaker-execd\[\d+\]'), 'pacemaker-execd[<PID>]'),
-            (re.compile(r'stonith-ng-[0-9]+'), 'stonith-ng-<PID>'),
-            (re.compile(r'corosync\[\d+\]'), 'corosync[<PID>]'),
-            (re.compile(r'pacemakerd\[\d+\]'), 'pacemakerd[<PID>]'),
-            (re.compile(r'transition [0-9]+'), 'transition <ID>'),
-            # [사용자 요청] DRBD 관련 로그 패턴 추가
-            (re.compile(r'drbd\s+[\w_]+/\d+\s+drbd\d+'), 'drbd <RESOURCE>/<VOL> <DEVICE>'),
-            (re.compile(r'drbd\s+[\w_]+:'), 'drbd <RESOURCE>:'),
-            (re.compile(r'drbd\s+[\w_]+\s+[\w\d_]+:'), 'drbd <RESOURCE> <PEER_HOST>:'),
-            (re.compile(r'conn\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'conn(<STATE> -> <STATE>)'),
-            (re.compile(r'disk\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'disk(<STATE> -> <STATE>)'),
-            (re.compile(r'peer\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'peer(<STATE> -> <STATE>)'),
-            (re.compile(r'pdsk\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'pdsk(<STATE> -> <STATE>)'),
-            (re.compile(r'repl\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'repl(<STATE> -> <STATE>)'),
-            (re.compile(r'role\(\s*[\w\s]+->\s*[\w\s]+\s*\)'), 'role(<STATE> -> <STATE>)'),
-            (re.compile(r'([0-9a-fA-F]{16}:){3}[0-9a-fA-F]{16}'), '<DRBD_UUID_CHAIN>'),
-            (re.compile(r'\b[0-9a-fA-F]{16}\b'), '<DRBD_UUID>'),
-            (re.compile(r'version\s\d+\s'), 'version <NUM> '),
-            (re.compile(r'capacity\s*==\s*\d+'), 'capacity == <NUM>'),
-            (re.compile(r'size\s*=\s*[\d.]+\s*\w+\s*\([\d.]+\s*\w+\)'), 'size = <SIZE>'),
-            (re.compile(r'agreed network protocol version\s+\d+'), 'agreed network protocol version <VERSION>'),
-            (re.compile(r'state change\s+\d+'), 'state change <ID>'),
-            (re.compile(r't=\d+'), 't=<TID>'),
-            (re.compile(r'call=\d+'), 'call=<CALL_ID>'),
-            # [사용자 요청] DRBD 관련 패턴 추가
-            (re.compile(r'drbd \d+'), 'drbd <RES_ID>'),
-        ]
-
         # 1. 모든 로그 라인을 읽어 패턴화하고 빈도수 계산
         all_patterns = Counter()
         pattern_examples = {} # 각 패턴의 첫 번째 원본 로그 예시 저장
-        log_files = [f for f in log_dir.iterdir() if f.is_file() and f.stat().st_size > 0]
+        
+        # [BUG FIX] 존재하지 않는 _get_normalization_patterns 메서드 호출을 제거하고, 패턴 목록을 직접 정의합니다.
+        PATTERNS_TO_NORMALIZE = [
+            (re.compile('\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?::\\d+)?\\b'), '<IP_ADDRESS>'),
+            (re.compile('\\[\\s*\\d+\\.\\d+\\]'), '[<KNL_TIMESTAMP>]'),
+            (re.compile('\\b([a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12})\\b', re.IGNORECASE), '<UUID>'),
+            (re.compile('pid\\s*=\\s*\\d+'), 'pid=<PID>'),
+            (re.compile('\\[\\d+\\]:'), '[<PID>]:'),
+            (re.compile('(\\b[A-Za-z]{3}\\s+\\d{1,2}\\s+)?\\d{2}:\\d{2}:\\d{2}'), '<TIMESTAMP>'),
+            (re.compile('\\b\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})?\\b'), '<ISO_TIMESTAMP>'),
+            (re.compile('0x[0-9a-fA-F]+'), '<HEX_ADDR>'),
+            (re.compile('sd[a-z]\\d*'), '<DEVICE>'),
+            (re.compile('session\\s\\d+'), 'session <SESSION_ID>'),
+            (re.compile('pengine-[0-9]+'), 'pengine-<PID>'),
+            (re.compile('cib-[0-9]+'), 'cib-<PID>'),
+            (re.compile('crmd-[0-9]+'), 'crmd-<PID>'),
+            (re.compile('pacemaker-schedulerd\\[\\d+\\]'), 'pacemaker-schedulerd[<PID>]'),
+            (re.compile('pacemaker-controld\\[\\d+\\]'), 'pacemaker-controld[<PID>]'),
+            (re.compile('pacemaker-execd\\[\\d+\\]'), 'pacemaker-execd[<PID>]'),
+            (re.compile('stonith-ng-[0-9]+'), 'stonith-ng-<PID>'),
+            (re.compile('corosync\\[\\d+\\]'), 'corosync[<PID>]'),
+            (re.compile('pacemakerd\\[\\d+\\]'), 'pacemakerd[<PID>]'),
+            (re.compile('transition [0-9]+'), 'transition <ID>'),
+            (re.compile('drbd\\s+[\\w_]+/\\d+\\s+drbd\\d+'), 'drbd <RESOURCE>/<VOL> <DEVICE>'),
+            (re.compile('drbd\\s+[\\w_]+:'), 'drbd <RESOURCE>:'),
+            (re.compile('drbd\\s+[\\w_]+\\s+[\\w\\d_]+:'), 'drbd <RESOURCE> <PEER_HOST>:'),
+            (re.compile('conn\\(\\s*[\\w\\s]+->\\s*[\\w\\s]+\\s*\\)'), 'conn(<STATE> -> <STATE>)'),
+            (re.compile('disk\\(\\s*[\\w\\s]+->\\s*[\\w\\s]+\\s*\\)'), 'disk(<STATE> -> <STATE>)'),
+            (re.compile('peer\\(\\s*[\\w\\s]+->\\s*[\\w\\s]+\\s*\\)'), 'peer(<STATE> -> <STATE>)'),
+            (re.compile('pdsk\\(\\s*[\\w\\s]+->\\s*[\\w\\s]+\\s*\\)'), 'pdsk(<STATE> -> <STATE>)'),
+            (re.compile('repl\\(\\s*[\\w\\s]+->\\s*[\\w\\s]+\\s*\\)'), 'repl(<STATE> -> <STATE>)'),
+            (re.compile('role\\(\\s*[\\w\\s]+->\\s*[\\w\\s]+\\s*\\)'), 'role(<STATE> -> <STATE>)'),
+            (re.compile('([0-9a-fA-F]{16}:){3}[0-9a-fA-F]{16}'), '<DRBD_UUID_CHAIN>'),
+            (re.compile('\\b[0-9a-fA-F]{16}\\b'), '<DRBD_UUID>'),
+            (re.compile('version\\s\\d+\\s'), 'version <NUM> '),
+            (re.compile('capacity\\s*==\\s*\\d+'), 'capacity == <NUM>'),
+            (re.compile('size\\s*=\\s*[\\d.]+\\s*\\w+\\s*\\([\\d.]+\\s*\\w+\\)'), 'size = <SIZE>'),
+            (re.compile('agreed network protocol version\\s+\\d+'), 'agreed network protocol version <VERSION>'),
+            (re.compile('state change\\s+\\d+'), 'state change <ID>'),
+            (re.compile('t=\\d+'), 't=<TID>'),
+            (re.compile('call=\\d+'), 'call=<CALL_ID>'),
+            (re.compile('drbd \\d+'), 'drbd <RES_ID>'),
+        ]
 
+        # [사용자 요청] LLM 부하 감소를 위해 로그 수집을 /var/log/messages 파일로 제한합니다.
+        # sosreport 구조에 따라 여러 경로에 있을 수 있는 messages 파일을 탐색합니다.
+        messages_path = next((p for p in [log_dir / 'messages', log_dir / 'syslog'] if p.exists() and p.is_file() and p.stat().st_size > 0), None)
+        log_files = [messages_path] if messages_path else []
+        if not log_files:
+            logging.warning(Color.warn(f"  - '{log_dir}'에서 'messages' 또는 'syslog' 파일을 찾을 수 없어 로그 분석을 건너뜁니다."))
+        logging.info(f"  - 분석 대상 로그 파일: {[f.name for f in log_files]}")
+
+        # [BUG FIX] 로그 파일 처리 로직을 try-except 블록 밖으로 이동하여 변수 범위 문제를 해결합니다.
         for log_file in log_files:
             if any(log_file.name.endswith(ext) for ext in ['.gz', '.xz', '.bz2', 'lastlog', 'wtmp', 'btmp']):
                 continue
+            
+            # [사용자 요청] 파일 크기가 50MB를 초과하면 최신 20,000 라인만 읽어옵니다.
+            MAX_LOG_LINES = 20000
             try:
                 content = log_file.read_text(encoding='utf-8', errors='ignore')
-                for line in content.split('\n'):
+                lines = content.split('\n')
+                if len(lines) > MAX_LOG_LINES:
+                    lines = lines[-MAX_LOG_LINES:]
+
+                for line in lines:
                     if not line.strip(): continue
                     
                     normalized_pattern = line
@@ -958,25 +1011,72 @@ class SosreportParser:
                     
                     final_pattern = re.sub(r'\s+', ' ', normalized_pattern).strip()
                     
-                    # 패턴과 파일명을 함께 키로 사용하여 파일별로 그룹화
                     pattern_key = (log_file.name, final_pattern)
                     all_patterns[pattern_key] += 1
                     if pattern_key not in pattern_examples:
-                        pattern_examples[pattern_key] = line # 원본 로그 예시 저장
+                        pattern_examples[pattern_key] = line
             except Exception as e:
                 logging.warning(f"  - 로그 파일 '{log_file.name}' 처리 중 오류 발생: {e}")
 
         # 2. 빈도수 기반으로 유의미한 로그 필터링
         smart_log_analysis = {}
         ANOMALY_THRESHOLD = 5
-        # [사용자 요청] HA 및 DRBD 관련 키워드 추가
-        ERROR_KEYWORDS = re.compile( # [개선] Pacemaker 오류를 더 잘 탐지하기 위해 키워드 추가
-            r'\b(error|failed|failure|critical|panic|denied|segfault|stonith|fencing|fence|split-brain|standby|primary|secondary|sync|failover|quorum|unfenced|inconsistent|timed out|target is busy|unexpected|couldn\'t)\b',
+        # [사용자 요청] 과도하게 반복되는 로그를 제외하기 위한 임계값
+        HIGH_FREQUENCY_THRESHOLD = 1000
+
+        # [사용자 요청] 선정된 로그 유형별 카운터를 추가합니다.
+        rare_log_count = 0
+        keyword_log_count = 0
+        selected_patterns = set() # 중복 계산 방지
+
+        # [사용자 요청] dmesg 로그도 스마트 패턴화 대상에 포함하여 로그 양을 최적화합니다.
+        dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
+        if dmesg_content != 'N/A':
+            logging.info("  - dmesg 로그 스마트 패턴화 진행 중...")
+            for line in dmesg_content.split('\n'):
+                if not line.strip():
+                    continue
+                
+                normalized_pattern = line
+                for regex, placeholder in PATTERNS_TO_NORMALIZE:
+                    normalized_pattern = regex.sub(placeholder, normalized_pattern)
+                
+                final_pattern = re.sub(r'\s+', ' ', normalized_pattern).strip()
+                
+                # dmesg 로그는 'dmesg'라는 가상 파일명으로 처리
+                pattern_key = ('dmesg', final_pattern)
+                all_patterns[pattern_key] += 1
+                if pattern_key not in pattern_examples:
+                    pattern_examples[pattern_key] = line
+
+        # [요청사항] 시스템 영향 분석을 위한 핵심 키워드 목록 강화
+        # 기존의 단순 오류 키워드에서 더 구체적이고 심층적인 키워드로 확장합니다.
+        CORE_KEYWORDS = re.compile(
+            r'\b(error|failed|failure|critical|panic|denied|segfault|corrupt|unrecoverable|'
+            r'stonith|fencing|fence|split-brain|standby|primary|secondary|sync|failover|quorum|unfenced|inconsistent|'
+            r'i/o error|out of memory|oom-killer|hung|deadlock|timeout|timed out|'
+            r'authentication failure|login failed|access denied|permission denied|'
+            r'unexpected|couldn\'t|unable to)\b',
             re.IGNORECASE)
 
         for (filename, pattern), count in all_patterns.items():
-            # 희귀 패턴(Anomaly)이거나, 자주 발생하지만 오류 키워드를 포함하는 패턴(Error Storm)만 선택
-            if count <= ANOMALY_THRESHOLD or ERROR_KEYWORDS.search(pattern):
+            # [요청사항] 필터링 조건 강화: 희귀 패턴이거나, 핵심 키워드를 포함하는 패턴만 선택
+            is_significant = CORE_KEYWORDS.search(pattern)
+            is_rare = count <= ANOMALY_THRESHOLD
+            is_too_frequent = count > HIGH_FREQUENCY_THRESHOLD
+
+            # [사용자 요청] 선정된 로그의 유형을 카운트합니다.
+            should_select = (is_rare or is_significant) and not (is_too_frequent and not is_significant)
+
+            if should_select:
+                pattern_key = (filename, pattern)
+                if pattern_key not in selected_patterns:
+                    if is_significant:
+                        keyword_log_count += 1
+                    elif is_rare: # is_significant가 아닌 희귀 로그만 카운트
+                        rare_log_count += 1
+                    selected_patterns.add(pattern_key)
+
                 if filename not in smart_log_analysis:
                     smart_log_analysis[filename] = []
                 smart_log_analysis[filename].append({
@@ -989,7 +1089,10 @@ class SosreportParser:
         for filename in smart_log_analysis:
             smart_log_analysis[filename].sort(key=lambda x: x['count'], reverse=True)
 
-        logging.info(Color.info(f"스마트 로그 분석 완료. {len(smart_log_analysis)}개 파일에서 유의미한 로그 패턴 추출."))
+        total_selected = rare_log_count + keyword_log_count
+        logging.info(Color.info(f"스마트 로그 분석 완료. 총 {total_selected}개의 유의미한 로그 패턴을 추출했습니다."))
+        logging.info(Color.info(f"  - 유형별 상세: 핵심 키워드 로그 {keyword_log_count}개, 희귀 로그 {rare_log_count}개"))
+
         return {"smart_log_analysis": smart_log_analysis}
 
     def parse_all(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -1018,14 +1121,19 @@ class SosreportParser:
         logging.info("  - (5/5) 최종 데이터 취합 완료.")
         return metadata, sar_data
 class HTMLReportGenerator:
-    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Dict, hostname: str, report_date: datetime.datetime, device_map: Dict):
-        self.metadata, self.sar_data, self.ai_analysis, self.hostname = metadata, sar_data, ai_analysis, hostname
+    def __init__(self, metadata: Dict, sar_data: Dict, ai_analysis: Optional[Dict], hostname: str, report_date: datetime.datetime, device_map: Dict):
+        self.metadata = metadata
+        self.sar_data = sar_data
+        # [BUG FIX] ai_analysis가 None일 경우를 대비하여 안전하게 초기화합니다.
+        self.ai_analysis = ai_analysis if ai_analysis is not None else {}
+        self.hostname = hostname
         self.report_date = report_date
-        self.device_map = device_map # [BUG FIX] device_map을 클래스 속성으로 초기화합니다.
+        # [BUG FIX] device_map을 클래스 속성으로 초기화합니다.
+        self.device_map = device_map
 
     def _generate_graphs(self) -> Dict[str, Any]:
         """[안정성 강화] 재시도 로직을 적용하여 각 그래프를 생성합니다."""
-        if not IS_GRAPHING_ENABLED: return {}
+        if not IS_GRAPHING_ENABLED: return {} # type: ignore
         if not IS_PLOTLY_AVAILABLE: logging.warning(Color.warn("  - Plotly 라이브러리가 없어 그래프 생성을 건너뜁니다.")); return {}
         log_step("그래프 생성 시작")
         graphs, sar = {'static': {}, 'interactive': {}}, self.sar_data
@@ -1532,20 +1640,14 @@ class HTMLReportGenerator:
 
     def generate(self, generated_graphs: Dict) -> str:
         # [수정] _generate_graphs는 이제 (base64_png, interactive_html) 튜플 또는 (None, interactive_html)을 반환합니다.
-        # raw_graphs = self._generate_graphs() # [개선] 이제 외부에서 생성된 그래프 데이터를 받습니다.
-        
-        graphs_for_template = {}
-        for key, result in generated_graphs.items():
-            if result and isinstance(result, tuple) and len(result) == 2:
-                graphs_for_template[key] = result
-
+        # [BUG FIX] AI 분석 결과가 리포트에 누락되는 문제를 해결합니다. (v2)
+        # get_html_template에 전달하는 데이터에 self.ai_analysis를 명시적으로 포함하도록 수정합니다.
         template_data = {
-            "hostname": self.hostname, 
-            "sar_data": self.sar_data, # [BUG FIX] disk_detail 팝업 활성화를 위해 sar_data를 템플릿에 전달합니다.
-            "ai_analysis": self.ai_analysis,
-            "graphs": generated_graphs, # [수정] Plotly HTML을 직접 전달
-            "security_advisories": self.metadata.get('security_advisories', []),
-            **self.metadata
+            **self.metadata,  # system_info, storage, network 등 기본 메타데이터
+            "hostname": self.hostname,
+            "ai_analysis": self.ai_analysis,  # [핵심 수정] AI 분석 결과 (summary, recommendations 등)
+            "graphs": generated_graphs,      # 생성된 그래프 데이터
+            "sar_data": self.sar_data,       # disk_detail 팝업 활성화를 위한 원본 sar 데이터
         }
         return get_html_template(template_data)
 
@@ -1585,6 +1687,9 @@ class AIAnalyzer:
     def __init__(self, server_url: str, report_date: Optional[datetime.datetime]):
         self.server_url = server_url.rstrip('/')
         self.report_date_str = report_date.strftime('%Y-%m-%d') if report_date else "N/A"
+        # [BUG FIX] Python 3.12+ 호환성: f-string 내 백슬래시 사용 오류를 해결하기 위해 re.sub을 밖으로 분리합니다.
+        server_url_no_port = re.sub(r':\d+', '', self.server_url)
+        self.CVE_DB_URL = f"{server_url_no_port}/cve-check/meta/office-check_db.json"
         self.tokenizer = None
         if IS_TIKTOKEN_AVAILABLE:
             try:
@@ -1704,46 +1809,13 @@ class AIAnalyzer:
 
 [요청]
 위 데이터에서 가장 중요하거나 비정상적인 특징, 잠재적인 문제점을 나타내는 핵심 사항을 2~3개의 불릿 포인트로 요약해 주십시오.
+응답은 반드시 유효한 JSON 객체 형식이어야 하며, 'summary' 키에 요약 내용을 담아주세요. 예: {{"summary": "- 요약 1\n- 요약 2"}}
 """
 
     def _create_final_analysis_prompt(self, summaries: Dict[str, str]) -> str:
-        """[신규] 개별 청크 요약본들을 종합하여 최종 분석을 위한 프롬프트를 생성합니다."""
-        # [BUG FIX] SyntaxError: 'return' outside function 오류를 수정합니다.
-        # 함수 본문이 올바르게 들여쓰기 되도록 수정합니다.
+        """[사용자 요청] AI의 역할을 RHEL 시스템 전반을 분석하는 최고 전문가로 재정의하고, HA/DRBD는 심층 분석의 한 부분으로 조정합니다."""
+        # [BUG FIX] return 문이 누락되어 프롬프트가 생성되지 않는 치명적인 오류를 수정합니다.
         summaries_text = "\n".join(f"- **{name}**: {summary}" for name, summary in summaries.items())
-
-        return f"""[시스템 역할]
-당신은 20년 경력의 Red Hat Certified Architect(RHCA)이자 리눅스 성능 분석 전문가입니다. 주어진 시스템 데이터의 각 섹션별 요약본을 종합하여, 시스템의 상태를 진단하고 문제의 근본 원인을 찾아 구체적인 해결 방안을 제시해야 합니다.
-**특히, HA 클러스터(Pacemaker, Corosync) 및 DRBD 관련 데이터가 있는 경우, 클러스터의 안정성, 리소스 상태, 잠재적 위험(예: split-brain, 리소스 모니터링 실패, failover 문제)을 최우선으로 분석해야 합니다.**
-
-[분석 대상: 시스템 데이터 섹션별 요약]
-{summaries_text}
-
-[출력 형식]
-위 요약본들을 종합적으로 분석하여, 다음의 키를 가진 단일 JSON 객체로만 반환하십시오. 다른 설명은 절대 추가하지 마세요.
-
-`summary` 필드는 다음의 마크다운 구조를 반드시 사용해야 합니다. 각 섹션은 '###' 헤더로 시작해야 합니다.
-### 종합 평가 (Overall Assessment)
-<시스템의 전반적인 상태에 대한 1~2 문장의 평가 (예: '양호', '주의', '심각') 및 핵심 근거>
-### 주요 발견 사항 (Key Findings)
-* <가장 중요한 발견점 1>
-* <가장 중요한 발견점 2>
-### 최우선 권장 사항 (Top Priority Recommendation)
-<가장 시급하게 조치해야 할 단 한 가지의 핵심 권장 사항>
-
-```json
-{{{{
-  "summary": "위의 마크다운 구조에 따라 시스템의 전반적인 상태, 주요 발견 사항, 핵심 권장 사항을 요약합니다.",
-  "critical_issues": ["시스템 안정성에 즉각적인 영향을 미치는 심각한 문제점 목록 (예: Kernel panic, OOM Killer 발생, 클러스터 장애, Split-brain)"],
-  "warnings": ["주의가 필요하거나 잠재적인 문제로 발전할 수 있는 경고 사항 목록 (예: 높은 I/O 대기, 특정 로그의 반복적인 오류)"],
-  "recommendations": [ {{{{ "priority": "높음/중간/낮음", "category": "성능/안정성/보안/구성", "issue": "구체적인 문제점 기술", "solution": "문제 해결을 위한 구체적이고 실행 가능한 단계별 가이드 또는 명령어", "related_logs": ["분석의 근거가 된 특정 로그 메시지 (있는 경우)"] }}}} ]
-}}}}
-```"""
-
-    def _create_final_analysis_prompt(self, summaries: Dict[str, str]) -> str:
-        """[신규] 개별 청크 요약본들을 종합하여 최종 분석을 위한 프롬프트를 생성합니다."""
-        summaries_text = "\n".join(f"- **{name}**: {summary}" for name, summary in summaries.items())
-
         # [사용자 요청] AI의 역할을 RHEL 시스템 전반을 분석하는 최고 전문가로 재정의하고, HA/DRBD는 심층 분석의 한 부분으로 조정합니다.
         # [BUG FIX] return 문이 누락되어 프롬프트가 생성되지 않는 치명적인 오류를 수정합니다.
         return f"""[시스템 역할] 종합 분석
@@ -1791,6 +1863,7 @@ class AIAnalyzer:
         2. 요약된 결과들을 모아 최종 종합 분석을 요청합니다.
         """
         log_step("AI 시스템 분석 요청 (지능형 청크 분할)")
+        logging.info(Color.info("  - AI 분석을 위한 데이터 로딩 및 익명화(필요시) 시작..."))
         try:
             with open(metadata_path, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
@@ -1804,230 +1877,174 @@ class AIAnalyzer:
                 metadata = anonymizer.anonymize_data(metadata, hostnames)
                 sar_data = anonymizer.anonymize_data(sar_data, hostnames)
     
-            # [단순화] 서버의 Map-Reduce 로직을 신뢰하고, 모든 데이터를 하나의 프롬프트로 구성하여 전송합니다.
-            # 서버가 컨텍스트 초과를 감지하고 자동으로 처리할 것입니다.
-            all_data_summary = {
+            # --- Map 단계: 데이터를 작은 묶음으로 나누어 병렬로 요약 ---
+            logging.info(Color.info("  - [Map Phase] 데이터 섹션별 병렬 요약 분석 시작..."))
+            data_chunks = {
                 "system_info": metadata.get("system_info"),
-                "ha_cluster_info": metadata.get("ha_cluster_info"),
-                "drbd_info": metadata.get("drbd_info"),
-                "performance_analysis": metadata.get("performance_analysis"),
+                "storage": metadata.get("storage"),
+                "processes": metadata.get("processes"),
+                "network": metadata.get("network"),
+                "boot_cmdline": metadata.get("boot_cmdline"),
+                "failed_services": metadata.get("failed_services"),
+                "configurations": metadata.get("configurations"),
                 "critical_log_events": metadata.get("critical_log_events"),
                 "smart_log_analysis": metadata.get("smart_log_analysis"),
-                "sar_data": sar_data # SAR 데이터도 함께 전송
+                "performance_analysis": metadata.get("performance_analysis"),
             }
-            final_prompt = self._create_final_analysis_prompt(all_data_summary)
-            final_analysis = self._make_request('sos/analyze_system', {"prompt": final_prompt})
+            # 값이 없는 청크는 제외
+            data_chunks = {k: v for k, v in data_chunks.items() if v}
     
+            chunk_summaries = {}
+            with ThreadPoolExecutor(max_workers=8, thread_name_prefix='Chunk_Analyzer') as executor:
+                future_to_chunk = {}
+                for name, data in data_chunks.items():
+                    # [BUG FIX] 루프 내에서 로깅을 먼저 수행하여 NameError를 해결합니다.
+                    logging.info(f"    -> AI 서버로 '{name}' 섹션 분석 요청 (크기: {len(json.dumps(data, default=str).encode('utf-8')) / 1024:.2f} KB)")
+                    future = executor.submit(
+                        self._make_request,
+                        'sos/analyze_system',
+                        {"prompt": self._create_chunk_analysis_prompt(name, data)}
+                    )
+                    future_to_chunk[future] = name
+                for future in as_completed(future_to_chunk):
+                    chunk_name = future_to_chunk[future]
+                    try:
+                        summary = future.result()
+                        chunk_summaries[chunk_name] = summary.get('summary', str(summary)) if isinstance(summary, dict) else str(summary)
+                        logging.info(f"    -> '{chunk_name}' 섹션 요약 완료.")
+                    except Exception as e:
+                        logging.error(f"'{chunk_name}' 섹션 요약 중 오류 발생: {e}")
+                        chunk_summaries[chunk_name] = f"'{chunk_name}' 섹션 분석 중 오류가 발생했습니다."
+
+            # --- Reduce 단계: 요약된 결과들을 모아 최종 종합 분석 요청 ---
+            logging.info(Color.info("  - [Reduce Phase] 요약본을 종합하여 최종 분석 요청..."))
+            final_prompt = self._create_final_analysis_prompt(chunk_summaries)
+            logging.debug(f"  - 생성된 최종 AI 분석 프롬프트:\n---\n{final_prompt}\n---")
+            final_analysis = self._make_request('sos/analyze_system', {"prompt": final_prompt})
+            logging.debug(f"  - AI 서버로부터 수신한 원본 분석 결과:\n---\n{json.dumps(final_analysis, indent=2, ensure_ascii=False)}\n---")
             return final_analysis
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logging.error(Color.error(f"AI 분석을 위한 데이터 파일을 읽는 중 오류 발생: {e}"))
             return {"summary": "분석 데이터 파일을 처리할 수 없어 AI 분석을 수행하지 못했습니다.", "critical_issues": [], "warnings": [], "recommendations": []}
 
-    def fetch_security_news(self, metadata: Dict, output_dir: Path) -> List[Dict]: # noqa: E501
-        """[보안 분석 v5] 4단계 AI 분석을 통해 시스템에 영향을 미치는 CVE를 분석하고 우선순위를 선정합니다."""
-        log_step("3단계: AI 기반 보안 위협 분석")
+    def analyze_security_advisories(self, metadata: Dict) -> List[Dict]:
+        """
+        설치된 패키지 버전을 기반으로 CVE 데이터베이스를 확인하여 조치가 필요한 보안 권고 사항을 분석하고,
+        AI를 통해 각 CVE의 요약을 생성합니다.
+        """
+        log_step("3단계: CVE 보안 권고 확인")
 
         installed_packages = metadata.get('installed_packages', [])
-        if not installed_packages: # noqa: E501
-            logging.warning(Color.warn("  - 설치된 패키지 정보가 없어 보안 분석을 건너뜁니다."))
+        if not installed_packages:
+            logging.warning(Color.warn("  - 설치된 패키지 정보가 없어 CVE 보안 권고 확인을 건너뜁니다."))
             return []
 
-        # --- 1단계: 로컬 CVE 데이터 수집 및 1차 분류 (기간) ---
-        logging.info(Color.info("\n--- 1단계: 로컬 CVE 데이터 수집 및 1차 분류 (기간) ---"))
-        # [요청 반영] cve_data.json 파일 경로를 ./cve_data.json으로 지정
-        cve_data_path = Path('./meta/cve_data.json')
-        if not cve_data_path.exists():
-            # [사용자 요청] security.py의 안정적인 오류 처리 로직을 적용합니다.
-            logging.error(Color.error(f"  - CVE 데이터 파일({cve_data_path})을 찾을 수 없어 보안 분석을 건너뜁니다."))
+        logging.info(f"  - CVE 데이터베이스 로드 중: {self.CVE_DB_URL}")
+        response = self._make_get_request_with_retry(self.CVE_DB_URL)
+        if not response or not response.ok:
+            logging.error(Color.error(f"  - CVE 데이터베이스({self.CVE_DB_URL})를 로드할 수 없습니다."))
             return []
+        cve_database = response.json()
+        logging.info(f"  - CVE 데이터베이스에서 {len(cve_database)}개 CVE 로드 완료.")
 
-        with open(cve_data_path, 'r', encoding='utf-8') as f:
-            cve_summaries = json.load(f)
-        logging.info(f"  - 로컬 CVE 데이터 로드 완료: 총 {len(cve_summaries)}개")
+        installed_packages_map = {pkg['name']: pkg['version'] for pkg in installed_packages}
+        vulnerabilities_by_package = {}
 
-        start_date = datetime.datetime.now() - timedelta(days=180)
-        recent_cves = []
-        for cve in cve_summaries:
-            if not ('public_date' in cve and cve['public_date']): continue
-            try:
-                public_dt = datetime.datetime.fromisoformat(cve['public_date'].replace('Z', '+00:00'))
-                if public_dt.replace(tzinfo=None) >= start_date:
-                    recent_cves.append(cve)
-            except ValueError:
-                continue
-        logging.info(f"  - 1차 분류(최근 180일) 완료. 후보 CVE: {len(recent_cves)}개")
-
-        # --- 2단계: CVE 상세 정보 수집 및 2차 분류 (Severity/CVSS) ---
-        logging.info(Color.info("\n--- 2단계: CVE 상세 정보 수집 및 2차 분류 (Severity/CVSS) ---"))
-        cves_with_details = []
-        # 스레드 안전성을 위해 Lock 객체를 생성합니다.
-        cve_details_lock = threading.Lock()
-
-        # [BUG FIX] CVE 상세 정보 조회 로직 강화 (로컬 실패 시 외부 API로 폴백)
-        # 1단계: 로컬 서버에서 먼저 조회
-        logging.info(f"  - {len(recent_cves)}개 CVE 상세 정보 수집 중 (From: http://127.0.0.1:5000/AIBox/cve/)...")
-        failed_cve_ids = []
-
-        with ThreadPoolExecutor(max_workers=20, thread_name_prefix='CVE_Detail_Fetcher_Local') as executor:
-            future_to_cve = {executor.submit(self._make_get_request_with_retry, f"http://127.0.0.1/AIBox/cve/{cve['CVE']}.json", timeout=10): cve for cve in recent_cves}
-            for future in as_completed(future_to_cve):
-                cve_summary = future_to_cve[future]
-                try:
-                    response = future.result()
-                    if response and response.ok:
-                        detail_data = response.json()
-                        # [BUG FIX] 상세 정보의 CVE ID 키가 'name'으로 되어 있어 'CVE'로 통일합니다.
-                        # 이렇게 하지 않으면, 기존 cve_summary의 'name' 필드(패키지명)를 덮어쓰게 됩니다.
-                        if 'name' in detail_data and detail_data['name'].startswith('CVE-'):
-                            detail_data['CVE'] = detail_data.pop('name')
-
-                        with cve_details_lock:
-                            # [BUG FIX] 원본 요약 정보와 상세 정보를 병합하여 CVE ID 누락 방지
-                            cves_with_details.append({**cve_summary, **detail_data})
-                    else:
-                        failed_cve_ids.append(cve_summary)
-                except Exception as e:
-                    logging.warning(f"    -> 로컬 CVE 상세 정보 조회 중 예외 발생: {cve_summary.get('CVE')}, 오류: {e}")
-                    failed_cve_ids.append(cve_summary)
-        
-        # 2단계: 로컬 조회 실패 건에 대해 Red Hat 공식 API로 재시도
-        if failed_cve_ids:
-            logging.info(f"  - 로컬 조회 실패 {len(failed_cve_ids)}건에 대해 외부 API로 재시도합니다...")
-            with ThreadPoolExecutor(max_workers=10, thread_name_prefix='CVE_Detail_Fetcher_Remote') as executor:
-                future_to_cve = {executor.submit(self._make_get_request_with_retry, f"https://access.redhat.com/hydra/rest/securitydata/cve/{cve['CVE']}.json", timeout=20): cve for cve in failed_cve_ids}
-                for future in as_completed(future_to_cve):
-                    cve_summary = future_to_cve[future]
-                    try:
-                        response = future.result()
-                        if response and response.ok:
-                            detail_data = response.json()
-                            # 외부 API 조회 결과에 대해서도 동일한 키 통일 작업을 수행합니다.
-                            if 'name' in detail_data and detail_data['name'].startswith('CVE-'):
-                                detail_data['CVE'] = detail_data.pop('name')
-
-                            with cve_details_lock:
-                                cves_with_details.append({**cve_summary, **detail_data})
-                    except Exception as e:
-                        logging.error(f"    -> 외부 API 조회 최종 실패: {cve_summary.get('CVE')}, 오류: {e}")
-
-        logging.info(f"  - CVE 상세 정보 수집 완료: {len(cves_with_details)}개")
-
-        # [사용자 요청] 2단계 필터링을 security.py 로직에 맞춰 CVSS 점수(>=7.0) 및 심각도 기준으로 변경
-        logging.info(f"  - 2차 분류: {len(cves_with_details)}개 CVE 중 CVSS 점수(>=7.0) 및 심각도(Critical/Important) 기준으로 후보군 선정...")
-        cves_after_2nd_filter = []
-        for cve in cves_with_details:
-            # [BUG FIX] CVE JSON 데이터의 심각도 필드 이름이 'threat_severity'이므로, 이를 참조하도록 수정합니다.
-            # 'severity' 필드는 존재하지 않아 필터링이 제대로 동작하지 않았습니다.
-            severity = cve.get('threat_severity', '').lower()
+        for cve_id, cve_data in cve_database.items():
+            # [BUG FIX] 시스템의 OS 버전과 CVE의 product_name을 비교하기 위한 로직 추가
+            system_os_version = metadata.get('os_release', '')
+            os_ver_match = re.search(r'Red Hat Enterprise Linux.*?release\s+(\d+)(?:\.(\d+))?', system_os_version)
+            if not os_ver_match:
+                continue # 시스템 OS 버전을 식별할 수 없으면 해당 CVE는 건너뜁니다.
             
-            # [사용자 요청] security.py의 안정적인 CVSS 점수 파싱 로직을 적용합니다.
-            # 1. cvss3.cvss3_base_score를 우선적으로 확인합니다.
-            # 2. 1번이 없을 경우, 최상위 레벨의 cvss3_score를 확인합니다.
-            # 3. 모든 값이 없거나 유효하지 않으면 0.0으로 처리합니다.
-            cvss3_score = 0.0
-            cvss3_data = cve.get('cvss3', {})
-            if isinstance(cvss3_data, dict):
-                try:
-                    score_str = cvss3_data.get('cvss3_base_score') or cve.get('cvss3_score')
-                    if score_str:
-                        cvss3_score = float(score_str)
-                except (ValueError, TypeError):
-                    pass # 점수 파싱 실패 시 0.0 유지
+            sys_major_ver, sys_minor_ver = os_ver_match.groups()
 
-            # [사용자 요청] security.py와 동일하게 CVSS 7.0 이상을 기준으로 필터링합니다.
-            if severity in ['critical', 'important'] and cvss3_score >= 7.0:
-                cves_after_2nd_filter.append(cve)
-        
-        logging.info(f"  - 2차 분류(Severity/CVSS) 완료. 후보 CVE: {len(cves_after_2nd_filter)}개")
+            for release in cve_data.get("affected_release", []):
+                # [BUG FIX] product_name 필터링 로직 추가
+                product_name = release.get("product_name")
+                if not product_name:
+                    continue
 
-        if not cves_after_2nd_filter:
-            logging.warning(Color.warn("  - 시스템에 영향을 미칠 가능성이 있는 CVE를 찾지 못했습니다."))
+                # 1. CVE의 product_name이 시스템의 Major 버전과 일치하는지 확인 (예: "Red Hat Enterprise Linux 8")
+                is_major_match = f"Red Hat Enterprise Linux {sys_major_ver}" in product_name
+                # 2. CVE의 product_name이 시스템의 Minor 버전과 일치하는지 확인 (예: "Red Hat Enterprise Linux 8.6")
+                is_minor_match = sys_minor_ver and f"Red Hat Enterprise Linux {sys_major_ver}.{sys_minor_ver}" in product_name
+                
+                # Major 또는 Minor 버전 중 하나라도 일치하지 않으면 이 릴리즈는 건너뜁니다.
+                if not (is_major_match or is_minor_match):
+                    continue
+
+                package_field = release.get("package", "")
+
+                # [BUG FIX] cve_check_report.py의 안정적인 패키지 이름/버전 분리 로직을 적용합니다.
+                parts = package_field.rsplit('-', 1)
+                if len(parts) == 2 and re.search(r'[\d.]', parts[1]):
+                    vuln_pkg_name, fix_version = parts
+                else:
+                    continue # 패키지 이름과 버전을 분리할 수 없으면 건너뜁니다.
+
+                # [BUG FIX] 설치된 패키지 목록에 해당 패키지가 있는지 확인합니다.
+                if vuln_pkg_name in installed_packages_map:
+                    installed_ver = installed_packages_map[vuln_pkg_name]
+                    if compare_versions(installed_ver, fix_version) < 0:
+                        current_finding = {
+                            'cve_id': cve_id,
+                            'severity': cve_data.get('threat_severity', 'N/A'),
+                            'package': vuln_pkg_name,
+                            'description': " ".join(cve_data.get('details', [])) or cve_data.get('statement', '요약 정보 없음'),
+                            'installed_version': installed_ver, # 버전 정보만 저장
+                            'fix_version': fix_version,       # 버전 정보만 저장
+                            'public_date': cve_data.get('public_date', 'N/A'),
+                            'cvss3': cve_data.get('cvss3', {})
+                        }
+                        if vuln_pkg_name not in vulnerabilities_by_package or compare_versions(fix_version, vulnerabilities_by_package[vuln_pkg_name]['fix_version'].split('-', 1)[-1]) > 0:
+                            vulnerabilities_by_package[vuln_pkg_name] = current_finding
+
+        final_vulnerabilities = list(vulnerabilities_by_package.values())
+        logging.info(f"  - 취약점 분석 완료. {len(final_vulnerabilities)}개 패키지에서 조치 필요 CVE 발견.")
+
+        if not final_vulnerabilities:
             return []
-        
-        # --- 3단계: 최종 30개 CVE 선정 (패키지당 1개) ---
-        logging.info(Color.info("\n--- 3단계: 최종 30개 CVE 선정 (패키지당 1개) ---"))
-        logging.info(f"  - {len(cves_after_2nd_filter)}개 CVE를 대상으로 AI를 사용하여 최종 후보 30개 선정...")
-        preliminary_candidates = []
-        preliminary_candidates_ids = set()
-        
-        # [사용자 요청] security.py의 예선 분석 로직을 참고하여 5개씩 묶어 병렬 처리
-        CHUNK_SIZE = 5
-        cve_chunks = [cves_after_2nd_filter[i:i + CHUNK_SIZE] for i in range(0, len(cves_after_2nd_filter), CHUNK_SIZE)]
 
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            # reasoning-model을 사용하도록 is_reasoning=True 전달
-            future_to_chunk = {executor.submit(self._preliminary_cve_analysis, chunk, is_reasoning=True): chunk for chunk in cve_chunks}
-            for i, future in enumerate(as_completed(future_to_chunk), 1):
-                chunk = future_to_chunk[future]
-                chunk_cve_ids = [cve.get('CVE') for cve in chunk if cve.get('CVE')]
-                logging.info(f"  - 3단계 {i}/{len(cve_chunks)}번째 묶음 처리 완료. (대상: {len(chunk_cve_ids)}개)")
+        logging.info(Color.info(f"  - AI를 통해 {len(final_vulnerabilities)}개 CVE 요약 생성 중...")) # noqa: E501
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_cve = {executor.submit(self._summarize_cve_with_ai, cve): cve for cve in final_vulnerabilities}
+            for future in as_completed(future_to_cve):
+                cve = future_to_cve[future]
                 try:
-                    # AI는 이 청크에서 중요하다고 판단한 CVE ID 목록을 반환
-                    selected_cve_ids = future.result() # AI 서버 응답
-                    # [BUG FIX] AI 서버가 None을 반환할 경우 'NoneType' is not iterable 오류가 발생하므로,
-                    # 이 경우 경고를 기록하고 빈 리스트로 처리하여 안정성을 높입니다.
-                    if selected_cve_ids is None:
-                        logging.warning(f"    -> AI 서버로부터 None 응답을 수신하여 이 묶음의 분석을 건너뜁니다. (대상: {chunk_cve_ids})")
-                        selected_cve_ids = []
-
-                    if isinstance(selected_cve_ids, list):
-                        logging.info(f"    -> AI가 {len(selected_cve_ids)}개 선정: {', '.join(selected_cve_ids[:5])}...")
-                        preliminary_candidates_ids.update(selected_cve_ids)
-                    else:
-                        # [안정성 강화] AI 응답이 예상과 다른 형식일 경우를 대비한 처리
-                        error_details = str(selected_cve_ids)
-                        raw_text = str(selected_cve_ids)
-                        extracted_cves = re.findall(r'CVE-\d{4}-\d{4,}', raw_text)
-                        if extracted_cves:
-                            logging.warning(f"    -> AI 응답이 리스트가 아니었지만, 텍스트에서 {len(extracted_cves)}개의 CVE 목록을 추출했습니다.")
-                            preliminary_candidates_ids.update(extracted_cves)
-                        else:
-                            logging.warning(f"    -> AI 응답이 예상과 다름 (리스트가 아님): {error_details[:250]}...")
+                    cve['description'] = future.result()
                 except Exception as e:
-                    logging.error(f"    -> 3단계 묶음 분석 중 오류 발생: {e}")
-
-        # 중복 제거 (다른 청크에서 동일 CVE가 선택될 수 있음)
-        preliminary_finalists_ids = sorted(list(preliminary_candidates_ids))[:30]
-        preliminary_finalists = [cve for cve in cves_after_2nd_filter if cve.get('CVE') in preliminary_finalists_ids]
-        # AI가 30개를 초과하여 선정할 경우를 대비하여 30개로 제한
-        logging.info(f"  - 3단계 분석 완료. 총 {len(preliminary_finalists)}개의 최종 후보가 선정되었습니다.")
-
-        if not preliminary_finalists:
-            logging.warning(Color.warn("  - AI가 시스템에 영향을 미칠 가능성이 있는 CVE를 찾지 못했습니다."))
-            return []
-
-        # --- 4단계: 최종 CVE 선정 (시스템 연관성 고려) ---
-        logging.info(Color.info("\n--- 4단계: 최종 CVE 선정 (시스템 연관성 고려) ---"))
-        logging.info(f"  - {len(preliminary_finalists)}개 후보를 대상으로 시스템 연관성 분석 및 최종 순위 선정...")
-        installed_package_full_names = {f"{pkg['name']}-{pkg['version']}" for pkg in installed_packages} # type: ignore
+                    logging.error(f"    -> {cve['cve_id']} 요약 생성 중 오류: {e}") # noqa: E501
+                    cve['description'] = "AI 요약 생성에 실패했습니다."
         
-        # 3단계에서 선정된 30개 CVE를 대상으로 시스템 연관성 분석
-        final_cves_with_analysis = self._final_cve_analysis(preliminary_finalists, installed_package_full_names, metadata) # type: ignore
+        logging.info(Color.success("\n보안 권고 분석 완료."))
+        return final_vulnerabilities
 
-        # AI 분석 결과와 원본 CVE 상세 정보를 병합
-        logging.info(f"  - 4단계 AI 분석 완료. {len(final_cves_with_analysis)}개의 CVE에 대한 최종 분석 및 순위 선정 완료.")
-        cve_details_map = {cve['CVE']: cve for cve in cves_with_details if 'CVE' in cve}
-        enriched_final_cves = [
-            {**cve_details_map.get(cve.get('cve_id'), {}), **cve}
-            for cve in final_cves_with_analysis
-        ]
+    def _summarize_cve_with_ai(self, cve_data: Dict) -> str:
+        """AI를 호출하여 CVE 요약을 한국어로 생성합니다."""
+        prompt = f"""[시스템 역할]
+당신은 보안 전문가입니다. 다음 CVE 요약 정보를 바탕으로, 핵심 위협 내용을 간결한 한국어 한 문장으로 요약하여 JSON 형식으로 반환해 주세요.
 
-        # 최종 리포트에 포함할 CVE 목록 (시스템에 실제 영향을 주는 것)
-        final_report_cves = []
-        installed_package_names = {pkg['name'] for pkg in installed_packages} # type: ignore
+[CVE 요약 정보]
+{cve_data.get('description', '')}
 
-        for cve in enriched_final_cves: # AI가 우선순위로 정렬한 목록
-            # AI가 분석한 패키지 이름
-            ai_package_name = cve.get('package')
-            if ai_package_name and ai_package_name in installed_package_names:
-                final_report_cves.append(cve)
+[출력 형식]
+반드시 다음의 키를 가진 단일 JSON 객체로만 응답하십시오. 다른 설명은 절대 추가하지 마세요.
+{{ "concise_summary": "<여기에 한국어 요약 작성>" }}"""
+        response = self._make_request('cve/analyze', {"prompt": prompt, "model_selector": "fast_model"})
+        # [BUG FIX] AI 서버가 JSON 객체 또는 순수 텍스트로 응답하는 모든 경우를 처리합니다.
+        if isinstance(response, dict):
+            # 서버가 JSON을 반환한 경우
+            summary = response.get('concise_summary', response.get('raw_response', str(response)))
+        elif isinstance(response, str):
+            # 서버가 순수 텍스트를 반환한 경우
+            summary = response
+        else:
+            summary = "AI 요약 처리 중 알 수 없는 오류가 발생했습니다."
 
-        # 최종 정렬 (심각도, CVSS 점수 순) 및 상위 20개 반환
-        logging.info(f"  - 시스템에 설치된 패키지와의 연관성 필터링 후 {len(final_report_cves)}개의 CVE가 최종 후보로 선정되었습니다.")
-        final_report_cves.sort(key=lambda x: (x.get('severity') == 'critical', self._safe_float(x.get('cvss_score', 0.0))), reverse=True)
-        logging.info(Color.success(f"\nAI 종합 분석 완료. 최종 {len(final_report_cves[:20])}개의 시스템 관련 긴급 보안 위협을 선정했습니다."))
-        return final_report_cves[:20]
-    
+        # '한국어 요약:' 접두사가 포함된 경우, 해당 부분을 제거하고 순수 요약만 반환합니다.
+        return summary.split('한국어 요약:')[-1].strip()
+
     def _add_installed_version_to_advisories(self, advisories: List[Dict], installed_packages: List[Dict]) -> List[Dict]:
         """[수정] AI가 선정한 보안 권고 목록에 실제 설치된 패키지 버전 정보를 추가합니다."""
         # 패키지 이름으로 버전을 빠르게 찾기 위한 맵 생성
@@ -2035,168 +2052,15 @@ class AIAnalyzer:
         package_version_map = {pkg['name']: pkg['version'] for pkg in installed_packages}
 
         for advisory in advisories:
-            package_name = advisory.get('package')
-            if package_name and package_name in package_version_map:
-                # 'installed_version' 키에 설치된 버전 정보 추가
-                advisory['installed_version'] = package_version_map[package_name]
+            pkg_name = advisory.get('package')
+            if pkg_name and pkg_name in package_version_map:
+                # [BUG FIX] HTML 템플릿과의 호환성을 위해 전체 패키지 문자열을 생성합니다.
+                installed_version_str = package_version_map[pkg_name]
+                fix_version_str = advisory.get('fix_version', 'N/A')
+                advisory['installed_version'] = f"{pkg_name}-{installed_version_str}"
+                advisory['fix_version'] = f"{pkg_name}-{fix_version_str}"
         
         return advisories
-
-
-    def _preliminary_cve_analysis(self, cve_chunk: List[Dict], is_reasoning: bool = False) -> List[str]:
-        """[수정] 2단계/3단계 분석을 위한 프롬프트를 생성하고 AI를 호출합니다."""
-        # AI에게 전달할 데이터 형식에 맞게 입력 데이터를 가공합니다.
-        cves_for_prompt = []
-        for cve in cve_chunk:
-            # [BUG FIX] cve 객체가 None인 경우를 처리하여 TypeError를 방지합니다.
-            if not cve:
-                logging.warning("None 타입의 CVE 데이터가 감지되어 건너뜁니다.")
-                continue
-
-            # [BUG FIX] security.py의 안정적인 프롬프트 생성 로직을 적용하여 AI 분석 정확도를 높입니다.
-            # CVE 요약, CVSS 벡터, 영향받는 패키지 등 AI가 중요도를 판단하는 데 필수적인 정보를 추가합니다.
-            cvss_score = (cve.get('cvss3', {}) or {}).get('cvss3_base_score') or cve.get('cvss3_score') or 'N/A'
-            cvss_vector = (cve.get('cvss3', {}) or {}).get('cvss3_vector') or 'N/A'
-            summary = " ".join(cve.get('details', [])) or cve.get('statement', '')
-
-            # [BUG FIX] 'package_state'가 None인 경우 빈 리스트로 대체하여 'NoneType not iterable' 오류 방지
-            package_state = cve.get('package_state') or []
-            if 'package_state' in cve and cve['package_state'] is None:
-                logging.debug(f"CVE {cve.get('CVE', 'N/A')}의 'package_state'가 None입니다. 빈 리스트로 대체합니다.")
-
-            affected_packages = list(set(re.match(r'([^-\s]+)', p.get('package_name', '')).group(1) for p in package_state if p.get('fix_state') == 'Affected' and re.match(r'([^-\s]+)', p.get('package_name', ''))))
-
-            cves_for_prompt.append({
-                "cve_id": cve.get('CVE', 'N/A'),
-                "severity": cve.get('threat_severity', 'N/A'),
-                "cvss_score": cvss_score,
-                "cvss_vector": cvss_vector,
-                "summary": summary,
-                "affected_packages": affected_packages
-            })
-
-        model_selector = "reasoning-model" if is_reasoning else "fast-model"
-        task_description = "가장 중요하고 시급하다고 판단되는 CVE의 ID 목록" if is_reasoning else "CVSS 점수, 심각도를 고려하여 관련성이 높은 CVE의 ID 목록"
-        limit_rule = "- **패키지별 대표 선정:** 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중 가장 위험한 **단 하나의 CVE만** 대표로 선정해야 합니다." if is_reasoning else ""
-
-        prompt = f"""[시스템 역할]
-당신은 Red Hat Enterprise Linux(RHEL) 시스템의 보안을 책임지는 최고 수준의 사이버 보안 분석가입니다.
-
-[임무]
-아래에 제공된 CVE 목록 중에서, {task_description}을 반환하십시오.
-
-[제한 조건]
-{limit_rule}
-
-[입력 데이터: CVE 목록]
-```json
-{json.dumps(cves_for_prompt, indent=2, ensure_ascii=False, default=str)}
-```
-
-[출력 형식]
-**가장 중요한 순서대로 CVE ID 문자열을 포함하는 JSON 배열 하나만 출력하십시오.** 다른 설명은 절대 추가하지 마세요.
-```json
-["CVE-XXXX-YYYY", "CVE-AAAA-BBBB", "CVE-CCCC-DDDD"]
-```"""
-        response = self._make_request('cve/analyze', {"prompt": prompt})
-        # AI 응답이 JSON 배열이 아닐 경우를 대비하여 안전하게 처리
-
-        # [BUG FIX] AI가 JSON 객체(dict)로 응답하는 경우, 'raw_response'나 다른 키에서 CVE 목록을 추출하도록 수정합니다.
-        if isinstance(response, list): # 가장 이상적인 경우
-            return response
-        elif isinstance(response, dict):
-            # 1. 'selected_cves' 키 확인 (기존 호환성)
-            if 'selected_cves' in response and isinstance(response['selected_cves'], list):
-                return response['selected_cves']
-            # 2. 'raw_response' 키에서 정규식으로 CVE ID 추출 (가장 안정적인 폴백)
-            raw_text = response.get('raw_response', str(response))
-            extracted_cves = re.findall(r'CVE-\d{4}-\d{4,}', raw_text)
-            if extracted_cves:
-                logging.warning(f"AI 응답이 리스트가 아니었지만, 텍스트에서 {len(extracted_cves)}개의 CVE 목록을 추출했습니다.")
-                return extracted_cves
-        
-        logging.warning(f"AI 예선 분석에서 유효한 CVE 목록을 추출하지 못했습니다. 응답: {str(response)[:200]}")
-        return []
-
-    def _create_final_analysis_prompt_for_chunk(self, cve_chunk: List[Dict], installed_package_full_names: set, metadata: Dict) -> str:
-        """[신규] 최종 분석을 위한 프롬프트를 청크 단위로 생성합니다."""
-        cves_for_prompt = [
-            {
-                "cve_id": cve.get('CVE', 'N/A'),
-                "severity": cve.get('threat_severity', 'N/A'),
-                "cvss_score": (cve.get('cvss3', {}) or {}).get('cvss3_base_score') or cve.get('cvss3_score') or 'N/A',
-                "package_state": cve.get('package_state', [])
-            } for cve in cve_chunk
-        ]
-
-        return f"""[시스템 역할]
-당신은 Red Hat Enterprise Linux의 보안 전문가입니다. 주어진 CVE 목록과 시스템에 설치된 패키지 정보를 바탕으로, **현재 시스템에 가장 시급하게 패치가 필요한 보안 위협**을 분석하고 선정해야 합니다.
-
-[분석 가이드라인]
-1.  **외부 위협 인텔리전스 수집 (Web Search)**: 각 CVE에 대해 웹 검색을 수행하여 다음 정보를 수집합니다.
-    *   **CISA KEV (Known Exploited Vulnerabilities) 등재 여부 (매우 중요)**
-    *   **PoC (Proof-of-Concept) 코드 공개 여부** (예: Exploit-DB, GitHub)
-    *   **EPSS (Exploit Prediction Scoring System) 점수 및 백분위**
-2.  **긴급도 및 우선순위 평가**: CVSS 점수뿐만 아니라, 위에서 수집한 외부 위협 인텔리전스를 종합적으로 고려하여 가장 시급하게 패치해야 할 위협의 우선순위를 정합니다. (CISA KEV 등재 > PoC 공개 > 높은 EPSS 점수 > 높은 CVSS 점수 순으로 중요)
-3.  **패키지별 대표 선정 (매우 중요)**: 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중에서 가장 위험하고 시급한 **단 하나의 CVE만** 대표로 선정해야 합니다.
-4.  **상세 분석 및 결과 포맷팅**: 분석 결과를 바탕으로, 각 위협에 대해 아래 '출력 형식'에 맞는 JSON 객체로 결과를 정리합니다.
-    *   `threat_tags`: "RCE", "Privilege Escalation" 등 위협 유형을 식별합니다. CISA KEV에 등재되었다면 **반드시 "Exploited in wild" 태그를 포함**해야 합니다.
-    *   `description`: 비전문가도 이해할 수 있도록 1~2 문장의 간결한 한국어 요약이어야 합니다.
-    *   `selection_reason`: **웹 검색으로 찾은 CISA KEV, PoC, EPSS 정보를 핵심 근거로** 사용하여, 왜 이 CVE가 다른 CVE들보다 우선적으로 처리되어야 하는지 구체적인 이유를 한국어로 설명합니다.
-
-[입력 데이터]
-- **시스템 정보:**
-  - OS Version: {metadata.get('system_info', {}).get('os_release', 'N/A')}
-  - Kernel: {metadata.get('system_info', {}).get('kernel', 'N/A')}
-  - 설치된 패키지 목록 (일부): {json.dumps(list(installed_package_full_names)[:10], indent=2, ensure_ascii=False, default=str)}
-- **분석 대상 CVE 후보 목록:**
-```json
-{json.dumps(cves_for_prompt, indent=2, ensure_ascii=False, default=str)}
-```
-
-[출력 형식]
-분석 결과를 다음의 키를 가진 단일 JSON 객체로만 반환하십시오. **객체의 최상위 키는 "security_advisories" 이어야 하며, 값은 우선순위에 따라 정렬된 CVE 정보의 배열이어야 합니다.** 다른 설명은 절대 추가하지 마세요.
-```json
-{{
-  "security_advisories": [ // 시스템에 실제 영향을 주는 CVE만 포함
-    {{ "cve_id": "<CVE-ID>", "severity": "<심각/중요>", "package": "<영향받는 패키지명>", "description": "<취약점에 대한 간결한 한국어 요약>" }}
-  ]
-}}```"""
-        logging.debug(f"AI Security Analysis Prompt:\n{prompt}")
-
-        response = self._make_request('cve/analyze', {"prompt": prompt})
-        logging.debug(f"AI Security Analysis Response:\n{json.dumps(response, indent=2, ensure_ascii=False)}")
-        advisories = response.get('security_advisories', []) or []
-        return advisories
-
-    def _final_cve_analysis(self, cve_candidates: List[Dict], installed_package_full_names: set, metadata: Dict) -> List[Dict]:
-        """[신규] 4단계 최종 분석을 병렬 청크 방식으로 수행합니다."""
-        final_advisories = []
-        
-        # 1. 후보 CVE를 5개씩 묶음(chunk)으로 나눕니다.
-        CHUNK_SIZE = 5
-        cve_chunks = [cve_candidates[i:i + CHUNK_SIZE] for i in range(0, len(cve_candidates), CHUNK_SIZE)]
-
-        # 2. ThreadPoolExecutor를 사용하여 각 묶음을 병렬로 분석합니다.
-        with ThreadPoolExecutor(max_workers=6, thread_name_prefix='FinalCVE_Analyzer') as executor:
-            # 각 청크에 대한 분석 작업을 제출합니다.
-            future_to_chunk = {
-                executor.submit(self._create_final_analysis_prompt_for_chunk, chunk, installed_package_full_names, metadata): chunk
-                for chunk in cve_chunks
-            }
-
-            for i, future in enumerate(as_completed(future_to_chunk), 1):
-                chunk_cve_ids = [cve.get('CVE', 'N/A') for cve in future_to_chunk[future]]
-                logging.info(f"  - 4단계 {i}/{len(cve_chunks)}번째 묶음 분석 완료. (대상: {len(chunk_cve_ids)}개)")
-                try:
-                    # 각 청크의 분석 결과를 최종 목록에 추가합니다.
-                    chunk_advisories = future.result()
-                    if chunk_advisories:
-                        final_advisories.extend(chunk_advisories)
-                except Exception as e:
-                    logging.error(f"    -> 4단계 묶음 분석 중 오류 발생: {e}")
-
-        return final_advisories
 
 def _initialize_matplotlib_font():
     """
@@ -2237,6 +2101,31 @@ def main(args: argparse.Namespace):
         sys.exit(1)
 
     log_step(f"'{tar_path.name}' 분석 시작")
+
+    # [사용자 요청] 실행 로그를 파일로 저장하기 위한 로거 설정
+    # 임시 경로에서 hostname을 먼저 파싱하여 로그 파일명을 결정합니다.
+    temp_extract_path = Path(tempfile.mkdtemp(prefix="sos-temp-"))
+    try:
+        hostname = "unknown"
+        with tarfile.open(args.tar_path, 'r:*') as tar:
+            # [BUG FIX] sosreport-HOSTNAME-DATE/hostname 과 같은 경로를 정확히 찾기 위해 로직을 수정합니다.
+            # 1. 아카이브의 최상위 디렉토리 이름을 먼저 찾습니다.
+            top_level_dirs = {Path(m.name).parts[0] for m in tar.getmembers() if m.isdir()}
+            if top_level_dirs:
+                base_dir = list(top_level_dirs)[0]
+                hostname_path_in_tar = f"{base_dir}/hostname"
+                
+                # 2. 'sosreport-HOSTNAME-DATE/hostname' 경로의 파일을 직접 추출합니다.
+                try:
+                    hostname_member = tar.getmember(hostname_path_in_tar)
+                    hostname_file = tar.extractfile(hostname_member)
+                    if hostname_file:
+                        hostname = hostname_file.read().decode('utf-8').strip()
+                except KeyError:
+                    logging.warning(f"'{hostname_path_in_tar}' 파일을 tar 아카이브에서 찾을 수 없습니다.")
+    finally:
+        shutil.rmtree(temp_extract_path, ignore_errors=True)
+
     extract_path = Path(tempfile.mkdtemp(prefix="sos-"))
     logging.info(Color.info(f"임시 디렉터리 생성: {extract_path}"))
     try:
@@ -2244,11 +2133,22 @@ def main(args: argparse.Namespace):
         with tarfile.open(args.tar_path, 'r:*') as tar: tar.extractall(path=extract_path)
         logging.info(Color.success("압축 해제 완료."))
 
+        # 로그 파일 핸들러 추가
+        output_dir = Path(args.output)
+        output_dir.mkdir(exist_ok=True)
+        log_file_path = output_dir / f"report-{hostname}.log"
+        
+        root_logger = logging.getLogger()
+        # [BUG FIX] 기존 핸들러를 유지하고 파일 핸들러를 추가하여 콘솔과 파일에 모두 로깅
+        file_handler = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        root_logger.addHandler(file_handler)
+        logging.info(f"실행 로그를 '{log_file_path}' 파일에 저장합니다.")
+
         parser = SosreportParser(extract_path)
         logging.info("[STEP] PARSING: Sosreport 파서 초기화 완료. 데이터 파싱을 시작합니다.")
         metadata, sar_data = parser.parse_all()
         
-        output_dir = Path(args.output); output_dir.mkdir(exist_ok=True)
         hostname = metadata.get('system_info', {}).get('hostname', 'unknown')
 
         # [사용자 요청] AI 분석 전 metadata.json 파일을 먼저 저장합니다.
@@ -2271,7 +2171,7 @@ def main(args: argparse.Namespace):
         log_step("2단계: 병렬 AI 분석 (시스템 & 보안)")
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix='AI_Analysis') as executor:
             future_ai = executor.submit(ai_analyzer.get_structured_analysis, metadata_path, sar_data_path, args.anonymize)
-            future_sec = executor.submit(ai_analyzer.fetch_security_news, metadata, output_dir)
+            future_sec = executor.submit(ai_analyzer.analyze_security_advisories, metadata) # 새 로직으로 호출
             
             structured_analysis = future_ai.result()
             security_advisories = future_sec.result() # type: ignore
@@ -2298,7 +2198,10 @@ def main(args: argparse.Namespace):
 
         logging.info("[STEP] GENERATING_REPORT: 최종 보고서 생성을 시작합니다.")
         log_step("5단계: 최종 보고서 생성")
-        reporter = HTMLReportGenerator(metadata, sar_data, structured_analysis, hostname, parser.report_date, parser.device_map)
+        # [BUG FIX] AI 분석 결과가 리포트에 누락되는 문제를 해결합니다.
+        # HTMLReportGenerator 생성자에 AI 분석 결과인 structured_analysis를
+        # ai_analysis 인자로 정확하게 전달하도록 수정합니다.
+        reporter = HTMLReportGenerator(metadata=metadata, sar_data=sar_data, ai_analysis=structured_analysis, hostname=hostname, report_date=parser.report_date, device_map=parser.device_map)
         
         # [사용자 요청] 그래프 생성 시, 저장된 sar_data.json 파일을 다시 읽어 사용합니다.
         logging.info(f"  - 그래프 생성을 위해 '{sar_data_path.name}' 파일 로딩 중...")

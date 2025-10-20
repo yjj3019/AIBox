@@ -882,16 +882,20 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
     # [사용자 요청 수정] AI 분석이 하나라도 성공했다면, AI의 결과를 최종 결과로 사용합니다.
     # AI 분석이 완전히 실패했을 경우에만 점수 기반 폴백 분석을 수행합니다.
     if not analyzed_cves and finalists:
-        logging.warning("AI 분석이 완전히 실패했습니다. 점수 기반 폴백 분석을 수행합니다.")
+        logging.warning("AI 분석이 완전히 실패했습니다. 점수 기반 폴백 분석(수동 분석)을 수행합니다.")
         analyzed_cves = analyze_and_prioritize_manual(finalists)
     else:
         # AI가 일부만 분석한 경우, 분석되지 않은 나머지는 버리고 AI의 결과만 사용합니다.
         analyzed_cve_ids_from_llm = {cve.get('cve_id') for cve in analyzed_cves if cve.get('cve_id')}
         unalyzed_cves = [cve for cve in finalists if cve.get('CVE') not in analyzed_cve_ids_from_llm]
         if unalyzed_cves:
-            logging.warning(f"AI가 분석하지 않은 {len(unalyzed_cves)}개의 CVE에 대해 점수 기반 폴백 분석 및 번역을 수행합니다.")
+            logging.warning(f"AI가 분석하지 않은 {len(unalyzed_cves)}개의 CVE에 대해 점수 기반 폴백 분석(수동 분석) 및 번역을 수행합니다.")
             # [사용자 요청] AI가 분석하지 않은 CVE에 대해 수동 분석(번역 포함)을 수행하고 결과를 병합합니다.
             fallback_analyzed_cves = analyze_and_prioritize_manual(unalyzed_cves)
+            # [핵심 수정] AI가 선정한 CVE가 항상 우선순위를 갖도록, 수동 분석 결과를 AI 분석 결과 뒤에 추가합니다.
+            # 이렇게 하면 AI가 선정한 목록이 먼저 처리되고, 수동 분석 목록은 보충하는 역할을 합니다.
+            # 기존 extend는 순서를 보장하지 않으므로, AI 선정 목록을 먼저 final_cves에 넣고,
+            # 수동 분석 목록은 그 후에 추가하는 방식으로 변경합니다.
             analyzed_cves.extend(fallback_analyzed_cves)
         
 
@@ -903,10 +907,12 @@ def analyze_and_prioritize_with_llm(cves: list) -> list:
     final_cves = []
     seen_packages = set()
 
-    # 2. AI가 우선순위로 정렬한 목록과 폴백 목록을 합쳐 전체 후보군을 만듭니다.
-    # [수정] AI 분석 결과와 폴백 분석 결과를 합치고, AI가 정한 순서를 최대한 유지하면서 점수 기반으로 재정렬합니다.
+    # 2. AI가 우선순위로 정렬한 목록과 폴백 목록을 합쳐 전체 후보군을 만듭니다. 
+    # [수정] AI가 분석한 CVE가 항상 상위에 오도록, AI 분석 결과를 먼저 처리하고 그 다음에 폴백/수동 분석 결과를 처리합니다.
+    # 기존에는 단순히 두 리스트를 합친 후 점수 기반으로 재정렬하여 AI의 선정 순위가 무시될 수 있었습니다.
     full_candidate_list = analyzed_cves + fallback_cves
-    full_candidate_list.sort(key=lambda x: x.get('priority_score', 0), reverse=True)
+    # AI가 분석한 결과는 이미 우선순위가 정해져 있으므로, 전체 리스트를 점수 기반으로 다시 정렬하지 않습니다.
+    # full_candidate_list.sort(key=lambda x: x.get('priority_score', 0), reverse=True) # 이 라인을 제거하여 AI의 순서를 유지합니다.
 
     for cve in full_candidate_list:
         # 최종 목록이 꽉 차면 중단합니다.
@@ -1074,10 +1080,10 @@ def generate_executive_summary(top_cves):
     # [BUG FIX] 분석된 CVE가 없을 경우, LLM 호출을 건너뛰고 기본 메시지를 반환합니다.
     # 이는 LLM이 빈 데이터로 인해 500 오류를 반환하는 것을 방지합니다.
     if not top_cves:
-        logging.info("\nNo CVEs to analyze for Executive Summary. Skipping LLM call.")
+        logging.info("No CVEs to analyze for Executive Summary. Skipping LLM call.")
         return "분석 기간 내에 보고된 주요 보안 위협이 발견되지 않았습니다. 시스템은 현재 알려진 주요 취약점으로부터 안전한 것으로 보입니다."
 
-    logging.info(f"\n{Color.header('Step 7: CISO 요약 보고서(Executive Summary) 생성 요청')}...\n")
+    logging.info(f"\n{Color.header('Step 7: CISO 요약 보고서(Executive Summary) 생성 요청')}...")
     
     summary_data = [
         {
@@ -1135,25 +1141,35 @@ Executive Summary 텍스트를 여기에 작성하십시오. (HTML 태그 없이
     # 내부 통신이므로 프록시 비활성화
     response = make_request('post', api_url, use_proxy=False, json=payload, timeout=300)
 
+    # [BUG FIX] orjson 사용 여부에 따라 올바른 JSON 디코딩 예외를 동적으로 처리합니다.
+    json_decode_errors = (_json_lib_std.JSONDecodeError,)
+    if _JSON_LIB == "orjson":
+        json_decode_errors += (orjson.JSONDecodeError,)
+
     if response:
         # [사용자 요청] AI 서버 응답이 JSON이거나 순수 텍스트(raw)인 모든 경우를 처리합니다.
         try:
-            summary_json = response.json()
-            # 1. JSON 응답 처리: 여러 가능한 키를 확인하여 요약 텍스트를 추출합니다.
-            possible_keys = ['raw_response', 'executive_summary', 'analysis_text', 'analysis_report']
-            summary_text = next((summary_json.get(key) for key in possible_keys if summary_json.get(key)), None)
-            if summary_text:
-                logging.info("Successfully extracted summary text from AI server's JSON response.")
+            # [BUG FIX] orjson 사용 여부에 따라 올바른 JSON 라이브러리를 사용하여 파싱합니다.
+            summary_json = loads(response.content)
+            # [BUG FIX] AI가 JSON 문자열을 반환하는 경우를 처리합니다.
+            if isinstance(summary_json, str):
+                summary_text = summary_json
             else:
-                # 1-1. JSON 응답에 요약 키는 없지만 'error' 키가 있는 경우
-                if 'error' in summary_json:
-                    error_details = summary_json.get('details', summary_json['error'])
-                    logging.error(f"AI 요약 생성 실패: {summary_json['error']} - Details: {error_details}")
-                    return f"### AI 요약 생성 실패\n\nAI 서버로부터 다음 오류를 수신했습니다:\n- {error_details}"
-                logging.warning(f"AI 서버가 예상치 못한 JSON 응답을 반환했습니다: {summary_json}")
-                # 1-2. 요약 키도, 오류 키도 없는 비정상적인 JSON 응답
-                return f"### AI 요약 처리 실패\n\nAI 서버로부터 예상치 못한 형식의 JSON 응답을 수신했습니다:\n```json\n{dumps_json(summary_json, indent=True)}\n```"
-        except (_json_lib_std.JSONDecodeError, orjson.JSONDecodeError):
+                # 1. JSON 객체 응답 처리: 여러 가능한 키를 확인하여 요약 텍스트를 추출합니다.
+                possible_keys = ['raw_response', 'executive_summary', 'analysis_text', 'analysis_report']
+                summary_text = next((summary_json.get(key) for key in possible_keys if summary_json.get(key)), None)
+                if summary_text:
+                    logging.info("Successfully extracted summary text from AI server's JSON response.")
+                else:
+                    # 1-1. JSON 응답에 요약 키는 없지만 'error' 키가 있는 경우
+                    if 'error' in summary_json:
+                        error_details = summary_json.get('details', summary_json['error'])
+                        logging.error(f"AI 요약 생성 실패: {summary_json['error']} - Details: {error_details}")
+                        return f"### AI 요약 생성 실패\n\nAI 서버로부터 다음 오류를 수신했습니다:\n- {error_details}"
+                    logging.warning(f"AI 서버가 예상치 못한 JSON 응답을 반환했습니다: {summary_json}")
+                    # 1-2. 요약 키도, 오류 키도 없는 비정상적인 JSON 응답
+                    return f"### AI 요약 처리 실패\n\nAI 서버로부터 예상치 못한 형식의 JSON 응답을 수신했습니다:\n```json\n{dumps_json(summary_json, indent=True)}\n```"
+        except json_decode_errors:
             # 2. 순수 텍스트(Raw) 응답 처리: JSON 파싱에 실패하면 응답을 일반 텍스트로 간주합니다.
             logging.warning("AI server response was not JSON. Processing as plain text.")
             summary_text = response.text.strip()

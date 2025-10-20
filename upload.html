@@ -130,21 +130,21 @@
         #delete-all-btn:hover { background-color: var(--error-color); color: white; }
         
         .report-list ul { list-style: none; padding: 0; margin: 0; }
-        /* [사용자 요청] 리포트 목록을 테이블 형식으로 변경 */
+        /* [디자인 개선] 리포트 목록을 테이블 형식으로 변경하여 가독성 향상 */
         .report-table { width: 100%; border-collapse: collapse; }
         .report-table th, .report-table td {
             padding: 12px 16px;
             text-align: left;
             border-bottom: 1px solid var(--border-color);
         }
-        .report-table th { font-weight: 600; font-size: 0.9rem; color: var(--secondary-text-color); }
+        .report-table th { font-weight: 600; font-size: 0.85rem; color: var(--secondary-text-color); text-transform: uppercase; letter-spacing: 0.5px; }
         .report-table tbody tr:hover { background-color: #f5f8ff; }
         .report-table a {
             text-decoration: none; color: var(--text-color); font-weight: 500;
             display: flex; align-items: center; gap: 10px;
         }
         .report-table a:hover { color: var(--primary-color); }
-        .report-table .file-icon { color: var(--primary-color); }
+        .report-table .file-icon { color: var(--primary-color); flex-shrink: 0; }
         .report-table .report-meta { font-size: 0.85rem; color: var(--secondary-text-color); }
         .report-table .actions { text-align: right; }
 
@@ -155,6 +155,19 @@
         .delete-btn:hover { background-color: #ffeded; color: var(--error-color); }
     </style>
 </head>
+<body>
+    <!-- [보안 강화] 비밀번호 입력을 위한 모달 창 추가 -->
+    <div id="password-modal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; background-color:rgba(0,0,0,0.5); justify-content:center; align-items:center;">
+        <div style="background:white; padding:2rem; border-radius:8px; box-shadow:0 5px 15px rgba(0,0,0,0.3); width:350px;">
+            <h3 style="margin-top:0;">관리자 비밀번호 확인</h3>
+            <p style="color:#666; font-size:0.9rem;">모든 리포트를 삭제하려면 비밀번호를 입력하세요.</p>
+            <input type="password" id="password-input-modal" style="width:100%; padding:10px; margin:1rem 0; border:1px solid #ccc; border-radius:4px;">
+            <div style="display:flex; justify-content:flex-end; gap:1rem;">
+                <button id="cancel-delete-btn" class="btn" style="background: var(--secondary-text-color); width: auto; margin-top: 0;">취소</button>
+                <button id="confirm-delete-btn" class="btn" style="background: var(--error-color); width: auto; margin-top: 0;">삭제 확인</button>
+            </div>
+        </div>
+    </div>
 <body>
     <header>
         <h1>AIBox SOSReport 분석</h1>
@@ -246,7 +259,7 @@
                 <button id="delete-all-btn" onclick="deleteAllReports()">전체 삭제</button>
             </div>
             <div class="report-list" id="report-list">
-                <!-- [사용자 요청] 리포트 목록을 테이블로 변경 -->
+                <!-- [디자인 개선] 리포트 목록을 테이블로 변경 -->
                 <table class="report-table">
                     <thead>
                         <tr><th>리포트 이름</th><th>생성 시각</th><th>소요 시간</th><th class="actions">작업</th></tr>
@@ -273,6 +286,11 @@
         const modelNameEl = document.getElementById('model-name');
         const timerDisplay = document.getElementById('timer-display');
         const analysisStepper = document.getElementById('analysis-stepper');
+        // [보안 강화] 비밀번호 모달 관련 DOM 요소 추가
+        const passwordModal = document.getElementById('password-modal');
+        const passwordInputModal = document.getElementById('password-input-modal');
+        const confirmDeleteBtn = document.getElementById('confirm-delete-btn');
+        const cancelDeleteBtn = document.getElementById('cancel-delete-btn');
 
         // [개선] 상태 값들을 상수로 관리하여 코드 가독성 및 유지보수성 향상
         const STATUS = {
@@ -547,10 +565,25 @@
             } catch (error) { alert(`리포트 삭제 오류: ${error.message}`); }
         }
         
+        // [보안 강화] '전체 삭제' 함수를 모달을 사용하도록 수정
         async function deleteAllReports() {
-            if (!confirm('생성된 모든 리포트와 분석 데이터(.json)를 정말 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.')) return;
-            const password = prompt("관리자 비밀번호를 입력하세요:");
-            if (password === null) return; // 사용자가 '취소'를 누른 경우
+            if (confirm('생성된 모든 리포트와 분석 데이터(.json)를 정말 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.')) {
+                passwordModal.style.display = 'flex';
+                passwordInputModal.focus();
+            }
+        }
+
+        // [보안 강화] 모달의 '삭제 확인' 버튼 클릭 이벤트 처리
+        confirmDeleteBtn.addEventListener('click', async () => {
+            const password = passwordInputModal.value;
+            if (!password) {
+                alert('비밀번호를 입력해주세요.');
+                return;
+            }
+
+            passwordModal.style.display = 'none';
+            passwordInputModal.value = '';
+
             try {
                 const response = await fetch(`${API_BASE_PATH}/api/reports/all`, {
                     method: 'DELETE',
@@ -558,10 +591,17 @@
                     body: JSON.stringify({ password: password })
                 });
                 const result = await response.json();
-                if (!response.ok) { throw new Error(result.error || '전체 삭제 실패'); }
+                if (!response.ok) throw new Error(result.error || '전체 삭제 실패');
+                alert('모든 리포트가 성공적으로 삭제되었습니다.');
                 fetchReports();
             } catch (error) { alert(`전체 삭제 오류: ${error.message}`); }
-        }
+        });
+
+        // [보안 강화] 모달의 '취소' 버튼 클릭 이벤트 처리
+        cancelDeleteBtn.addEventListener('click', () => {
+            passwordModal.style.display = 'none';
+            passwordInputModal.value = '';
+        });
 
         async function checkServerStatus() {
             try {

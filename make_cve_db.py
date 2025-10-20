@@ -33,7 +33,7 @@ LOCAL_CVE_URL = "http://127.0.0.1:5000/AIBox/cve/{cve_id}.json"
 REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
 
 # CVE DB 저장 경로
-CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/meta/cve-check_db.json")
+# CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/meta/cve-check_db.json")
 
 def fetch_cve_data(cve_id):
     """[수정] 재시도 로직이 추가된 CVE 데이터 조회 함수"""
@@ -91,28 +91,32 @@ def extract_cve_info(cve_data):
 def main():
     parser = argparse.ArgumentParser(description="CVE ID 목록을 읽어 CVE 데이터베이스를 생성합니다.")
     parser.add_argument("cve_list_file", type=str, help="CVE ID 목록이 포함된 텍스트 파일 경로")
+    # [요청사항] 출력 파일을 지정하는 옵션 추가
+    parser.add_argument("--output", type=str, default="/data/iso/AIBox/cve-check/meta/cve-check_db.json", help="생성될 CVE 데이터베이스 파일의 경로")
     args = parser.parse_args()
 
     cve_list_path = Path(args.cve_list_file)
     if not cve_list_path.is_file():
         logging.error(Color.error(f"오류: CVE 목록 파일 '{cve_list_path}'를 찾을 수 없습니다."))
         return
+    
+    cve_db_path = Path(args.output)
 
     # 기존 DB가 있으면 로드, 없으면 새로 생성
     cve_database = {}
-    if CVE_DB_PATH.exists():
+    if cve_db_path.exists():
         try:
-            with open(CVE_DB_PATH, 'r', encoding='utf-8') as f:
+            with open(cve_db_path, 'r', encoding='utf-8') as f:
                 cve_database = json.load(f)
         except json.JSONDecodeError:
-            logging.warning(Color.warn(f"경고: 기존 CVE DB 파일 '{CVE_DB_PATH}'이 손상되었거나 비어있습니다. 새 파일을 생성합니다."))
+            logging.warning(Color.warn(f"경고: 기존 CVE DB 파일 '{cve_db_path}'이 손상되었거나 비어있습니다. 새 파일을 생성합니다."))
             cve_database = {}
     
     with open(cve_list_path, 'r') as f:
         cve_ids = [line.strip() for line in f if line.strip()]
 
     # DB 파일 디렉토리 생성
-    CVE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    cve_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # --- [요청사항] 수집 결과 카운터 추가 ---
     success_count = 0
@@ -144,12 +148,12 @@ def main():
             pbar.update(1)
 
     # 업데이트된 DB 저장
-    with open(CVE_DB_PATH, 'w', encoding='utf-8') as f:
+    with open(cve_db_path, 'w', encoding='utf-8') as f:
         json.dump(cve_database, f, indent=2, ensure_ascii=False)
 
     logging.info(Color.success("\nCVE 데이터베이스 생성이 완료되었습니다."))
     logging.info(f"  - 총 저장된 CVE: {len(cve_database)}개")
-    logging.info(f"  - DB 위치: {CVE_DB_PATH}")
+    logging.info(f"  - DB 위치: {cve_db_path}")
 
     # --- [요청사항] 최종 수집 결과 요약 출력 ---
     logging.info(Color.header("\n--- 수집 결과 요약 ---"))

@@ -1,0 +1,159 @@
+# This file defines regular expression patterns for normalizing log messages.
+# It is loaded by sos_analyzer.py to make log patternization more modular.
+# Each item has a name, regex, and placeholder.
+# 'ignorecase: true' can be added to make a regex case-insensitive.
+
+- name: "IPv4 Address and Port"
+  regex: '\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::\d+)?\b'
+  placeholder: '<IP_ADDRESS>'
+  
+- name: "Kernel Timestamp"
+  regex: '\[\s*\d+\.\d+\]'
+  placeholder: '[<KNL_TIMESTAMP>]'
+
+- name: "UUID"
+  regex: '\b([a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12})\b'
+  placeholder: '<UUID>'
+  ignorecase: true
+
+- name: "PID (equals format)"
+  regex: 'pid\s*=\s*\d+'
+  placeholder: 'pid=<PID>'
+
+- name: "PID (bracket format)"
+  regex: '\[\d+\]:'
+  placeholder: '[<PID>]:'
+
+- name: "Standard Timestamp"
+  regex: '(\b[A-Za-z]{3}\s+\d{1,2}\s+)?\d{2}:\d{2}:\d{2}'
+  placeholder: '<TIMESTAMP>'
+
+- name: "ISO 8601 Timestamp"
+  regex: '\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?\b'
+  placeholder: '<ISO_TIMESTAMP>'
+
+- name: "Hex Address"
+  regex: '0x[0-9a-fA-F]+'
+  placeholder: '<HEX_ADDR>'
+
+- name: "Disk Device Name"
+  regex: 'sd[a-z]\d*'
+  placeholder: '<DEVICE>'
+
+- name: "Session ID"
+  regex: 'session\s\d+'
+  placeholder: 'session <SESSION_ID>'
+
+# Pacemaker/Corosync Patterns
+- name: "Pacemaker Pengine PID"
+  regex: 'pengine-[0-9]+'
+  placeholder: 'pengine-<PID>'
+
+- name: "Pacemaker CIB PID"
+  regex: 'cib-[0-9]+'
+  placeholder: 'cib-<PID>'
+
+- name: "Pacemaker CRMD PID"
+  regex: 'crmd-[0-9]+'
+  placeholder: 'crmd-<PID>'
+
+- name: "Pacemaker Schedulerd PID"
+  regex: 'pacemaker-schedulerd\[\d+\]'
+  placeholder: 'pacemaker-schedulerd[<PID>]'
+
+- name: "Pacemaker Controld PID"
+  regex: 'pacemaker-controld\[\d+\]'
+  placeholder: 'pacemaker-controld[<PID>]'
+
+- name: "Pacemaker Execd PID"
+  regex: 'pacemaker-execd\[\d+\]'
+  placeholder: 'pacemaker-execd[<PID>]'
+
+- name: "Pacemaker Stonith PID"
+  regex: 'stonith-ng-[0-9]+'
+  placeholder: 'stonith-ng-<PID>'
+
+- name: "Corosync PID"
+  regex: 'corosync\[\d+\]'
+  placeholder: 'corosync[<PID>]'
+
+- name: "Pacemakerd PID"
+  regex: 'pacemakerd\[\d+\]'
+  placeholder: 'pacemakerd[<PID>]'
+
+- name: "Pacemaker Transition ID"
+  regex: 'transition [0-9]+'
+  placeholder: 'transition <ID>'
+
+# DRBD Patterns
+- name: "DRBD Resource/Volume/Device"
+  regex: 'drbd\s+[\w_]+/\d+\s+drbd\d+'
+  placeholder: 'drbd <RESOURCE>/<VOL> <DEVICE>'
+
+- name: "DRBD Resource"
+  regex: 'drbd\s+[\w_]+:'
+  placeholder: 'drbd <RESOURCE>:'
+
+- name: "DRBD Resource Peer Host"
+  regex: 'drbd\s+[\w_]+\s+[\w\d_]+:'
+  placeholder: 'drbd <RESOURCE> <PEER_HOST>:'
+
+- name: "DRBD Connection State"
+  regex: 'conn\(\s*[\w\s]+->\s*[\w\s]+\s*\)'
+  placeholder: 'conn(<STATE> -> <STATE>)'
+
+- name: "DRBD Disk State"
+  regex: 'disk\(\s*[\w\s]+->\s*[\w\s]+\s*\)'
+  placeholder: 'disk(<STATE> -> <STATE>)'
+
+- name: "DRBD Peer State"
+  regex: 'peer\(\s*[\w\s]+->\s*[\w\s]+\s*\)'
+  placeholder: 'peer(<STATE> -> <STATE>)'
+
+- name: "DRBD Peer Disk State"
+  regex: 'pdsk\(\s*[\w\s]+->\s*[\w\s]+\s*\)'
+  placeholder: 'pdsk(<STATE> -> <STATE>)'
+
+- name: "DRBD Replication State"
+  regex: 'repl\(\s*[\w\s]+->\s*[\w\s]+\s*\)'
+  placeholder: 'repl(<STATE> -> <STATE>)'
+
+- name: "DRBD Role State"
+  regex: 'role\(\s*[\w\s]+->\s*[\w\s]+\s*\)'
+  placeholder: 'role(<STATE> -> <STATE>)'
+
+- name: "DRBD UUID Chain"
+  regex: '([0-9a-fA-F]{16}:){3}[0-9a-fA-F]{16}'
+  placeholder: '<DRBD_UUID_CHAIN>'
+
+- name: "DRBD UUID"
+  regex: '\b[0-9a-fA-F]{16}\b'
+  placeholder: '<DRBD_UUID>'
+
+- name: "DRBD Version"
+  regex: 'version\s\d+\s'
+  placeholder: 'version <NUM> '
+
+- name: "DRBD Capacity"
+  regex: 'capacity\s*==\s*\d+'
+  placeholder: 'capacity == <NUM>'
+
+- name: "DRBD Protocol Version"
+  regex: 'agreed network protocol version\s+\d+'
+  placeholder: 'agreed network protocol version <VERSION>'
+
+- name: "DRBD State Change ID"
+  regex: 'state change\s+\d+'
+  placeholder: 'state change <ID>'
+
+- name: "DRBD Thread ID"
+  regex: 't=\d+'
+  placeholder: 't=<TID>'
+
+- name: "DRBD Call ID"
+  regex: 'call=\d+'
+  placeholder: 'call=<CALL_ID>'
+
+- name: "DRBD Resource ID"
+  regex: 'drbd \d+'
+  placeholder: 'drbd <RES_ID>'

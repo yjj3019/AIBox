@@ -56,8 +56,8 @@ def get_html_template(data):
     def create_recommendation_rows(rec_list):
         if not rec_list: return "<tr><td colspan='4' style='text-align:center;'>데이터 없음</td></tr>"
         rows = ""
-        # [사용자 요청] AI가 한글로 반환하는 우선순위를 CSS 클래스에 맞게 매핑합니다.
-        priority_map = {"높음": "high", "중간": "medium", "낮음": "low", "High": "high", "Medium": "medium", "Low": "low"}
+        # [사용자 요청] '긴급' 우선순위를 추가하고, AI가 반환하는 다양한 우선순위 키워드를 매핑합니다.
+        priority_map = {"긴급": "urgent", "Urgent": "urgent", "높음": "high", "High": "high", "중간": "medium", "Medium": "medium", "낮음": "low", "Low": "low"}
         for item in rec_list:
             priority_class = priority_map.get(item.get('priority', ''), "")
             issue_html = h(str(item.get('issue', 'N/A')))
@@ -184,27 +184,25 @@ def get_html_template(data):
             rows += f"<tr><td>{h(p.get('user'))}</td><td>{h(p.get('pid'))}</td><td>{h(p.get('cpu_pct'))}</td>{mem_cols}<td>{h(p.get('stat'))}</td><td class='tooltip'>{cmd_short}<span class='tooltiptext'>{cmd}</span></td></tr>"
         return rows
 
-    def create_security_news_rows(news_list):
-        if not news_list: return "<tr><td colspan='4' style='text-align:center;'>AI가 선정한 보안 위협 없음</td></tr>"
+    def create_cve_advisory_rows(advisory_list):
+        if not advisory_list: return "<tr><td colspan='5' style='text-align:center;'>조치가 필요한 CVE 보안 권고가 없습니다.</td></tr>"
         rows = ""
-        # [사용자 요청] AI가 한글 또는 영문으로 반환할 수 있는 심각도를 CSS 클래스에 맞게 매핑합니다.        
-        severity_map = {"심각": "high", "critical": "high", "중요": "medium", "important": "medium"} 
-        for item in news_list:
+        severity_map = {"critical": "high", "important": "medium", "moderate": "low", "low": "low"}
+        for item in advisory_list:
             severity_class = severity_map.get(item.get('severity', '').lower(), "low") # noqa: E501
             severity_badge = f"<span class='priority-badge {severity_class}'>{h(item.get('severity', 'N/A'))}</span>"
             
-            # [사용자 요청] 설치된 버전 정보를 툴팁으로 표시
-            package_name = h(item.get('package'))
-            installed_version = item.get('installed_version')
-            if installed_version:
-                package_html = f'<div class="tooltip">{package_name}<span class="tooltiptext" style="width: 300px; margin-left: -150px;">Installed: {h(installed_version)}</span></div>'
-            else:
-                package_html = package_name
+            # 설치된 버전과 권고 버전을 툴팁으로 표시
+            package_name = h(item.get('package', 'N/A'))
+            installed_version_str = h(item.get('installed_version', 'N/A'))
+            fix_version_str = h(item.get('fix_version', 'N/A'))
+            package_html = f'<div class="tooltip">{package_name}<span class="tooltiptext" style="width: 400px; margin-left: -200px;">설치된 버전: {installed_version_str}<br>권고 버전: {fix_version_str}</span></div>'
             
             # [사용자 요청] CVE ID 아래에 공개일과 CVSSv3 점수를 추가합니다.
             cve_id = h(item.get('cve_id'))
             # [BUG FIX] JSON 데이터의 필드 이름(release_date)을 정확히 참조하도록 수정합니다.
-            public_date = h(item.get('release_date', item.get('public_date', '')).split('T')[0])
+            public_date_raw = item.get('public_date', '')
+            public_date = h(public_date_raw.split('T')[0]) if public_date_raw else 'N/A'
             
             # [BUG FIX] CVSS 점수 필드(cvss3.cvss3_base_score)를 정확히 참조하도록 수정합니다.
             cvss3_data = item.get('cvss3', {})
@@ -219,7 +217,7 @@ def get_html_template(data):
                 </div>
             """
             
-            rows += f"<tr><td>{cve_cell_html}</td><td>{severity_badge}</td><td>{package_html}</td><td>{h(item.get('description'))}</td></tr>"
+            rows += f"<tr><td>{cve_cell_html}</td><td>{severity_badge}</td><td>{package_html}</td><td>{h(item.get('description'))}</td><td>{h(item.get('fix_version'))}</td></tr>"
         return rows
 
     def create_netdev_rows(netdev_list):
@@ -248,9 +246,9 @@ def get_html_template(data):
     ha_cluster_info = data.get('ha_cluster_info', {})
     drbd_info = data.get('drbd_info', {})
     security_audit_findings = ai_analysis.get('security_audit_findings', [])
-    process_stats = data.get('processes', {})
+    process_stats = data.get('processes', {}); cve_advisories = data.get('security_advisories', [])
     security_news = data.get('security_advisories', [])
-    
+
     summary_raw = ai_analysis.get('summary', '분석 결과 없음')
     # [핵심 개선] markdown 라이브러리를 사용하여 AI 요약을 HTML로 변환합니다.
     if IS_MARKDOWN_AVAILABLE:
@@ -271,51 +269,49 @@ def get_html_template(data):
         <meta charset="UTF-8">
         <title>AI 시스템 분석 보고서: {h(data.get('hostname', ''))}</title>
         <style>
-            :root {{ --primary-color: #3498db; --secondary-color: #2c3e50; --success-color: #2ecc71; --warning-color: #f39c12; --danger-color: #e74c3c; --light-gray: #ecf0f1; --card-bg: #ffffff; --body-bg: #f4f6f8; --border-color: #dfe4ea; --box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08); }}
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans KR", sans-serif; background-color: var(--body-bg); color: #34495e; margin: 0; padding: 2rem; }}
-            .container {{ max-width: 1400px; margin: auto; }}
-            header {{ background: linear-gradient(135deg, var(--secondary-color) 0%, #34495e 100%); color: white; padding: 2rem; text-align: center; border-radius: 12px; margin-bottom: 2rem; box-shadow: var(--box-shadow); }}
-            h1, h2, h3 {{ margin:0; padding:0;}}
-            h3 {{ font-size: 1.2em; color: var(--secondary-color); margin-top: 1.5rem; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--light-gray);}}
-            .report-card {{ background: var(--card-bg); border-radius: 10px; margin-bottom: 2rem; box-shadow: var(--box-shadow); overflow: hidden; }}
-            .card-header {{ background-color: #f7f9fc; padding: 1rem 1.5rem; font-size: 1.5em; font-weight: 600; display: flex; align-items: center; border-bottom: 1px solid var(--border-color); }}
-            .card-header .icon {{ width: 28px; height: 28px; margin-right: 1rem; color: var(--primary-color); }}
-            .card-body {{ padding: 1.5rem; }}
+            :root{{ --primary-color: #007bff; --secondary-color: #6c757d; --success-color: #28a745; --danger-color: #dc3545; --warning-color: #ffc107; --background-color: #f0f4f8; --surface-color: #ffffff; --text-color: #212529; --header-bg: #0d1b2a; --header-text: #ffffff; --border-color: #dee2e6; --shadow: 0 4px 12px rgba(0,0,0,0.08); }}
+            body{{ font-family: "Noto Sans KR", sans-serif; margin:0; padding: 2rem; background-color:var(--background-color); color:var(--text-color); font-size:16px; line-height:1.6; }}
+            .container{{ max-width:1600px; margin:0 auto; }}
+            .header{{ background-color: var(--header-bg); color: var(--header-text); padding: 3rem 2rem; text-align: center; border-radius: 12px; margin-bottom: 2rem; box-shadow: var(--shadow); }}
+            h1{{ font-size:2.5rem; font-weight:700; margin:0; }}
+            .header p{{ font-size:1.1rem; opacity: 0.8; max-width:800px; margin:1rem auto 0; }}
+            .report-card{{ background-color:var(--surface-color); border:1px solid var(--border-color); border-radius:12px; box-shadow:var(--shadow); overflow:hidden; margin-bottom:2rem; }}
+            .card-header{{ font-size:1.5rem; color: var(--text-color); border-bottom: 1px solid var(--border-color); padding:1.25rem 1.5rem; margin:0; font-weight: 600; display: flex; align-items: center; gap: 0.75rem; }}
+            .card-header .icon {{ width: 28px; height: 28px; color: var(--primary-color); }}
+            .card-body{{ padding:1.5rem; }}
+            .card-body h3 {{ font-size: 1.25rem; font-weight: 700; margin-top: 1.5rem; margin-bottom: 0.5rem; padding-bottom: 0.25rem; border-bottom: 2px solid #e2e8f0; }}
+            .card-body ul {{ list-style-type: disc; padding-left: 1.5rem; margin-top: 0.5rem; }}
+            .card-body li {{ margin-bottom: 0.5rem; }}
+            .card-body p {{ margin-bottom: 1rem; }}
             .data-table {{ width: 100%; border-collapse: collapse; }}
-            .data-table th, .data-table td {{ padding: 0.9rem 1rem; text-align: left; border-bottom: 1px solid var(--border-color); word-break: break-all; }}
-            .data-table thead th {{ background-color: #f7f9fc; font-weight: 600; }}
+            .data-table th, .data-table td {{ padding:1rem 1.25rem; text-align:left; vertical-align:top; border-bottom:1px solid var(--border-color); }}
+            .data-table thead th {{ background-color:#f8f9fa; color: var(--text-color); font-weight:700; font-size:.9rem; position:sticky; top:0; z-index:1; }}
+            .data-table tbody tr:hover{{ background-color:#f8f9fa; }}
             .graph-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(450px, 1fr)); gap: 1.5rem; }}
             .graph-container {{ padding: 1rem; border: 1px solid var(--border-color); border-radius: 8px; margin-top: 1rem; }}
-            .graph-container h3 {{ text-align: center; border: none; }}
+            .graph-container h3 {{ text-align: center; border: none; font-size: 1.1em; margin-bottom: 1rem; }}
             .plotly-graph-container {{ width: 100%; min-height: 450px; }}
             .no-data-message {{ text-align: center; color: #888; padding: 2rem; }}
             .details-button-container {{ text-align: center; margin-top: 1rem; }}
-            .details-button {{
-                background-color: #f0f2f5; color: #34495e; border: 1px solid #dfe4ea;
-                padding: 8px 16px; border-radius: 6px; cursor: pointer;
-                font-weight: 500; font-size: 0.9rem; transition: all 0.2s ease;
-            }}
+            .details-button {{ background-color: #f0f2f5; color: #34495e; border: 1px solid #dfe4ea; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 0.9rem; transition: all 0.2s ease; }}
             .details-button:hover {{ background-color: #e9ecef; }}
-            .progress-bar-container {{ height: 12px; width: 100%; background-color: var(--light-gray); border-radius: 6px; overflow:hidden;}}
+            .progress-bar-container {{ height: 12px; width: 100%; background-color: #e9ecef; border-radius: 6px; overflow:hidden;}}
             .progress-bar {{ height: 100%; border-radius: 6px; }}
-            .priority-badge {{ padding: 0.25em 0.6em; border-radius: 5px; font-size: 0.85em; color: white; font-weight: 600; }}
-            .priority-badge.high {{ background-color: var(--danger-color);}}
-            .priority-badge.medium {{ background-color: var(--warning-color); }}
-            .priority-badge.low {{ background-color: #7f8c8d; }}
+            .priority-badge {{ display:inline-block; padding:.3em .6em; font-size:.85rem; font-weight:700; border-radius:.375rem; border: 1px solid transparent; }}
+            .priority-badge.high {{ background-color: #ffebee; color: var(--danger-color); border-color: var(--danger-color); }}
+            .priority-badge.urgent {{ background-color: #ff1744; color: white; border-color: #ff1744; }} /* [신규] 긴급 우선순위 스타일 */
+            .priority-badge.medium {{ background-color: #fff8e1; color: #f57c00; border-color: #f57c00; }}
+            .priority-badge.low {{ background-color: #e3f2fd; color: #0277bd; border-color: #0277bd; }}
             .tooltip {{ position: relative; display: inline-block; cursor: help; }}
             .tooltip .tooltiptext {{ visibility: hidden; width: 450px; background-color: var(--secondary-color); color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 10; bottom: 125%; left: 50%; margin-left: -225px; opacity: 0; transition: opacity 0.3s; white-space: pre-wrap;}}
             .log-icon {{ font-size: 0.8em; vertical-align: super; }}
-            .solution-box {{ margin-bottom: 0.5rem; }}
-            .validation-box {{ margin-top: 0.8rem; padding: 0.5rem 0.8rem; background-color: #f0f2f5; border-radius: 4px; font-size: 0.9em; }}
-            .validation-box code {{ background-color: transparent; padding: 0; }}
             .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
-            /* [사용자 요청] 푸터 텍스트를 중앙에 정렬하고 여백을 추가합니다. */
-            footer {
-                text-align: center; /* 텍스트를 중앙에 정렬합니다. */
-                padding: 2rem 0;    /* 위아래로 여백을 추가합니다. */
-                margin-top: 2rem;   /* 본문과의 간격을 확보합니다. */
-                color: #7f8c8d;      /* 텍스트 색상을 지정합니다. */
-            }
+            .summary-tags{{ margin-bottom:.5rem; }}
+            .threat-tag{{ display:inline-block; padding:.2em .6em; margin-right:.5rem; margin-bottom:.3rem; font-size:.8rem; font-weight:500; color:#fff; border-radius:4px; }}
+            .tag-exploited{{ background-color: var(--danger-color); }}
+            .tag-threat{{ background-color: #f57c00; }}
+            .tag-pkg{{ background-color: var(--secondary-color); }}
+            footer {{ text-align: center; padding: 2rem 0; margin-top: 2rem; color: #7f8c8d; }}
         </style>
         <script>
             function openGraphPopup(filename) {{
@@ -325,25 +321,23 @@ def get_html_template(data):
     </head>
     <body>
         <div class="container">
-            <header><h1>AI 시스템 분석 보고서</h1><p>Hostname: {h(data.get('hostname', 'N/A'))} &bull; Report Date: {datetime.now().strftime('%Y-%m-%d')}</p></header>
+            <div class="header"><h1>AI 시스템 분석 보고서</h1><p>Hostname: {h(data.get('hostname', 'N/A'))} &bull; 분석 기준일: {datetime.now().strftime('%Y-%m-%d')}</p></div>
 
             <div class="report-card">
-                <div class="card-header">{svg_icons['info']} 시스템 요약</div>
+                <div class="card-header">{svg_icons['info']} 시스템 정보</div>
                 <div class="card-body"><table class="data-table">
-                    <tr><th>OS Version</th><td>{h(system_info.get('os_release', 'N/A'))}</td></tr>
-                    <tr><th>Kernel</th><td>{h(system_info.get('kernel', 'N/A'))}</td></tr>
-                    <tr><th>System Model</th><td>{h(system_info.get('system_model', 'N/A'))}</td></tr>
-                    <tr><th>CPU</th><td>{h(system_info.get('cpu', 'N/A'))}</td></tr>
-                    <tr><th>Memory</th><td>{h(system_info.get('memory', 'N/A'))}</td></tr>
-                    <tr><th>Uptime</th><td>{h(system_info.get('uptime', 'N/A'))}</td></tr>
-                    <tr><th>Boot time</th><td>{h(system_info.get('boot_time', 'N/A'))}</td></tr>
-                    <tr><th>Report creation date</th><td>{h(system_info.get('report_creation_date', 'N/A'))}</td></tr>
+                    <tbody>
+                        <tr><th>OS Version</th><td>{h(system_info.get('os_release', 'N/A'))}</td><th>Kernel</th><td>{h(system_info.get('kernel', 'N/A'))}</td></tr>
+                        <tr><th>System Model</th><td>{h(system_info.get('system_model', 'N/A'))}</td><th>CPU</th><td>{h(system_info.get('cpu', 'N/A'))}</td></tr>
+                        <tr><th>Memory</th><td>{h(system_info.get('memory', 'N/A'))}</td><th>Uptime</th><td>{h(system_info.get('uptime', 'N/A'))}</td></tr>
+                        <tr><th>Last Boot</th><td>{h(system_info.get('boot_time', 'N/A'))}</td><th>Report Date</th><td>{h(system_info.get('report_creation_date', 'N/A'))}</td></tr>
+                    </tbody>
                 </table></div>
             </div>
 
             <div class="report-card">
                 <div class="card-header">{svg_icons['summary_ai']} AI 종합 분석</div>
-                <div class="card-body" style="line-height: 1.8;">{summary_html}</div>
+                <div class="card-body">{summary_html}</div>
             </div>
             <div class="report-card" {'style="display:none;"' if not ai_analysis.get('critical_issues') else ''}>
                 <div class="card-header">{svg_icons['critical']} AI 분석: 심각한 이슈</div>
@@ -356,30 +350,20 @@ def get_html_template(data):
             <div class="report-card">
                 <div class="card-header">{svg_icons['idea']} AI 분석: 권장사항</div>
                 <div class="card-body"><table class="data-table">
-                    <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
+                    <thead><tr><th style="width:10%">우선순위</th><th style="width:15%">카테고리</th><th style="width:35%">문제점</th><th style="width:40%">해결 방안</th></tr></thead>
                     <tbody>{create_recommendation_rows(ai_analysis.get('recommendations', []))}</tbody>
                 </table></div>
             </div>
 
             <div class="report-card" {'style="display:none;"' if not ha_cluster_info and not drbd_info else ''}>
                 <div class="card-header">{svg_icons['cluster']} HA 클러스터 및 DRBD 정보</div>
-                <div class="card-body">
-                    {'<h3>Pacemaker/Corosync 정보</h3><pre><code>' + h(ha_cluster_info.get('crm_report', '데이터 없음')) + '</code></pre>' if ha_cluster_info else ''}
-                    {f'''<h3>DRBD 상태</h3>
-                    <table class="data-table">
-                        <thead><tr><th>ID</th><th>Connection</th><th>Roles</th><th>Disk States</th><th>Warning</th></tr></thead>
-                        <tbody>{create_drbd_rows(drbd_info.get('resources', []))}</tbody>
-                    </table>
-                    ''' if drbd_info else ''}
-                    {'<h3>DRBD 설정 (/etc/drbd.conf)</h3><pre><code>' + h(drbd_info.get('drbd_config', '데이터 없음')) + '</code></pre>' if drbd_info.get('drbd_config') else ''}
-                </div>
+                <div class="card-body">{f'''<h3>DRBD 상태</h3><table class="data-table"><thead><tr><th>ID</th><th>Connection</th><th>Roles</th><th>Disk States</th><th>Warning</th></tr></thead><tbody>{create_drbd_rows(drbd_info.get('resources', []))}</tbody></table>''' if drbd_info else ''}{'<h3>Pacemaker/Corosync 정보</h3><pre><code>' + h(ha_cluster_info.get('crm_report', '데이터 없음')) + '</code></pre>' if ha_cluster_info else ''}{'<h3>DRBD 설정 (/etc/drbd.conf)</h3><pre><code>' + h(drbd_info.get('drbd_config', '데이터 없음')) + '</code></pre>' if drbd_info.get('drbd_config') else ''}</div>
             </div>
-
 
             <div class="report-card" {'style="display:none;"' if not security_audit_findings else ''}>
                 <div class="card-header">{svg_icons['shield']} 보안 감사 결과</div>
                 <div class="card-body"><table class="data-table">
-                    <thead><tr><th style="width: 10%; text-align: center;">심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
+                    <thead><tr><th style="width:10%">심각도</th><th style="width:15%">카테고리</th><th style="width:35%">문제점</th><th style="width:40%">해결 방안</th></tr></thead>
                     <tbody>{create_security_audit_rows(security_audit_findings)}</tbody>
                 </table></div>
             </div>
@@ -387,108 +371,46 @@ def get_html_template(data):
             <div class="report-card" {'style="display:none;"' if not kb_findings else ''}>
                 <div class="card-header">{svg_icons['shield']} 규칙 기반 진단 결과 (Knowledge Base)</div>
                 <div class="card-body"><table class="data-table">
-                    <thead><tr><th style="width: 10%; text-align: center;">심각도</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
+                    <thead><tr><th style="width:10%">심각도</th><th style="width:15%">카테고리</th><th style="width:35%">문제점</th><th style="width:40%">해결 방안</th></tr></thead>
                     <tbody>{create_kb_finding_rows(kb_findings)}</tbody>
                 </table></div>
             </div>
 
-
             <div class="report-card">
                 <div class="card-header">{svg_icons['dashboard']} 자원 사용 현황</div>
-                <div class="card-body graph-grid">
-                    {render_graph('cpu', 'CPU Usage (%)', graphs)}
-                    {render_graph('memory', 'Memory Usage (KB)', graphs)}
-                    {render_graph('load', 'System Load Average', graphs)}
-                    {render_graph('io_usage', 'I/O Usage (sar -b)', graphs)}
-                    {render_graph('disk_detail', 'Block Device I/O (sar -d)', graphs)}
-                    {render_graph('swap', 'Swap Usage (%)', graphs)}
-                    {render_graph('file_handler', 'File and Inode Handlers', graphs)}
-                    {render_graph('network_representative', 'Network Traffic', graphs)}
-                </div>
+                <div class="card-body graph-grid">{render_graph('cpu', 'CPU Usage (%)', graphs)}{render_graph('memory', 'Memory Usage (KB)', graphs)}{render_graph('load', 'System Load Average', graphs)}{render_graph('io_usage', 'I/O Usage (sar -b)', graphs)}{render_graph('disk_detail', 'Block Device I/O (sar -d)', graphs)}{render_graph('swap', 'Swap Usage (%)', graphs)}{render_graph('file_handler', 'File and Inode Handlers', graphs)}{render_graph('network_representative', 'Network Traffic', graphs)}</div>
             </div>
 
             <div class="report-card">
                 <div class="card-header">{svg_icons['disk']} 스토리지 및 파일 시스템</div>
-                <div class="card-body"><table class="data-table">
-                    <thead><tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Mounted on</th><th>Usage</th></tr></thead>
-                    <tbody>{create_storage_rows(data.get('storage', []))}</tbody>
-                </table></div>
+                <div class="card-body"><table class="data-table"><thead><tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Mounted on</th><th style="width:20%">Usage</th></tr></thead><tbody>{create_storage_rows(data.get('storage', []))}</tbody></table></div>
             </div>
 
             <div class="report-card">
                 <div class="card-header">{svg_icons['network']} 네트워크 정보</div>
                 <div class="card-body">
-                    <h3>IP4 상세 정보</h3>
-                    <table class="data-table">
-                        <thead><tr><th>Interface</th><th>MAC</th><th>IPv4</th><th>State</th></tr></thead>
-                        <tbody>{create_ip4_details_rows(network_details.get('interfaces', []))}</tbody>
-                    </table>
-                    <h3>라우팅 정보</h3>
-                    <table class="data-table">
-                        <thead><tr><th>Destination</th><th>Gateway</th><th>Device</th></tr></thead>
-                        <tbody>{create_routing_table_rows(network_details.get('routing_table', []))}</tbody>
-                    </table>
-                    <h3>ETHTOOL 상태</h3>
-                    <table class="data-table">
-                        <thead><tr><th>Interface</th><th>Driver</th><th>Speed</th><th>Duplex</th><th>Link</th><th>RX Ring</th></tr></thead>
-                        <tbody>{create_ethtool_rows(network_details.get('ethtool', {}))}</tbody>
-                    </table>
-                    <h3>NETDEV 통계</h3>
-                    <table class="data-table">
-                        <thead><tr><th>Iface</th><th>RX Bytes</th><th>RX Pkts</th><th>RX Errs</th><th>RX Drop</th><th>TX Bytes</th><th>TX Pkts</th><th>TX Errs</th><th>TX Drop</th></tr></thead>
-                        <tbody>{create_netdev_rows(network_details.get('netdev', []))}</tbody>
-                    </table>
-                    <h3>네트워크 본딩</h3>
-                    <table class="data-table">
-                        <thead><tr><th>Device / Slave</th><th>MII Status</th><th>Speed</th><th>Mode</th></tr></thead>
-                        <tbody>{create_bonding_rows(network_details.get('bonding', []))}</tbody>
-                    </table>
+                    <h3>IP4 상세 정보</h3><table class="data-table"><thead><tr><th>Interface</th><th>MAC</th><th>IPv4</th><th>State</th></tr></thead><tbody>{create_ip4_details_rows(network_details.get('interfaces', []))}</tbody></table>
+                    <h3>라우팅 정보</h3><table class="data-table"><thead><tr><th>Destination</th><th>Gateway</th><th>Device</th></tr></thead><tbody>{create_routing_table_rows(network_details.get('routing_table', []))}</tbody></table>
+                    <h3>ETHTOOL 상태</h3><table class="data-table"><thead><tr><th>Interface</th><th>Driver</th><th>Speed</th><th>Duplex</th><th>Link</th><th>RX Ring</th></tr></thead><tbody>{create_ethtool_rows(network_details.get('ethtool', {}))}</tbody></table>
+                    <h3>NETDEV 통계</h3><table class="data-table"><thead><tr><th>Iface</th><th>RX Bytes</th><th>RX Pkts</th><th>RX Errs</th><th>RX Drop</th><th>TX Bytes</th><th>TX Pkts</th><th>TX Errs</th><th>TX Drop</th></tr></thead><tbody>{create_netdev_rows(network_details.get('netdev', []))}</tbody></table>
+                    <h3>네트워크 본딩</h3><table class="data-table"><thead><tr><th>Device / Slave</th><th>MII Status</th><th>Speed</th><th>Mode</th></tr></thead><tbody>{create_bonding_rows(network_details.get('bonding', []))}</tbody></table>
                 </div>
             </div>
 
             <div class="report-card">
                 <div class="card-header">{svg_icons['cpu']} 프로세스 및 리소스</div>
                 <div class="card-body">
-                     <h3>리소스 사용 현황 (상위 5개 사용자)</h3>
-                     <table class="data-table">
-                        <thead><tr><th>User</th><th>CPU%</th><th>MEM%</th><th>RSS</th></tr></thead>
-                        <tbody>{create_by_user_rows(process_stats.get('by_user',[]))}</tbody>
-                    </table>
-                    <h3>Top 5 CPU 사용 프로세스</h3>
-                    <table class="data-table">
-                        <thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>STAT</th><th>Command</th></tr></thead>
-                        <tbody>{create_process_rows(process_stats.get('top_cpu', []), "CPU 사용량 높은 프로세스 없음")}</tbody>
-                    </table>
-                    <h3>Top 5 메모리 사용 프로세스</h3>
-                    <table class="data-table">
-                        <thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>MEM%</th><th>RSS(KB)</th><th>STAT</th><th>Command</th></tr></thead>
-                        <tbody>{create_process_rows(process_stats.get('top_mem', []), "메모리 사용량 높은 프로세스 없음", include_mem=True)}</tbody>
-                    </table>
-                     <h3>Uninterruptible/Zombie Processes</h3>
-                    <table class="data-table">
-                        <thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>MEM%</th><th>RSS(KB)</th><th>STAT</th><th>Command</th></tr></thead>
-                        <tbody>
-                            {create_process_rows(process_stats.get('uninterruptible', []), "Uninterruptible 프로세스 없음", include_mem=True)}
-                            {create_process_rows(process_stats.get('zombie', []), "Zombie 프로세스 없음", include_mem=True)}
-                        </tbody>
-                    </table>
+                     <h3>리소스 사용 현황 (상위 5개 사용자)</h3><table class="data-table"><thead><tr><th>User</th><th>CPU%</th><th>MEM%</th><th>RSS</th></tr></thead><tbody>{create_by_user_rows(process_stats.get('by_user',[]))}</tbody></table>
+                    <h3>Top 5 CPU 사용 프로세스</h3><table class="data-table"><thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>STAT</th><th>Command</th></tr></thead><tbody>{create_process_rows(process_stats.get('top_cpu', []), "CPU 사용량 높은 프로세스 없음")}</tbody></table>
+                    <h3>Top 5 메모리 사용 프로세스</h3><table class="data-table"><thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>MEM%</th><th>RSS(KB)</th><th>STAT</th><th>Command</th></tr></thead><tbody>{create_process_rows(process_stats.get('top_mem', []), "메모리 사용량 높은 프로세스 없음", include_mem=True)}</tbody></table>
+                     <h3>Uninterruptible/Zombie Processes</h3><table class="data-table"><thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>MEM%</th><th>RSS(KB)</th><th>STAT</th><th>Command</th></tr></thead><tbody>{create_process_rows(process_stats.get('uninterruptible', []), "Uninterruptible 프로세스 없음", include_mem=True)}{create_process_rows(process_stats.get('zombie', []), "Zombie 프로세스 없음", include_mem=True)}</tbody></table>
                 </div>
             </div>
 
             <div class="report-card">
-                <div class="card-header">{svg_icons['shield']} AI 선정 보안 위협</div>
+                <div class="card-header">{svg_icons['shield']} CVE 보안 권고</div>
                  <div class="card-body">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th style="width: 15%;">CVE</th>
-                                <th style="width: 10%; text-align: center;">Severity</th>
-                                <th style="width: 15%;">영향받는 패키지</th>
-                                <th>취약점 요약</th>
-                            </tr>
-                        </thead>
-                        <tbody>{create_security_news_rows(security_news)}</tbody>
-                    </table>
+                    <table class="data-table"><thead><tr><th style="width: 15%;">CVE</th><th style="width: 10%; text-align: center;">Severity</th><th style="width: 15%;">영향받는 패키지</th><th>취약점 요약</th><th style="width: 20%;">권고 버전</th></tr></thead><tbody>{create_cve_advisory_rows(cve_advisories)}</tbody></table>
                 </div>
             </div>
 
