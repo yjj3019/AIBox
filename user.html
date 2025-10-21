@@ -326,17 +326,20 @@ document.addEventListener('DOMContentLoaded', () => {
     async function checkServerStatus() {
         try {
             const response = await fetch(`${API_BASE_URL}/health`);
-            if (!response.ok) throw new Error('Server not healthy');
+            if (!response.ok) throw new Error(`Server not healthy: ${response.status}`);
             const data = await response.json();
+
+            const wasDisconnected = connStatusIndicator.classList.contains('disconnected');
 
             hideError();
             connStatusSpan.textContent = "연결됨";
             connStatusIndicator.className = 'status-indicator connected';
-            setUIEnabled(true);
 
             if (serverInstanceId === null) {
                 serverInstanceId = data.instance_id;
             } else if (serverInstanceId !== data.instance_id) {
+                // 서버가 재시작된 경우, 1초 후 페이지를 새로고침하여 상태를 완전히 초기화합니다.
+                showError('서버가 재시작되었습니다. 페이지를 새로고침합니다...');
                 setTimeout(() => location.reload(), 1000);
             }
         } catch (error) {

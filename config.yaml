@@ -1,0 +1,26 @@
+# AIBox 서버 기본 설정 파일
+
+# LLM 서버 정보
+llm_url: http://172.21.135.113:4000
+token: sk-iX9Azu30JV3E-WByjwm2PQ
+
+# 모델 설정
+model: S-Core/Qwen3-235B-A22B
+reasoning_model: S-Core/Qwen3-235B-A22B
+fast_model: S-Core/Qwen3-235B-A22B-no_think
+fallbacks_model: S-Core/Llama-4-Scout-17B-16E-Instruct
+reasoning_model_context: 128
+fast_model_context: 128
+fallbacks_model_context: 256
+
+# 서버 및 네트워크 설정
+host: 0.0.0.0
+port: 5000
+base_url: http://127.0.0.1:5000/AIBox
+
+# 성능 및 캐시 설정
+cache_ttl_days: 7
+cache_size_gb: 5.0
+llm_max_workers: 0
+llm_request_delay: 5.0
+pre_chunk_delay: 5.0
