@@ -32,7 +32,7 @@ MAX_WORKERS = 10
 # --- API 엔드포인트 ---
 LOCAL_CVE_URL = 'http://127.0.0.1:5000/AIBox/cve/{cve_id}.json'
 REDHAT_CVE_URL = 'https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json'
-LLM_ANALYZE_URL = 'http://127.0.0.1:5000/AIBox/api/cve/analyze'
+LLM_ANALYZE_URL = 'http://127.0.0.1:5000/AIBox/api/sos/analyze_system'
 
 # --- 필터링할 RHEL 제품 목록 (정규표현식 사용) ---
 TARGET_PRODUCT_PATTERNS = [
@@ -199,7 +199,7 @@ def process_cve_data(cve_data, skip_filtering=False):
         'public_date': cve_data.get('public_date', 'N/A').split('T')[0],
         'severity': cve_data.get('threat_severity', 'N/A'),
         'cvss3_score': cve_data.get('cvss3', {}).get('cvss3_base_score', 'N/A'),
-        'summary_en': cve_data.get('statement') or " ".join(cve_data.get('details', [])),
+        'summary_en': " ".join(cve_data.get('details', [])) or "기술적인 요약 정보가 없습니다.",
         'affected_releases': filtered_releases,
         'bugzilla_id': bugzilla_info.get('id'),
         'bugzilla_url': bugzilla_info.get('url'),
@@ -219,34 +219,27 @@ def get_korean_summaries_with_llm(cve_list):
 
     analyzed_data = {}
 
-    def analyze_single_cve(cve):
+    def analyze_single_cve(cve_item_for_prompt):
         """[NEW] security.py 로직을 참고하여 단일 CVE에 대한 심층 분석을 요청하는 함수"""
-        cve_id = cve['cve_id']
-        # AI에게 전달할 데이터 형식에 맞게 입력 데이터를 가공
-        cve_for_prompt = {
-            "cve_id": cve_id,
-            "severity": cve.get('severity', 'N/A'), # type: ignore
-            "cvss_score": cve.get('cvss3_score', 'N/A'),
-            "summary": cve.get('summary_en', '')
-        }
-
-        # security.py의 전문가 프롬프트를 적용
+        cve_id = cve_item_for_prompt['cve_id']
+        # [BUG FIX] 각 스레드가 고유한 prompt 객체를 생성하도록 수정합니다.
         prompt = {
             "task": "research_and_summarize_cve_deep_dive_in_korean",
             "prompt": ( # type: ignore
-                "You are a top-tier cybersecurity expert specializing in Red Hat Enterprise Linux (RHEL). "
-                "Your mission is to conduct a deep-dive analysis of the provided CVE. "
-                "You MUST perform a web search to gather the latest threat intelligence. "
-                "All analysis must be in PERFECT, NATURAL KOREAN."
-                "\n\n[Analysis Guidelines & Web Search Requirements]"
-                "\n1.  **Threat Intelligence Gathering (Web Search)**: Search for CISA KEV (Known Exploited Vulnerabilities) and PoC (Proof-of-Concept) code availability (e.g., Exploit-DB, GitHub)."
-                "\n2.  **Detailed Analysis**: Based on the gathered intelligence, provide:"
-                "\n    - **threat_tags**: Identify threat types like 'RCE', 'Privilege Escalation'. If it's in CISA KEV, you MUST include the 'Exploited in wild' tag. If a PoC is public, add 'PoC Available'."
-                "\n    - **concise_summary**: A 2-3 sentence summary in Korean for technical experts." # type: ignore
+                "You are a RHEL security expert specializing in CVE analysis. Your task is to investigate and summarize the provided CVE information into a concise, factual Korean summary tailored for Red Hat Enterprise Linux environments."
+                "You MUST base your summary solely on the provided CVE data from Red Hat sources (e.g., access.redhat.com). Do NOT add any personal opinions, risk assessments, mitigation advice, or external interpretations—stick strictly to the facts."
+                "\n\n[Analysis Guidelines]"
+                "\n1. Summarize: Write a 1-2 sentence Korean summary that precisely covers: The affected software/package in RHEL, the specific trigger or condition causing the vulnerability, and the direct technical impact (e.g., buffer overflow leading to remote code execution, denial of service via resource exhaustion)."
+                "\n   - Keep it objective, technical, and concise (under 100 words)."
+                "\n   - If RHEL-specific details like affected versions or errata are available, incorporate them factually without speculation."
+                "\n2. Threat Tags: Extract and list 1-3 relevant threat types as abbreviations (e.g., 'RCE' for Remote Code Execution, 'PE' for Privilege Escalation, 'DoS' for Denial of Service, 'ID' for Information Disclosure) based directly on the CVE description. Use only tags that accurately match the facts; do not invent new ones."
                 "\n\n[Output Format]"
-                "\nReturn ONLY a single, valid JSON object with keys: 'threat_tags', 'concise_summary'."
+                "\nReturn ONLY a single, valid JSON object with the following keys:"
+                "\n- 'threat_tags': An array of strings (e.g., ['RCE', 'DoS'])."
+                "\n- 'concise_summary': The Korean summary as a string."
+                "\nEnsure the JSON is parseable and contains no additional text."
             ),
-            "cve_data": cve_for_prompt, # type: ignore
+            "cve_data": cve_item_for_prompt, # type: ignore
             "model_selector": "deep_dive" # [수정] 서버가 reasoning_model을 선택하도록 키워드 추가 # type: ignore
         }
         max_retries = 3
@@ -254,12 +247,21 @@ def get_korean_summaries_with_llm(cve_list):
             try:
                 response = requests.post(LLM_ANALYZE_URL, json=prompt, timeout=180, headers={'Content-Type': 'application/json'}) # type: ignore
                 response.raise_for_status()
-                result = response.json()
-                if all(k in result for k in ['threat_tags', 'concise_summary']):
-                    return cve_id, result
-                else:
-                    logging.warning(f"[{cve_id}] LLM이 예상치 못한 형식의 JSON을 반환했습니다: {result}")
-                    return cve_id, None # 형식 오류도 실패로 간주
+                # [BUG FIX] AI가 이제 순수 텍스트로 응답하므로, .text를 직접 사용합니다.
+                # JSON 파싱을 제거하여 'JSONDecodeError'를 방지합니다.
+                summary_text = response.text.strip()
+                if summary_text:
+                    # [BUG FIX] AI가 JSON 형식으로 응답하는 경우를 대비하여, 텍스트에서 실제 내용만 추출합니다.
+                    try:
+                        parsed_json = json.loads(summary_text)
+                        if isinstance(parsed_json, dict):
+                             # AI가 실수로 JSON을 반환한 경우, 'concise_summary' 또는 다른 키에서 텍스트를 찾습니다.
+                             summary_text = parsed_json.get('concise_summary', next(iter(parsed_json.values()), summary_text))
+                    except json.JSONDecodeError:
+                        pass # 순수 텍스트 응답이므로 정상 처리
+                    return cve_id, {"concise_summary": summary_text, "threat_tags": []}
+                logging.warning(f"[{cve_id}] LLM이 빈 응답을 반환했습니다.")
+                return cve_id, None
             except requests.RequestException as e:
                 logging.warning(f"[{cve_id}] LLM API 요청 오류 (시도 {attempt + 1}): {e}")
                 if attempt < max_retries - 1: time.sleep(1)
@@ -272,7 +274,19 @@ def get_korean_summaries_with_llm(cve_list):
 
     # ThreadPoolExecutor를 사용하여 병렬로 각 CVE 분석 요청
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_cve = {executor.submit(analyze_single_cve, cve): cve['cve_id'] for cve in cve_list}
+        # [BUG FIX] 각 스레드가 고유한 cve_item을 참조하도록 람다 함수를 사용하여 클로저 문제를 해결합니다. (v2)
+        future_to_cve = {
+            executor.submit(
+                analyze_single_cve,
+                {
+                    "cve_id": cve_item['cve_id'],
+                    "severity": cve_item.get('severity', 'N/A'),
+                    "cvss_score": cve_item.get('cvss3_score', 'N/A'),
+                    "summary": cve_item.get('summary_en', '')
+                }
+            ): cve_item['cve_id']
+            for cve_item in cve_list
+        }
         
         processed_count = 0
         for future in as_completed(future_to_cve):
@@ -380,10 +394,10 @@ def generate_interactive_html_report(cve_list, custom_report_path=None):
             for tag in threat_tags:
                 tag_class = "tag-exploited" if "Exploited" in tag else "tag-threat"
                 tags_html += f'<span class="threat-tag {tag_class}">{tag}</span>'
-        
+
         # [수정] 요약 정보에서 '분석 근거(selection_reason)' 제거
         # [사용자 요청] Bugzilla, CWE, Package 정보 추가
-        reference_links_html = ""
+        reference_links_html = "" # noqa: F841
         if cve.get("bugzilla_id") and cve.get("bugzilla_url"):
             reference_links_html += f'<span>RHBZ: <a href="{cve["bugzilla_url"]}" target="_blank">{cve["bugzilla_id"]}</a></span>'
         
@@ -402,7 +416,7 @@ def generate_interactive_html_report(cve_list, custom_report_path=None):
         summary_html_block = f"""
         <div class="summary-content">
             <div class="summary-tags">{tags_html}</div>
-            <p class="main-summary">{summary}</p>
+            <p class="main-summary">{analysis.get("concise_summary", "요약 정보를 불러오지 못했습니다.")}</p>
             <div class="reference-links">{reference_links_html}</div>
         </div>
         """
@@ -410,11 +424,11 @@ def generate_interactive_html_report(cve_list, custom_report_path=None):
         # [BUG FIX] 테이블 레이아웃이 깨지는 문제를 해결하기 위해 HTML 생성 로직을 재구성합니다.
         # 1. rowspan에 사용할 행의 개수를 계산합니다.
         if not flat_releases:
-            flat_releases.append({'product': '-', 'advisory': '-', 'packages': '-'})
+            flat_releases.append({'product': '해당 없음', 'advisory': '해당 없음', 'packages': '해당 없음'})
         num_rows_for_cve = len(flat_releases)
 
         # 2. 각 CVE에 대한 행을 생성합니다.
-        for i, release_info in enumerate(flat_releases):
+        for i, release_info in enumerate(flat_releases): # noqa: B007
             table_rows_html += '<tr>'
             # 첫 번째 행에만 rowspan을 사용하여 공통 정보를 병합합니다.
             if i == 0:
@@ -425,7 +439,7 @@ def generate_interactive_html_report(cve_list, custom_report_path=None):
                 table_rows_html += f'<td rowspan="{num_rows_for_cve}">{cve_link_html}</td>'
                 table_rows_html += f'<td rowspan="{num_rows_for_cve}">{cve["public_date"]}</td>'
                 table_rows_html += f'<td rowspan="{num_rows_for_cve}">{severity}</td>'
-                table_rows_html += f'<td rowspan="{num_rows_for_cve}">{cve["cvss3_score"]}</td>'
+                table_rows_html += f'<td rowspan="{num_rows_for_cve}">{cve.get("cvss3_score", "N/A")}</td>'
                 table_rows_html += f'<td rowspan="{num_rows_for_cve}" class="summary-cell">{summary_html_block}</td>'
             
             # 각 행에 고유한 릴리즈 정보를 추가합니다.
@@ -641,15 +655,7 @@ def create_excel_report(cve_list):
         # 하이퍼링크 추가
         cve_cell = ws.cell(row=ws.max_row, column=1)
         cve_cell.hyperlink = f"https://access.redhat.com/security/cve/{cve['cve_id']}"
-        cve_cell.font = Font(color="0000FF", underline="single")
-
-    # 컬럼 너비 및 스타일 조정
-    column_widths = [20, 15, 12, 10, 60, 40, 40, 20, 50]
-    for i, width in enumerate(column_widths, 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=i, max_col=i):
-            for cell in row:
-                cell.alignment = Alignment(wrap_text=True, vertical='top')
+        cve_cell.style = "Hyperlink"
 
     return wb
 

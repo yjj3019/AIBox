@@ -542,18 +542,20 @@ def _create_final_analysis_prompt(cves_chunk: list) -> str:
             "epss_score": threat_intel.get('epss', {}).get('score')
         })
 
-    return f"""[시스템 역할] deep_dive 종합 분석
+    return f"""[시스템 역할]
 당신은 Red Hat Enterprise Linux(RHEL)의 보안 취약점을 분석하는 최고 수준의 사이버 보안 전문가입니다. 당신의 임무는 주어진 여러 개의 CVE 데이터 목록을 분석하여, 실제 위협이 되는 CVE의 우선순위를 선정하고 상세 분석을 수행하는 것입니다. **모든 분석 결과는 반드시 자연스러운 한국어로 작성해야 합니다.**
+
+[분석 대상 시스템 정보]
+이 분석은 특정 시스템에 종속되지 않은, RHEL 생태계 전반에 대한 일반적인 위협 평가입니다.
 
 [분석 가이드라인 및 웹 검색 활용]
 1.  **외부 정보 수집 (Web Search)**: 각 CVE에 대해 웹 검색을 수행하여 다음 정보를 수집합니다.
-    *   **한국 KISA/KrCERT 경보**: 한국 관련 기관의 경보 발령 여부 (최우선 고려)
-    *   **CISA KEV**: 실제 공격에 악용되었는지 여부
-    *   **PoC (Proof-of-Concept)**: 공개된 공격 코드가 있는지 여부
-    *   **EPSS (Exploit Prediction Scoring System)**: 향후 30일 내 공격 발생 가능성
-2.  **우선순위 선정 및 최종 {TOP_CVE_COUNT}개 선택**: **입력 데이터에 명시된 `is_in_kev`와 `epss_score` 정보를 최우선으로 고려**하고, 웹 검색 결과를 종합하여 우선순위를 선정합니다. (KISA/KrCERT 등재 > CISA KEV 등재 > PoC 공개 > 높은 EPSS 점수 > 높은 CVSS 점수 순으로 중요)
-3.  **패키지별 대표 선정 (매우 중요)**: 최종 리포트에 포함할 CVE를 선정할 때, 동일한 패키지(예: 'kernel')에 여러 취약점이 있다면, 그중 가장 위험한 **단 하나의 CVE만** 대표로 선정하여 최종 목록에 포함시켜야 합니다.
-4.  **상세 분석**: 각 CVE에 대해 다음 항목을 분석하고 식별하십시오.
+    *   **한국 KISA/KrCERT 경보 발령 또는 등재 여부를 최우선으로 고려합니다.**
+    *   **CISA KEV (Known Exploited Vulnerabilities) 등재 여부**
+    *   **PoC (Proof-of-Concept) 코드 공개 여부** (예: Exploit-DB, GitHub)
+    *   **EPSS (Exploit Prediction Scoring System) 점수 및 백분위**
+2.  **우선순위 선정**: 위에서 수집한 정보를 바탕으로 우선순위를 선정합니다. 한국 KISA/KrCERT 등재 CVE 를 최우선으로 고려하고, CISA KEV 등재 CVE를 차선으로 고려합니다. 그 다음으로 **패키지 중요도('kernel', 'glibc', 'openssl', 'systemd', 'grub2', 'gcc', 'bash', 'pacemaker', 'corosync', 'openssh' 등)**, PoC 공개 여부, EPSS 백분위, CVSS 점수, 공격 심각도(RCE, 권한 상승) 순으로 종합 평가하여 가장 시급한 CVE부터 정렬합니다.
+3.  **상세 분석**: 각 CVE에 대해 다음 항목을 분석하고 식별하십시오.
     *   **위협 태그(threat_tags)**: "RCE", "Privilege Escalation", "DoS" 등 위협 유형을 식별합니다. CISA KEV에 등재되었다면 **반드시 "Exploited in wild" 태그를 포함**해야 합니다. EPSS 점수가 0.2 이상이면 "High Exploit Probability" 태그를 추가하세요.
     *   PoC가 공개되었다면 **"PoC Available"** 태그를 추가하세요. EPSS 백분위가 0.9 (90%) 이상이면 **"Top 10% Exploit Risk"** 태그를 추가하세요.
     *   **영향받는 핵심 컴포넌트(affected_components)**: 'kernel', 'glibc', 'openssl', 'systemd', 'grub2', 'gcc', 'bash', 'pacemaker', 'corosync', 'openssh' 등 RHEL 시스템의 핵심 컴포넌트를 식별합니다.
@@ -723,7 +725,7 @@ def _create_batch_cve_analysis_prompt(cves_chunk: list) -> str:
 
 def _call_llm_for_batch_analysis(prompt: str) -> dict:
     """[신규] 배치 분석 프롬프트를 AIBox 서버로 보내고 결과를 받습니다."""
-    api_url = f'{CONFIG["AIBOX_SERVER_URL"].rstrip("/")}/AIBox/api/cve/analyze'
+    api_url = f'{CONFIG["AIBOX_SERVER_URL"].rstrip("/")}/AIBox/api/sos/analyze_system'
     payload = {
         "prompt": prompt,
         "model_selector": "deep_dive" if "deep_dive" in prompt else "fast_model"
@@ -1136,7 +1138,7 @@ Executive Summary 텍스트를 여기에 작성하십시오. (HTML 태그 없이
         "prompt": summary_prompt,
         "model_selector": "deep_dive" # Executive Summary는 reasoning_model 사용
     }
-    api_url = f'{CONFIG["AIBOX_SERVER_URL"].rstrip("/")}/AIBox/api/cve/analyze' # 범용 분석 엔드포인트 사용
+    api_url = f'{CONFIG["AIBOX_SERVER_URL"].rstrip("/")}/AIBox/api/sos/analyze_system' # 범용 분석 엔드포인트 사용
     
     # 내부 통신이므로 프록시 비활성화
     response = make_request('post', api_url, use_proxy=False, json=payload, timeout=300)
@@ -1448,7 +1450,7 @@ def generate_report(processed_cves, executive_summary):
     .tag-exploited{{ background-color: var(--danger-color); }}
     .tag-threat{{ background-color: #f57c00; }}
     .tag-pkg{{ background-color: var(--secondary-color); }}
-    /* [사용자 요청] RHSA 조치 방안 스타일 개선 */
+    /* [사용자 요청] RHSA 조치 방안 스타일 개선 */ .tag-pkg {{ margin-bottom: .3rem; }}
     .rhsa-item {{ display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.4rem; }}
     .rhsa-id-tag {{ display: inline-block; background-color: var(--success-color); color: white; padding: .2em .6em; border-radius: 4px; font-size: .85rem; font-weight: 500; }}
     .rhsa-id-tag a {{ color: white; text-decoration: none; }}

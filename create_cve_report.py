@@ -87,6 +87,11 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
     """제공된 CVE 데이터를 기반으로 지정된 AIBox 서버를 호출하여 분석을 수행합니다."""
     # [사용자 요청] LLM 응답 파싱 실패 시 3회 재시도 로직 추가
     max_retries = 3 # noqa: F841
+
+    # [BUG FIX] CVE 데이터가 비어있으면 AI 분석을 시도하지 않고 즉시 반환합니다.
+    if not cve_data:
+        return "### AI 분석 불가\n\n제공된 CVE에 대한 정보가 없습니다. 해당 CVE의 세부 정보나 영향을 분석하기 위해 구체적인 식별자(CVE 번호)가 필요합니다."
+
     for attempt in range(max_retries):
         logging.info(f"'{cve_id}'에 대한 AI 분석을 시작합니다 (시도 {attempt + 1}/{max_retries}, 서버: {server_url})...")
         
@@ -122,17 +127,17 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
 
 [출력 형식: 상세 분석 보고서 (Markdown)]
 ### 취약점 개요 (Vulnerability Summary)
-- **[분석 대상 제품 목록]에 명시된 제품 중에서** 이 취약점의 영향을 받는 소프트웨어만 명확하고 간결하게 설명합니다. 다른 제품은 절대 언급하지 마십시오.
+- **[분석 대상 제품 목록]에 명시된 제품 중에서** 이 취약점의 영향을 받는 소프트웨어, 문제 발생 원인, 그리고 그로 인해 유발되는 핵심적인 취약점(예: 정수 오버플로우, 힙 버퍼 오버플로우)을 **마크다운(굵은 글씨, 목록 등)을 적극적으로 사용하여** 명확하고 간결하게 설명합니다. 다른 제품은 절대 언급하지 마십시오.
 
 ### 근본 원인 분석 (Root Cause Analysis)
-- 제공된 'cwe'와 상세 설명을 바탕으로 취약점이 발생하는 기술적 원인을 심층적으로 분석합니다.
+- 제공된 'cwe'와 상세 설명을 바탕으로 취약점이 발생하는 기술적 원인을 **마크다운을 활용하여 구조적으로** 심층 분석합니다.
 
 ### 잠재적 영향 (Impact Assessment)
-- 'cvss3' 점수와 'EPSS' 점수를 기반으로, 이 취약점이 악용될 경우 발생할 수 있는 비즈니스 및 보안 위험을 구체적으로 기술합니다. (예: 데이터 유출, 서비스 거부, 원격 코드 실행 등)
+- 'cvss3' 점수와 'EPSS' 점수를 기반으로, 이 취약점이 악용될 경우 발생할 수 있는 비즈니스 및 보안 위험을 **마크다운 목록을 사용하여 구체적으로** 기술합니다. (예: 데이터 유출, 서비스 거부, 원격 코드 실행 등)
 
-""" # noqa: E501
-    # [BUG FIX] 하드코딩된 URL 대신, 인자로 받은 서버 URL을 사용하도록 수정합니다.
-    api_url = server_url
+"""
+    # [BUG FIX] AIBox 서버로부터 받은 기본 URL을 사용하여 올바른 API 엔드포인트 주소를 구성합니다.
+    api_url = f"{server_url.rstrip('/')}/AIBox/api/sos/analyze_system"
     payload = {
         "prompt": prompt,
         "model_selector": "deep_dive" # 복잡한 리포트 생성이므로 reasoning_model 사용
@@ -145,23 +150,14 @@ def analyze_data_with_llm(cve_id: str, cve_data: dict, external_data: dict, serv
         if not response:
             raise requests.RequestException("AI 서버 요청 최종 실패")
         
-        # [BUG FIX] AI 서버가 JSON 객체 또는 순수 텍스트를 반환하는 모든 경우에 대응합니다.
-        try:
-            # 1. 응답이 비어있는지 먼저 확인합니다.
-            if not response.content:
-                logging.warning("AI 서버가 빈 응답을 반환했습니다.")
-                return "### AI 분석 실패\n- AI 서버가 빈 응답을 반환했습니다."
-            
-            # 2. JSON 응답을 먼저 시도합니다.
-            response_json = loads(response.content)
-            if isinstance(response_json, dict):
-                return response_json.get('raw_response') or response_json.get('analysis_report') or dumps(response_json, indent=True)
-            return dumps(response_json, indent=True)
-        except (json.JSONDecodeError, orjson.JSONDecodeError):
-            # 3. JSON 파싱에 실패하면, 응답을 순수 텍스트로 간주하고 처리합니다. (AttributeError 방지)
-            #    이것이 문제의 근본 원인을 해결하는 부분입니다.
-            logging.warning("AI 서버 응답이 JSON 형식이 아닙니다. 순수 텍스트로 처리합니다.")
-            return response.text.strip()
+        # [BUG FIX] AI 서버가 순수 텍스트(text/plain)로 응답하므로, JSON으로 파싱하지 않고 .text 속성을 직접 사용합니다.
+        # 이전 코드에서 loads()를 호출하여 순수 텍스트가 다시 JSON 문자열로 변환되면서 이스케이프 문자(\n)가 포함되는 문제가 있었습니다.
+        # 이제 응답 본문을 그대로 반환하여 이 문제를 해결합니다.
+        summary = response.text.strip()
+        if not summary:
+            logging.warning("AI 서버가 빈 응답을 반환했습니다.")
+            return "### AI 분석 실패\n- AI 서버가 빈 응답을 반환했습니다."
+        return summary
 
     except requests.RequestException as e:
         logging.error(f"AIBox 서버 통신 오류: {e}")
@@ -389,11 +385,16 @@ def render_html_report(template_path: str, cve_id: str, context: dict) -> str:
     
     # Markdown 라이브러리가 설치된 경우, AI가 생성한 마크다운을 HTML로 변환합니다.
     if markdown:
-        context['comprehensive_summary_html'] = markdown(summary_text, extensions=['tables', 'fenced_code', 'nl2br'])
+        # [BUG FIX] 마크다운 변환 및 Markup 객체 생성을 if 블록 안으로 이동하여 SyntaxError를 해결합니다.
+        # [BUG FIX] Jinja2 3.0+ 버전에서는 Markup 클래스가 markupsafe 라이브러리로 이동했습니다.
+        # 'cannot import name 'Markup' from 'jinja2'' 오류를 해결하기 위해 import 경로를 수정합니다.
+        html_content = markdown(summary_text, extensions=['tables', 'fenced_code', 'nl2br'])
+        from markupsafe import Markup
+        context['comprehensive_summary_html'] = Markup(html_content)
     else:
         # 설치되지 않은 경우, 기본적인 텍스트로 표시합니다.
         escaped_text = html.escape(summary_text).replace('\n', '<br>')
-        context['comprehensive_summary_html'] = f'<pre style="white-space: pre-wrap;">{escaped_text}</pre>'
+        context['comprehensive_summary_html'] = f'<pre style="white-space: pre-wrap; font-family: inherit;">{escaped_text}</pre>'
 
     # HTML 파일로 저장하는 대신, 렌더링된 HTML 문자열을 반환합니다.
     return template.render(context)

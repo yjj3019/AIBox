@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CVE 분석 자동화</title>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        /* [디자인 개선] upload.html의 전문적인 디자인 시스템을 적용하여 UI를 현대적으로 개선합니다. */
+        :root {
+            --primary-color: #007aff; --primary-gradient: linear-gradient(45deg, #007aff, #0051a8);
+            --success-color: #34c759; --danger-color: #ff3b30; --background-color: #f7f8fc;
+            --surface-color: #ffffff; --text-color: #1a1a1a; --secondary-text-color: #6b7280;
+            --border-color: #e5e7eb; --shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.04);
+            --header-bg: #1f2937; --header-text: #ffffff;
+        }
+        body { font-family: 'Noto Sans KR', sans-serif; background-color: var(--background-color); color: var(--text-color); margin: 0; padding: 2rem; }
+        .container { max-width: 960px; margin: 0 auto; }
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 16px;
+        }
+        .panel-header h2 { margin: 0; padding: 0; border: none; }
+        .header { background: var(--header-bg); color: var(--header-text); padding: 2.5rem; text-align: center; border-radius: 16px; margin-bottom: 2rem; box-shadow: var(--shadow); }
+        .header h1 { margin: 0; font-size: 2.25rem; font-weight: 700; }
+        .panel { background-color: var(--surface-color); border-radius: 12px; padding: 24px; box-shadow: var(--shadow); border: 1px solid var(--border-color); margin-bottom: 2rem; }
+        .panel h2 { margin-top: 0; margin-bottom: 20px; font-size: 1.25rem; font-weight: 600; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; display:flex; align-items:center; gap: 10px;}
+        
+        /* [디자인 개선] 파일 업로드 영역 스타일 */
+        .upload-area {
+            border: 2px dashed var(--border-color); border-radius: 10px; padding: 40px; text-align: center;
+            cursor: pointer; transition: all 0.2s ease-in-out; background-color: #fafbff;
+        }
+        .upload-area:hover, .upload-area.dragover { background-color: #f5f8ff; border-color: var(--primary-color); }
+        .upload-area .upload-icon { color: var(--primary-color); margin-bottom: 16px; }
+        .upload-area p { margin: 4px 0 0; font-size: 1rem; color: var(--text-color); font-weight: 500;}
+        #host-files { display: none; }
+        #file-list { margin-top: 1rem; font-size: 0.9rem; color: var(--secondary-text-color); }
+        .download-links { display: flex; gap: 10px; }
+        /* [디자인 개선] 다운로드 링크를 아이콘이 포함된 세련된 버튼 스타일로 변경합니다. */
+        .download-links a {
+            display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem;
+            background-color: #eef6ff; color: var(--primary-color); padding: 6px 12px;
+            border-radius: 6px; text-decoration: none; border: 1px solid #cce4ff; transition: all 0.2s ease;
+        }
+        .download-links a:hover { background-color: var(--primary-color); color: white; border-color: var(--primary-color); }
+
+        textarea {
+            width: 100%; padding: 0.8rem 1rem; border: 1px solid var(--border-color); border-radius: 8px;
+            font-size: 1rem; box-sizing: border-box; font-family: 'Noto Sans KR', sans-serif;
+            min-height: 150px; resize: vertical;
+        }
+        .button {
+            background: var(--primary-gradient); color: white; border: none; padding: 12px 25px;
+            border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.2s ease;
+            display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; margin-top: 20px;
+            box-shadow: 0 4px 14px 0 rgba(0, 118, 255, 0.39);
+        }
+        .button:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 20px 0 rgba(0, 118, 255, 0.45); }
+        .button:disabled { background: #94d3a2; cursor: not-allowed; opacity: 0.7; box-shadow: none; }
+        
+        /* [디자인 개선] Stepper UI 스타일 */
+        .stepper { list-style: none; padding: 0; margin: 0; }
+        .step { display: flex; align-items: center; gap: 16px; padding: 14px 4px; }
+        .step:not(:last-child) { border-bottom: 1px solid var(--border-color); }
+        .step-icon {
+            width: 36px; height: 36px; border-radius: 50%; background-color: #f3f4f6; color: var(--secondary-text-color);
+            display: flex; align-items: center; justify-content: center; transition: all 0.3s ease; flex-shrink: 0;
+            font-weight: 700;
+        }
+        .step-label { font-weight: 500; color: var(--secondary-text-color); transition: color 0.3s ease; }
+        .step.active .step-icon { background-color: var(--primary-color); color: white; }
+        .step.active .step-label { color: var(--text-color); font-weight: 600; }
+        .step.completed .step-icon { background-color: var(--success-color); color: white; }
+        .step.completed .step-label { color: var(--text-color); }
+        .step.failed .step-icon { background-color: var(--danger-color); color: white; }
+        .step.failed .step-label { color: var(--danger-color); font-weight: 600; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        .step.active .step-icon svg { animation: spin 1.2s linear infinite; }
+        .step-detail { font-size: 0.85rem; color: #6b7280; margin-top: 4px; }
+
+        /* [디자인 개선] 로그 상세 보기 스타일 */
+        #log-details {
+            margin-top: 1.5rem;
+            padding: 1rem;
+            background-color: #1f2937;
+            color: #d1d5db;
+            border-radius: 8px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+            font-size: 0.85rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header class="header">
+        <h1>CVE 분석 자동화 리포트</h1>
+    </header>
+
+    <div class="main-content">
+        <form id="analysis-form">
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>1. 호스트 정보 파일 업로드</h2>
+                    <!-- [사용자 요청] 정보 수집 스크립트 다운로드 링크 추가 -->
+                    <div class="download-links">
+                        <span>수집 스크립트:</span>
+                        <a href="/AIBox/cve-check/gather_bash.sh" download>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+                            gather_bash.sh
+                        </a>
+                        <a href="/AIBox/cve-check/gather_py.py" download>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                            gather_py.py
+                        </a>
+                    </div>
+                </div>
+                <div class="upload-area" id="upload-area">
+                    <div class="upload-icon">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="12" y2="12"></line><line x1="15" y1="15" x2="12" y2="12"></line></svg>
+                    </div>
+                    <p>분석할 호스트 정보 파일(.json)을 드래그하세요.</p>
+                    <p style="font-size: 0.9rem; color: var(--secondary-text-color);">또는 클릭하여 파일 선택 (다중 선택 가능)</p>
+                    <input type="file" id="host-files" name="host_files" multiple required accept=".json">
+                </div>
+                <div id="file-list"></div>
+            </div>
+
+            <div class="panel">
+                <h2>2. 분석할 CVE ID 입력</h2>
+                <textarea id="cve-ids" name="cve_ids" placeholder="CVE-2023-1234&#10;CVE-2024-5678" required></textarea>
+            </div>
+
+            <button type="submit" id="submit-btn" class="button">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+                분석 시작
+            </button>
+        </form>
+
+        <div id="status-container" class="panel" style="display: none; margin-top: 2rem;">
+            <h2>분석 진행 상태</h2>
+            <!-- [사용자 요청] Stepper UI 추가 -->
+            <ul class="stepper" id="analysis-stepper">
+                <li class="step" data-step="1">
+                    <div class="step-icon">1</div>
+                    <div class="step-label">분석 시작</div>
+                </li>
+                <li class="step" data-step="2">
+                    <div class="step-icon">2</div>
+                    <div class="step-label">CVE 데이터베이스 생성</div>
+                </li>
+                <li class="step" data-step="3">
+                    <div class="step-icon">3</div>
+                    <div class="step-label">리포트 생성</div>
+                </li>
+                <li class="step" data-step="4">
+                    <div class="step-icon">4</div>
+                    <div class="step-label">결과 압축</div>
+                </li>
+                <li class="step" data-step="5">
+                    <div class="step-icon">5</div>
+                    <div class="step-label">완료</div>
+                </li>
+            </ul>
+            <div id="log-details" style="display: none;"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // --- Global UI Elements ---
+    const form = document.getElementById('analysis-form');
+    const submitBtn = document.getElementById('submit-btn');
+    const statusContainer = document.getElementById('status-container');
+    const stepper = document.getElementById('analysis-stepper');
+    const logDetails = document.getElementById('log-details');
+    const hostFilesInput = document.getElementById('host-files'); // 호스트 파일 입력 필드
+    const cveIdsTextarea = document.getElementById('cve-ids'); // CVE ID 입력 필드
+    const uploadArea = document.getElementById('upload-area'); // 업로드 영역
+    const fileListDiv = document.getElementById('file-list'); // 파일 목록 표시 영역
+
+    // --- Drag & Drop 및 파일 선택 UI 초기화 ---
+    uploadArea.addEventListener('click', () => hostFilesInput.click());
+    hostFilesInput.addEventListener('change', () => updateFileList(hostFilesInput.files));
+
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        uploadArea.addEventListener(eventName, e => { e.preventDefault(); e.stopPropagation(); }, false);
+    });
+    ['dragenter', 'dragover'].forEach(eventName => {
+        uploadArea.addEventListener(eventName, () => uploadArea.classList.add('dragover'), false);
+    });
+    ['dragleave', 'drop'].forEach(eventName => {
+        uploadArea.addEventListener(eventName, () => uploadArea.classList.remove('dragover'), false);
+    });
+    uploadArea.addEventListener('drop', e => {
+        hostFilesInput.files = e.dataTransfer.files;
+        updateFileList(hostFilesInput.files);
+    }, false);
+
+    function updateFileList(files) {
+        if (files.length === 0) {
+            fileListDiv.innerHTML = '';
+        } else {
+            fileListDiv.innerHTML = `${files.length}개 파일 선택됨: ${Array.from(files).map(f => f.name).join(', ')}`;
+        }
+    }
+
+    // --- 폼 제출 이벤트 리스너 ---
+    form.addEventListener('submit', async function(event) {
+        event.preventDefault();
+        
+        if (hostFilesInput.files.length === 0) {
+            alert('호스트 정보 파일을 하나 이상 선택해주세요.');
+            return;
+        }
+        if (!cveIdsTextarea.value.trim()) {
+            alert('CVE ID를 하나 이상 입력해주세요.');
+            return;
+        }
+
+        const formData = new FormData();
+        for (const file of hostFilesInput.files) { formData.append('host_files', file); }
+        formData.append('cve_ids', cveIdsTextarea.value);
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = '분석 중...';
+        statusContainer.style.display = 'block';
+        updateStatusUI({ log: ['분석 요청을 서버에 전송 중입니다...'], status: 'queued' });
+        logDetails.style.display = 'block';
+
+        try {
+            const response = await fetch('/AIBox/api/cve-check/start-analysis', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || '서버에서 오류가 발생했습니다.');
+            }
+
+            const result = await response.json();
+            const analysisId = result.analysis_id;
+            updateStatusUI({ log: [`분석이 시작되었습니다. (ID: ${analysisId})`], status: 'running' });
+
+            // 상태를 주기적으로 확인
+            checkStatus(analysisId);
+
+        } catch (error) {
+            updateStatusUI({ log: [`오류: ${error.message}`], status: 'failed' });
+            submitBtn.disabled = false;
+            submitBtn.textContent = '분석 시작';
+        }
+    });
+
+    function checkStatus(analysisId) {
+        const intervalId = setInterval(async () => {
+            try {
+                const response = await fetch(`/AIBox/api/cve-check/analysis-status/${analysisId}`);
+                if (!response.ok) {
+                    // 404 Not Found 등, 분석 ID가 사라진 경우
+                    clearInterval(intervalId);
+                    updateStatusUI({ log: [`분석 상태를 가져올 수 없습니다. (ID: ${analysisId})`], status: 'failed' });
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = '분석 시작';
+                    return;
+                }
+
+                const data = await response.json();
+                updateStatusUI(data);
+
+                if (data.status === 'complete' || data.status === 'failed') {
+                    clearInterval(intervalId);
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = '분석 시작';
+                }
+            } catch (error) {
+                clearInterval(intervalId);
+                updateStatusUI({ log: [`상태 확인 중 네트워크 오류 발생: ${error.message}`], status: 'failed' });
+                submitBtn.disabled = false;
+                submitBtn.textContent = '분석 시작';
+            }
+        }, 3000); // 3초마다 확인
+    }
+
+    function updateStatusUI(data) {
+        // 1. Stepper 업데이트
+        const icons = {
+            spinner: `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="animation: spin 1.2s linear infinite;"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line></svg>`,
+            check: '✔',
+            error: '✖'
+        };
+
+        const steps = stepper.querySelectorAll('.step');
+        const statusMap = {
+            'queued': 1,
+            'running': 2,
+            'generating_report': 3, // 서버에서 이 상태를 보내준다면...
+            'compressing': 4,       // 서버에서 이 상태를 보내준다면...
+            'complete': 5,
+            'failed': -1
+        };
+        let currentStep = 0;
+        const logText = (data.log || []).join('\n');
+
+        if (data.status === 'failed') {
+            currentStep = Array.from(steps).length; // 실패 시 마지막 단계에서 멈춤
+        } else if (data.status === 'complete') {
+            currentStep = Array.from(steps).length;
+        } else if (/결과 압축 중/.test(logText)) {
+            currentStep = 4;
+        } else if (/리포트 생성 시작/.test(logText)) {
+            currentStep = 3;
+        } else if (/메타데이터 생성 중/.test(logText)) {
+            currentStep = 2;
+        } else {
+            currentStep = 1;
+        }
+
+        steps.forEach((step, index) => {
+            const stepNum = index + 1;
+            const iconDiv = step.querySelector('.step-icon');
+            const labelDiv = step.querySelector('.step-label');
+            step.className = 'step'; // 모든 클래스 초기화
+
+            if (stepNum < currentStep) {
+                step.classList.add('completed');
+                iconDiv.innerHTML = icons.check;
+            } else if (stepNum === currentStep) {
+                if (data.status === 'failed') {
+                    step.classList.add('failed');
+                    iconDiv.innerHTML = icons.error;
+                    const lastLog = data.log && data.log.length > 0 ? data.log[data.log.length - 1] : "알 수 없는 오류";
+                    labelDiv.innerHTML = `분석 실패<div class="step-detail">${lastLog}</div>`;
+                } else if (data.status === 'complete') {
+                    step.classList.add('completed');
+                    iconDiv.innerHTML = icons.check;
+                } else {
+                    step.classList.add('active');
+                    iconDiv.innerHTML = icons.spinner;
+                }
+            } else {
+                iconDiv.textContent = stepNum;
+            }
+        });
+        
+        // 2. 상세 로그 업데이트
+        logDetails.textContent = (data.log || []).join('\n').replace(/\[\d{1,2}m/g, ''); // ANSI 색상 코드 제거
+        logDetails.scrollTop = logDetails.scrollHeight; // 항상 마지막 로그가 보이도록 스크롤
+
+        if (data.status === 'complete' && data.zip_file) {
+            // [사용자 요청] 분석 완료 시 자동으로 다운로드 시작
+            const downloadLink = document.createElement('a');
+            downloadLink.href = `/AIBox/output/${data.zip_file}`;
+            downloadLink.download = data.zip_file;
+            document.body.appendChild(downloadLink);
+            downloadLink.click();
+            document.body.removeChild(downloadLink);
+        }
+    }
+});
+</script>
+
+</body>
+</html>

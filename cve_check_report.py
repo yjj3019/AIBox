@@ -1,16 +1,25 @@
 #!/usr/bin/env python3.11
 # -*- coding: utf-8 -*-
 
-import os
 import re
 import json
 import html
 from pathlib import Path
 from datetime import datetime
 import requests
+from tqdm import tqdm
+import time
 import logging
 import sys
+import argparse
+import urllib.parse
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# [BUG FIX] security.py 로직을 참고하여, 프록시 환경에서 발생할 수 있는
+# SSL 인증서 검증 오류(SSLError)를 방지하기 위해 InsecureRequestWarning을 비활성화합니다.
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- [신규] 콘솔 출력 색상 및 로깅 설정 ---
 class Color:
@@ -31,8 +40,15 @@ class Color:
 logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
 
 # --- 설정값 ---
-SYSTEM_DATA_DIR = Path("/data/iso/AIBox/cve-check/data")
-REPORT_OUTPUT_DIR = Path("/data/iso/AIBox/cve-check/output")
+# [BUG FIX] 스크립트 실행 위치에 관계없이 항상 올바른 경로를 참조하도록 절대 경로로 수정합니다.
+# 스크립트 파일의 위치를 기준으로 상대 경로를 계산하여 절대 경로를 만듭니다.
+# [BUG FIX] AIBox_Server.py에서 실행될 때의 작업 디렉토리 문제를 해결하기 위해,
+# 스크립트의 부모 디렉토리('cve-check')의 부모 디렉토리('/data/iso/AIBox')를 기준으로 경로를 설정합니다.
+SCRIPT_DIR = Path(__file__).resolve().parent
+BASE_DIR = SCRIPT_DIR.parent # /data/iso/AIBox/cve-check -> /data/iso/AIBox
+SYSTEM_DATA_DIR = BASE_DIR / "cve-check/data"
+REPORT_OUTPUT_DIR = BASE_DIR / "cve-check/output"
+# [통합] 이 경로는 더 이상 직접 사용되지 않으며, 모든 데이터는 메모리 내에서 처리됩니다.
 CVE_DB_PATH = Path("/data/iso/AIBox/cve-check/meta/cve-check_db.json")
 
 # --- 필터링할 RHEL 제품 목록 (정규표현식 사용) ---
@@ -161,6 +177,69 @@ def parse_cve_package_field(package_field: str):
     return package_field, "" # 모든 방법으로 분리 실패 시
 
 def summarize_vulnerability(details, statement, server_url=None):
+    """[통합] cve_check_report.py와 create_cve_report.py의 AI 요약 로직을 통합하고 안정성을 강화합니다."""
+    # 1. 영문 요약본 생성
+    english_summary = "No summary available."
+    if details and isinstance(details, list) and details[0]:
+        english_summary = details[0]
+    elif statement:
+        english_summary = statement.split('.')[0] + '.'
+    
+    english_summary = english_summary.strip().replace('\n', ' ')
+    if len(english_summary) > 250:
+        english_summary = english_summary[:247] + "..."
+
+    if not server_url:
+        logging.warning(Color.warn("Warning: AI 서버 URL이 제공되지 않았습니다. 영문 요약을 사용합니다."))
+        return english_summary
+
+    # 2. AIBox 서버에 번역 및 요약 요청
+    try:
+        api_url = f"{server_url.rstrip('/')}/AIBox/api/sos/analyze_system"
+        prompt = f"""[SYSTEM ROLE]
+You are a cybersecurity analyst. Your task is to summarize the core threat of the following vulnerability in a single, concise Korean sentence, focusing on the impact (e.g., remote code execution, privilege escalation).
+
+[ENGLISH SUMMARY]
+{english_summary}
+
+[OUTPUT FORMAT]
+You MUST return ONLY a single, valid JSON object with the key "analysis_report". Do not add any other text.
+Example: {{"analysis_report": "특정 조건에서 원격 코드 실행이 가능한 취약점입니다."}}
+"""
+        payload = {
+            "prompt": prompt,
+            "model_selector": "fast_model"
+        }
+        
+        response = requests.post(api_url, json=payload, timeout=30, proxies={'http': None, 'https': None})
+        
+        if response.ok:
+            try:
+                result = response.json()
+                if isinstance(result, dict):
+                    summary = result.get('analysis_report')
+                    if summary and isinstance(summary, str):
+                        return summary
+                
+                raw_response_str = str(result)
+                if not re.fullmatch(r'\[\s*\d+\s*\]', raw_response_str):
+                    return raw_response_str
+
+            except (json.JSONDecodeError, AttributeError):
+                return response.text.strip().strip('"')
+    except requests.RequestException as e:
+        logging.warning(Color.warn(f"Warning: AI summary generation failed - {e}. Falling back to English summary."))
+    
+    return english_summary
+
+def is_target_product(product_name):
+    """주어진 제품 이름이 대상 RHEL 제품 목록에 포함되는지 확인합니다."""
+    for pattern in TARGET_PRODUCT_PATTERNS:
+        if pattern.match(product_name):
+            return True
+    return False
+
+def get_product_source_label(product_name: str) -> str:
     """취약점 요약 생성 (LLM 대신 규칙 기반으로 핵심 내용 요약)"""
     # [사용자 요청] AI 서버를 호출하여 한글 요약 및 번역을 수행하도록 수정합니다.
     # 1. 영문 요약본을 먼저 생성합니다.
@@ -182,7 +261,7 @@ def summarize_vulnerability(details, statement, server_url=None):
     # 2. AIBox 서버에 번역 및 요약 요청
     try:
         # [BUG FIX] 하드코딩된 URL 대신, 인자로 받은 서버 URL을 사용합니다.
-        api_url = f"{server_url.rstrip('/')}/AIBox/api/cve/analyze"
+        api_url = f"{server_url.rstrip('/')}/AIBox/api/sos/analyze_system"
         # [사용자 요청] 취약점 요약이 핵심 내용만 포함하도록 프롬프트를 수정합니다.
         prompt = f"""[SYSTEM ROLE]
 You are a cybersecurity analyst. Your task is to summarize the core threat of the following vulnerability in a single, concise Korean sentence, focusing on the impact (e.g., remote code execution, privilege escalation).
@@ -200,8 +279,8 @@ Example: {{"analysis_report": "특정 조건에서 원격 코드 실행이 가�
             "model_selector": "fast_model" # 'fast' 또는 다른 키워드를 서버 로직에 맞게 추가
         }
         
-        # 로컬 서버 통신이므로 프록시를 사용하지 않습니다.
-        response = requests.post(api_url, json=payload, timeout=30, proxies={'http': '', 'https': ''})
+        # [사용자 요청] 로컬 AIBox 서버와 통신하므로 프록시를 명시적으로 비활성화합니다.
+        response = requests.post(api_url, json=payload, timeout=30, proxies={'http': None, 'https': None})
         
         if response.ok:
             # [사용자 요청] 한글 깨짐 문제 해결: JSON 응답을 올바르게 파싱합니다.
@@ -229,31 +308,6 @@ Example: {{"analysis_report": "특정 조건에서 원격 코드 실행이 가�
     
     # 3. AI 서버 호출 실패 시, 영문 요약을 반환합니다.
     return english_summary
-
-def is_target_product(product_name):
-    """주어진 제품 이름이 대상 RHEL 제품 목록에 포함되는지 확인합니다."""
-    for pattern in TARGET_PRODUCT_PATTERNS:
-        if pattern.match(product_name):
-            return True
-    return False
-
-def get_product_source_label(product_name: str) -> str:
-    """
-    [사용자 요청] product_name에 따라 RHSA ID 옆에 표시할 출처 라벨을 반환합니다.
-    """
-    if not product_name:
-        return ""
-    
-    if "Extended Lifecycle Support" in product_name:
-        return "ELS"
-    if "Extended Update Support Long-Life Add-On" in product_name:
-        return "EUS-LongLife"
-    if "Extended Update Support" in product_name:
-        return "EUS"
-    if "Update Services for SAP Solutions" in product_name:
-        return "SAP-Solution"
-    
-    return "" # 기본 RHEL 버전은 라벨 없음
 
 def get_product_source_label(product_name: str) -> str: # noqa: E302
     """
@@ -396,27 +450,27 @@ def generate_html_report(system_info, vulnerabilities):
             .card-body {{ padding: 1.5rem; }}
             .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; padding: 0.5rem 1.5rem 1.5rem; }}
             .info-item {{ background-color: #f9fafb; padding: 1.25rem; border-radius: 10px; border: 1px solid var(--border-color); }}
-            .info-item strong {{ display: block; color: var(--secondary-color); font-size: 0.9rem; margin-bottom: 0.25rem; }}
+            .info-item strong {{ display: block; color: var(--secondary-color); font-size: 0.9rem; margin-bottom: 0.5rem; }}
             table {{ width: 100%; border-collapse: collapse; }}
             th, td {{ padding: 1rem 1.5rem; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border-color); }}
             thead th {{ background-color: #f9fafb; color: var(--secondary-color); font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.5px; }}
             tbody tr:hover {{ background-color: #f5f8ff; }}
             tbody tr:last-child td {{ border-bottom: none; }}
-            a {{ color: #007bff; text-decoration: none; }}
+            a {{ color: var(--primary-color); text-decoration: none; font-weight: 500; }}
             a:hover {{ text-decoration: underline; }}
             .status-cell {{ text-align: center; vertical-align: middle; }}
             .status-icon {{
                 display: inline-block;
                 padding: 0.25em 0.6em;
                 border-radius: 20px;
-                font-size: 0.85em;
+                font-size: 0.9em;
                 color: white;
                 font-weight: bold;
-                min-width: 40px;
+                min-width: 45px;
             }}
             .status-ok {{ background-color: var(--success-color); }}
             .status-nok {{ background-color: var(--danger-color); }}
-            .version-icon {{ font-weight: bold; font-size: 1.1em; vertical-align: middle; margin-left: 4px; }}
+            .version-icon {{ font-weight: bold; font-size: 1.2em; vertical-align: middle; margin-left: 6px; }}
             .version-icon.high {{ color: var(--success-color); }}
             .version-icon.low {{ color: var(--danger-color); }}
         </style>
@@ -429,7 +483,7 @@ def generate_html_report(system_info, vulnerabilities):
             </div>
             <div class="card">
                 <div class="card-header">시스템 정보</div>
-                <div class="card-body info-grid">
+                <div class="info-grid">
                     <div class="info-item"><strong>OS Version</strong> {html.escape(os_version)}</div>
                     <div class="info-item"><strong>Kernel Version</strong> {html.escape(kernel_version)}</div>
                     <div class="info-item"><strong>Uptime</strong> {html.escape(uptime)}</div>
@@ -438,14 +492,14 @@ def generate_html_report(system_info, vulnerabilities):
             </div>
 
             <div class="card">
-                <div class="card-header">분석 요약</div>
+                <h2 class="card-header">분석 요약</h2>
                 <div class="card-body">
                     <p>총 <strong>{len(vulnerabilities)}</strong>개의 고유 CVE에 대해 분석했으며, 그 중 <strong>{sum(1 for v in vulnerabilities if any(f.get('version_comparison', -1) < 0 for f in v.get('findings', [])))}</strong>개의 CVE에 대한 조치가 필요합니다.</p>
                 </div>
             </div>
 
             <div class="card">
-                <div class="card-header">취약점 상세 정보</div>
+                <h2 class="card-header">취약점 상세 정보</h2>
                 <table>
                     <thead>
                         <tr>
@@ -473,61 +527,87 @@ def generate_html_report(system_info, vulnerabilities):
 def generate_nok_report_html(nok_vulnerabilities):
     """[신규] 조치 상태가 'NOK'인 모든 취약점 목록을 보여주는 HTML 파일을 생성합니다."""
     
+    # [사용자 요청] 현재 버전에 화살표 아이콘을 추가하기 위해 HTML 생성 로직을 수정합니다.
     nok_rows = ""
     for i, item in enumerate(nok_vulnerabilities, 1):
         cve_link = f'<a href="https://access.redhat.com/security/cve/{html.escape(item["cve_id"])}" target="_blank">{html.escape(item["cve_id"])}</a>'
+        
+        # 'version_comparison'이 -1 (낮음)일 경우에만 화살표 아이콘을 추가합니다.
+        current_pkg_html = html.escape(item['current_package'])
+        if item.get('version_comparison') == -1:
+            current_pkg_html += ' <span class="version-icon low" title="권고 버전보다 낮음">↓</span>'
+
         nok_rows += f"""
         <tr>
             <td>{i}</td>
             <td>{html.escape(item['hostname'])}</td>
             <td>{cve_link}</td>
-            <td>{html.escape(item['current_package'])}</td>
+            <td>{current_pkg_html}</td>
             <td>{html.escape(item['fix_package'])}</td>
             <td class="status-cell"><span class="status-icon status-nok">NOK</span></td>
         </tr>
         """
 
+    # [사용자 요청] 전체적인 디자인을 다른 리포트와 유사하게 개선합니다.
     nok_report_template = f"""
     <!DOCTYPE html>
     <html lang="ko">
     <head>
         <meta charset="UTF-8">
         <title>전체 조치 필요(NOK) 취약점 목록</title>
+        <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
         <style>
-            body {{ font-family: sans-serif; margin: 2em; line-height: 1.6; color: #333; }}
-            h1 {{ color: #dc3545; border-bottom: 2px solid #eee; padding-bottom: 0.5em; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; box-shadow: 0 2px 3px rgba(0,0,0,0.1); }}
-            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; vertical-align: middle; }}
-            th {{ background-color: #f2f2f2; font-weight: bold; color: #555; }}
-            tr:nth-child(even) {{ background-color: #f9f9f9; }}
-            a {{ color: #007bff; text-decoration: none; }}
+            :root {{
+                --primary-color: #007aff; --danger-color: #ff3b30; --background-color: #f7f8fc;
+                --surface-color: #ffffff; --text-color: #1a1a1a; --header-bg: #1f2937;
+                --header-text: #ffffff; --border-color: #e5e7eb; --shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.04);
+            }}
+            body {{ font-family: 'Noto Sans KR', sans-serif; margin: 0; padding: 2rem; background-color: var(--background-color); color: var(--text-color); }}
+            .container {{ max-width: 1400px; margin: 0 auto; }}
+            .card {{ background-color: var(--surface-color); border-radius: 16px; box-shadow: var(--shadow); overflow: hidden; }}
+            .header {{ background: linear-gradient(135deg, #c81e1e, #a31515); color: var(--header-text); padding: 2.5rem; text-align: center; border-radius: 16px; margin-bottom: 2rem; }}
+            h1 {{ font-size: 2.25rem; font-weight: 700; margin: 0; display: flex; align-items: center; justify-content: center; gap: 1rem; }}
+            .content {{ padding: 2rem; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 1.5rem; }}
+            th, td {{ padding: 1rem 1.5rem; text-align: left; vertical-align: middle; border-bottom: 1px solid var(--border-color); }}
+            thead th {{ background-color: #f9fafb; color: #4B5563; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+            tbody tr:hover {{ background-color: #fff5f5; }}
+            a {{ color: var(--primary-color); text-decoration: none; font-weight: 500; }}
             a:hover {{ text-decoration: underline; }}
             .status-cell {{ text-align: center; }}
             .status-icon {{
-                display: inline-block; padding: 0.25em 0.6em; border-radius: 20px;
-                font-size: 0.85em; color: white; font-weight: bold; min-width: 40px;
+                display: inline-block; padding: 0.3em 0.7em; border-radius: 20px;
+                font-size: 0.9em; color: white; font-weight: bold; min-width: 45px;
             }}
             .status-nok {{ background-color: #ff3b30; }}
+            .version-icon.low {{ color: var(--danger-color); font-weight: bold; font-size: 1.2em; vertical-align: middle; margin-left: 6px; }}
         </style>
     </head>
     <body>
-        <h1>전체 조치 필요(NOK) 취약점 목록</h1>
-        <p>총 <strong>{len(nok_vulnerabilities)}</strong>개의 조치 필요 항목이 발견되었습니다.</p>
-        <table>
-            <thead>
-                <tr>
-                    <th style="width: 5%;">No.</th>
-                    <th>Hostname</th>
-                    <th>CVE ID</th>
-                    <th>현재 패키지 버전</th>
-                    <th>권고 버전</th>
-                    <th style="width: 8%;">조치 상태</th>
-                </tr>
-            </thead>
-            <tbody>
-                {nok_rows if nok_rows else "<tr><td colspan='6' style='text-align:center; color: #666;'>조치가 필요한 취약점이 없습니다.</td></tr>"}
-            </tbody>
-        </table>
+        <div class="container">
+            <div class="header"><h1><i class="fas fa-triangle-exclamation"></i>전체 조치 필요(NOK) 취약점 목록</h1></div>
+            <div class="card">
+                <div class="content">
+                <p>총 <strong>{len(nok_vulnerabilities)}</strong>개의 조치 필요 항목이 발견되었습니다.</p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 5%;">No.</th>
+                            <th>Hostname</th>
+                            <th>CVE ID</th>
+                            <th>현재 패키지 버전</th>
+                            <th>권고 버전</th>
+                            <th style="width: 8%;">조치 상태</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {nok_rows if nok_rows else "<tr><td colspan='6' style='text-align:center; padding: 2rem; color: #666;'>조치가 필요한 취약점이 없습니다.</td></tr>"}
+                    </tbody>
+                </table>
+                </div>
+            </div>
+        </div>
     </body>
     </html>
     """
@@ -541,20 +621,15 @@ def generate_index_html(report_list, total_input_files):
     """
     # [사용자 요청] 각 리포트 앞에 번호를 붙이기 위해 enumerate 사용
     report_rows = ""
-    # [사용자 요청] 개별 삭제 버튼을 위해 report_filename과 hostname을 deleteReport 함수에 전달합니다.
     for i, report in enumerate(sorted(report_list, key=lambda x: x['creation_time'], reverse=True), 1):
         report_rows += f"""
         <tr id="report-row-{html.escape(report['hostname'])}">
-            <td>{i}</td>  <!-- No. 열 추가 -->
+            <td class="center-align">{i}</td>
             <td>{html.escape(report['hostname'])}</td> 
             <td><a href="{html.escape(report['report_filename'])}" target="_blank">{html.escape(report['report_filename'])}</a></td>
             <td>{html.escape(report['creation_time'])}</td>
-            <td>{report['total_vulnerabilities']}</td>
-            <td style="color: #dc3545; font-weight: bold;">{report['nok_vulnerabilities']}</td>
-            <!-- [사용자 요청] 개별 삭제 버튼 추가 -->
-            <td class="actions">
-                <button class="button button-delete" onclick="deleteReport('{html.escape(report['report_filename'])}', '{html.escape(report['hostname'])}')"><i class="fas fa-trash-alt"></i> 삭제</button>
-            </td>
+            <td class="center-align">{report['total_vulnerabilities']}</td>
+            <td class="center-align nok-count"><i class="fas fa-exclamation-triangle"></i> {report['nok_vulnerabilities']}</td>
         </tr>
         """
 
@@ -566,58 +641,67 @@ def generate_index_html(report_list, total_input_files):
         <title>취약점 분석 리포트 목록</title>
         <!-- [신규] 아이콘 라이브러리 추가 -->
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+        <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
-            body {{ font-family: sans-serif; margin: 2em; line-height: 1.6; color: #333; }}
-            h1, h2 {{ color: #0056b3; border-bottom: 2px solid #eee; padding-bottom: 0.5em; margin-top: 1.5em; }}
-            .summary-box {{ background-color: #eef7ff; border: 1px solid #cce5ff; padding: 15px; margin-bottom: 20px; border-radius: 5px; }}
-            /* [신규] 전역 제어 버튼 스타일 */
-            .global-controls {{ display: flex; justify-content: flex-end; gap: 1rem; margin-bottom: 1.5rem; }}
-            .button {{ display: inline-flex; align-items: center; gap: 0.5rem; padding: 8px 15px; border-radius: 5px; border: 1px solid transparent; font-weight: 500; cursor: pointer; text-decoration: none; transition: all 0.2s; }}
-            .button-zip {{ background-color: #198754; color: white; border-color: #198754; }}
-            .button-zip:hover {{ background-color: #157347; }}
-            .button-delete-all {{ background-color: #dc3545; color: white; border-color: #dc3545; }}
-            .button-delete-all:hover {{ background-color: #bb2d3b; }}
-            .button-download {{ background-color: #0d6efd; color: white; border-color: #0d6efd; font-size: 0.85rem; padding: 6px 12px;}}
-            .button-download:hover {{ background-color: #0b5ed7; }}
-            /* [사용자 요청] 개별 삭제 버튼 스타일 추가 */
-            .button-delete {{ background-color: #6c757d; color: white; border-color: #6c757d; font-size: 0.85rem; padding: 6px 12px;}}
-            .button-delete:hover {{ background-color: #5c636a; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; box-shadow: 0 2px 3px rgba(0,0,0,0.1); }}
-            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; vertical-align: top; }}
-            th {{ background-color: #f2f2f2; font-weight: bold; color: #555; }}
-            tr:nth-child(even) {{ background-color: #f9f9f9; }}
-            a {{ color: #007bff; text-decoration: none; }}
+            /* [디자인 개선] 전문가적인 느낌을 주기 위해 전체적인 디자인 시스템을 재구성합니다. */
+            :root {{
+                --primary-color: #3B82F6; --danger-color: #EF4444; --background-color: #F9FAFB; /* 배경색 변경 */
+                --surface-color: #ffffff; --text-color: #1F2937; --header-bg: #1F2937; /* 헤더 배경색 변경 */
+                --header-text: #ffffff; --border-color: #E5E7EB; --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06); /* 그림자 효과 변경 */
+                --shadow-inner: inset 0 2px 4px 0 rgba(0,0,0,0.05);
+            }}
+            body {{ font-family: 'Noto Sans KR', sans-serif; margin: 0; padding: 2.5rem; background-color: var(--background-color); color: var(--text-color); }}
+            .container {{ max-width: 1200px; margin: 0 auto; }}
+            .header {{ background: var(--header-bg); color: var(--header-text); padding: 3rem; text-align: center; border-radius: 16px; margin-bottom: 2.5rem; box-shadow: var(--shadow); }}
+            h1 {{ font-size: 2.5rem; font-weight: 700; margin: 0; display: flex; align-items: center; justify-content: center; gap: 1rem; }}
+            .card {{ background-color: var(--surface-color); border-radius: 16px; box-shadow: var(--shadow); overflow: hidden; }}
+            .card-body {{ padding: 0; }} /* 테이블이 꽉 차도록 패딩 제거 */
+            .button {{ display: inline-flex; align-items: center; gap: 0.5rem; padding: 10px 18px; border-radius: 8px; border: 1px solid transparent; font-weight: 500; cursor: pointer; text-decoration: none; transition: all 0.2s; }}
+            .button-delete {{ background-color: #F3F4F6; color: #4B5563; border: 1px solid #E5E7EB; font-size: 0.85rem; padding: 6px 12px; }}
+            .button-delete:hover {{ background-color: var(--danger-color); color: white; border-color: transparent; }}
+            .footer-link-container {{ padding: 1.5rem; text-align: center; background-color: #F9FAFB; border-top: 1px solid var(--border-color); }}
+            .button-nok-report {{ background: var(--danger-color); color: white; border: none; box-shadow: 0 4px 6px rgba(239, 68, 68, 0.2); }}
+            .button-nok-report:hover {{ transform: translateY(-2px); box-shadow: 0 7px 10px rgba(239, 68, 68, 0.3); }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 1rem 1.5rem; text-align: left; vertical-align: middle; border-bottom: 1px solid var(--border-color); font-size: 0.95rem; }}
+            thead th {{ background-color: #F9FAFB; color: #4B5563; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+            tbody tr {{ transition: background-color 0.2s ease-in-out; }}
+            tbody tr:hover {{ background-color: #EFF6FF; }}
+            tbody tr:last-child td {{ border-bottom: none; }}
+            a {{ color: var(--primary-color); text-decoration: none; font-weight: 500; transition: color 0.2s; }}
             a:hover {{ text-decoration: underline; }}
             .actions {{ text-align: center; }}
+            .center-align {{ text-align: center; }}
+            .nok-count {{ font-weight: 700; color: var(--danger-color); }}
+            .nok-count .fa-exclamation-triangle {{ 
+                color: #FBBF24;
+                margin-right: 0.3rem; 
+            }}
         </style>
     </head>
     <body>
-        <h1>취약점 분석 리포트 목록</h1>
-        <div class="summary-box">
-            <h2>분석 요약</h2>
-            <p>
-                총 <strong>{total_input_files}</strong>개의 시스템 정보 파일이 입력되어 <strong>{len(report_list)}</strong>개의 리포트가 생성되었습니다.
-            </p>
+        <div class="container">
+            <div class="header"><h1><i class="fas fa-shield-virus"></i>취약점 분석 리포트 목록</h1></div>
+            <div class="card">
+                <div class="card-body">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th style="width: 5%;" class="center-align">No.</th>
+                                <th>Hostname</th>
+                                <th>Report File</th>
+                                <th>생성 시간</th>
+                                <th class="center-align">총 취약점</th>
+                                <th class="center-align">조치 필요</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {report_rows if report_rows else "<tr><td colspan='7' style='text-align:center; padding: 2rem; color: #666;'>생성된 리포트가 없습니다.</td></tr>"}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
-        <!-- [신규] 전역 제어판 -->
-        <div class="global-controls">
-            <button class="button button-zip" onclick="downloadAllAsZip()"><i class="fas fa-file-archive"></i> 전체 압축 다운로드</button>
-            <button class="button button-delete-all" onclick="deleteAllReports()"><i class="fas fa-trash-alt"></i> 전체 리포트 삭제</button>
-        </div>
-        <table>
-            <thead>
-                <tr>
-                    <th style="width: 5%;">No.</th><th>Hostname</th><th>Report File</th><th>생성 시간</th><th>총 취약점</th><th>조치 필요</th><th style="width: 10%;">작업</th> <!-- 작업 열 추가 -->
-                </tr>
-            </thead>
-            <tbody>
-                {report_rows if report_rows else "<tr><td colspan='7' style='text-align:center; color: #666;'>생성된 리포트가 없습니다.</td></tr>"} <!-- colspan 6 -> 7 -->
-            </tbody>
-        </table>
-        <!-- [사용자 요청] 전체 시스템 취약점 정보 링크 추가 -->
-        <table style="margin-top: 2rem;">
-             <tr id="total-info-row"><td colspan="7" style="text-align:center; font-weight:bold;"><a href="all_nok_vulnerabilities_{datetime.now().strftime('%Y%m%d')}.html" target="_blank">전체 시스템 취약점 정보</a></td></tr>
-        </table>
 
         <!-- [신규] 비밀번호 입력 모달 -->
         <div id="password-modal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; background-color:rgba(0,0,0,0.5); justify-content:center; align-items:center;">
@@ -639,34 +723,37 @@ def generate_index_html(report_list, total_input_files):
             const confirmDeleteBtn = document.getElementById('confirm-delete-btn');
             const cancelDeleteBtn = document.getElementById('cancel-delete-btn');
 
-            // 개별 리포트 삭제 함수
-            async function deleteReport(filename, hostname) {{
-                if (!confirm(`'${{filename}}' 리포트와 관련 데이터를 정말 삭제하시겠습니까?`)) return;
+            // [BUG FIX] 페이지 로드 시 동적으로 '전체 조치 필요(NOK)' 리포트 링크를 찾아 추가합니다.
+            // 파일 생성 시점 문제로 인해 서버 사이드에서 링크를 추가하지 못하는 문제를 해결합니다.
+            document.addEventListener('DOMContentLoaded', function() {{
+                const tbody = document.querySelector('tbody');
+                if (!tbody) return;
 
-                try {{ 
-                    // 서버의 삭제 API 호출
-                    // [BUG FIX] API 경로를 수정합니다. cve-check 리포트는 /cve-check/api 경로를 사용해야 합니다.
-                    // [BUG FIX] API 경로를 절대 경로로 수정하여 404 오류를 해결합니다.
-                    const response = await fetch(`/AIBox/api/cve-check/reports?file=${{encodeURIComponent(filename)}}`, {{ method: 'DELETE' }});
-                    if (!response.ok) {{
-                        const result = await response.json();
-                        throw new Error(result.error || '개별 리포트 삭제에 실패했습니다.');
-                    }}
-                    // 성공 시 테이블에서 해당 행 제거
-                    const row = document.getElementById(`report-row-${{hostname}}`);
-                    if (row) {{
-                        row.remove();
-                    }}
+                // 'all_nok_vulnerabilities_*.html' 형식의 파일 이름을 찾습니다.
+                // 이 스크립트는 index.html 내에 있으므로, 상대 경로로 파일을 찾습니다.
+                // 서버의 파일 목록을 직접 읽을 수 없으므로, 예상되는 파일 이름을 기반으로 링크를 생성합니다.
+                // 파일 이름은 'all_nok_vulnerabilities_YYYYMMDD.html' 형식이므로, 오늘 날짜로 파일명을 추측합니다.
+                const today = new Date();
+                const yyyy = today.getFullYear();
+                const mm = String(today.getMonth() + 1).padStart(2, '0');
+                const dd = String(today.getDate()).padStart(2, '0');
+                const nokReportFilename = `all_nok_vulnerabilities_${{yyyy}}${{mm}}${{dd}}.html`;
 
-                    // 테이블이 비었는지 확인하고 메시지 표시
-                    const tbody = document.querySelector('tbody');
-                    if (tbody && tbody.children.length === 0) {{
-                        tbody.innerHTML = "<tr><td colspan='5' style='text-align:center; color: #666;'>생성된 리포트가 없습니다.</td></tr>";
-                    }}
-                }} catch (error) {{
-                    alert(`리포트 삭제 오류: ${{error.message}}`);
-                }}
-            }}
+                // 동적으로 링크 행(row)을 생성합니다.
+                const nokRow = document.createElement('tr');
+                nokRow.style.backgroundColor = '#FFFBEB';
+                nokRow.style.fontWeight = 'bold';
+                nokRow.innerHTML = `
+                    <td class="center-align" style="color: #B45309;"><i class="fas fa-star"></i></td>
+                    <td colspan="6">
+                        <a href="${{nokReportFilename}}" target="_blank" style="color: #B45309;">
+                            전체 조치 필요(NOK) 취약점 목록
+                        </a>
+                    </td>
+                `;
+                // 테이블의 마지막에 생성된 행을 추가합니다.
+                tbody.appendChild(nokRow);
+            }});
 
             // 전체 리포트 삭제 함수
             async function deleteAllReports() {{
@@ -716,40 +803,117 @@ def generate_index_html(report_list, total_input_files):
     """
     return index_html_template
 
+# --- [통합] make_cve_db.py의 핵심 기능 ---
+
+LOCAL_CVE_URL = "http://127.0.0.1/AIBox/cve/{cve_id}.json"
+REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
+
+def _fetch_url(url, use_proxy, source_name, cve_id):
+    """단일 URL에서 데이터를 가져오는 헬퍼 함수"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            proxies = {'http': None, 'https': None} if not use_proxy else None
+            response = requests.get(url, timeout=10, proxies=proxies, verify=False)
+            if response.status_code == 200:
+                logging.debug(f"    - [{cve_id}] 성공: {source_name}에서 데이터 수신.")
+                return response.json()
+            if response.status_code == 404:
+                logging.debug(f"    - [{cve_id}] 정보 없음(404): {source_name}")
+                return None # 404는 재시도 불필요
+            logging.warning(f"    - [{cve_id}] {source_name} 응답 오류 (상태 코드: {response.status_code}, 시도 {attempt + 1})")
+        except requests.RequestException as e:
+            logging.warning(f"    - [{cve_id}] {source_name} 연결 오류 (시도 {attempt + 1}): {e}")
+        if attempt < max_retries - 1:
+            time.sleep(1)
+    return None
+
+def fetch_cve_data_from_sources(cve_id: str):
+    """[성능 개선] 로컬 및 외부 소스에서 CVE 데이터를 병렬로 조회하고, 먼저 도착하는 결과를 사용합니다."""
+    sources = [
+        {"url": LOCAL_CVE_URL.format(cve_id=cve_id), "source_name": "로컬 서버", "use_proxy": False},
+        {"url": REDHAT_CVE_URL.format(cve_id=cve_id), "source_name": "Red Hat API", "use_proxy": True}
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_to_source = {executor.submit(_fetch_url, s['url'], s['use_proxy'], s['source_name'], cve_id): s for s in sources}
+        for future in as_completed(future_to_source):
+            result = future.result()
+            if result:
+                # 성공한 요청이 있으면 다른 요청은 취소하고 즉시 결과를 반환합니다.
+                for f in future_to_source: f.cancel()
+                return result
+    return None # 모든 소스에서 조회 실패
+
+def extract_cve_info(cve_data):
+    """[통합] CVE JSON 데이터에서 필요한 정보를 추출합니다."""
+    if not cve_data: return None
+    return {
+        "threat_severity": cve_data.get("threat_severity", "N/A"),
+        "public_date": cve_data.get("public_date", "N/A"),
+        "bugzilla": cve_data.get("bugzilla", {}),
+        "cvss3": cve_data.get("cvss3", {}),
+        "cwe": cve_data.get("cwe", "N/A"),
+        "details": cve_data.get("details", []),
+        "statement": cve_data.get("statement", ""),
+        "affected_release": cve_data.get("affected_release", []),
+        "package_state": cve_data.get("package_state", [])
+    }
+
+def build_cve_database_in_memory(cve_id_list: list) -> dict:
+    """[통합] 주어진 CVE ID 목록으로 메모리 내에서 CVE 데이터베이스를 구축합니다."""
+    cve_database = {}
+    logging.info(Color.header(f"\n===== CVE 데이터베이스 생성을 시작합니다 (총 {len(cve_id_list)}개) ====="))
+    # [사용자 요청] tqdm 진행률 표시줄 로직을 제거하고 간단한 텍스트 로그로 대체합니다.
+    for i, cve_id in enumerate(cve_id_list, 1):
+        logging.info(f"  - [{i}/{len(cve_id_list)}] Processing {cve_id}...")
+        cve_data = fetch_cve_data_from_sources(cve_id)
+        if cve_data:
+            extracted_info = extract_cve_info(cve_data)
+            if extracted_info:
+                cve_database[cve_id] = extracted_info
+    logging.info(Color.success("\n메모리 내 CVE 데이터베이스 생성이 완료되었습니다."))
+    return cve_database
+
 # --- 메인 로직 ---
 
 def main(args):
     # [BUG FIX] 명령줄 인자를 main 함수로 전달받도록 수정
     server_url = args.server_url
+
+    # [BUG FIX] --server-url에서 스키마, 호스트, 포트만 추출하여 AIBox 서버의 기본 URL을 정확히 얻습니다.
+    # 이렇게 하면 AIBox 서버의 기본 경로(예: /AIBox)가 중복되는 것을 방지하고,
+    # AIAnalyzer가 여러 다른 API 엔드포인트를 올바르게 호출할 수 있습니다.
+    parsed_url = urllib.parse.urlparse(server_url)
+    server_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
     if args.no_ai_summary:
         server_url = None # AI 요약 비활성화
 
-    # 디렉토리 준비
-    # [사용자 요청] 스크립트 실행 시 output 디렉토리 초기화
-    if REPORT_OUTPUT_DIR.exists():
-        logging.info(f"기존 output 디렉토리 '{REPORT_OUTPUT_DIR}'의 내용을 삭제합니다.")
-        shutil.rmtree(REPORT_OUTPUT_DIR)
-    
-    REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True) # 삭제 후 다시 생성
-    SYSTEM_DATA_DIR.mkdir(parents=True, exist_ok=True) # data 디렉토리는 유지
-    CVE_DB_PATH.parent.mkdir(parents=True, exist_ok=True) # CVE DB 디렉토리도 확인
+    REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 시스템 정보 파일 목록 가져오기
-    system_files = list(SYSTEM_DATA_DIR.glob("*.json"))
+    # [통합] --cve-id-file 인자로부터 CVE ID 목록을 읽어 메모리 내 DB를 생성합니다.
+    cve_id_file_path = Path(args.cve_id_file)
+    if not cve_id_file_path.is_file():
+        logging.error(Color.error(f"오류: CVE ID 목록 파일 '{cve_id_file_path}'를 찾을 수 없습니다."))
+        return
+    with open(cve_id_file_path, 'r') as f:
+        cve_ids_to_process = [line.strip() for line in f if line.strip()]
+    
+    cve_database = build_cve_database_in_memory(cve_ids_to_process)
+    if not cve_database:
+        logging.error(Color.error("오류: CVE 데이터를 수집하지 못해 리포트를 생성할 수 없습니다."))
+        return
+
+    # [통합] --input-file 인자가 있으면 해당 파일만, 없으면 기존처럼 data 디렉토리 전체를 처리
+    if args.input_file:
+        system_files = [Path(args.input_file)]
+    else:
+        SYSTEM_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        system_files = list(SYSTEM_DATA_DIR.glob("*.json"))
+
     if not system_files:
         logging.error(Color.error(f"오류: 분석할 시스템 정보 파일이 '{SYSTEM_DATA_DIR}'에 없습니다."))
-        return
-
-    # CVE DB 로드
-    if not CVE_DB_PATH.is_file():
-        logging.error(Color.error(f"오류: CVE 데이터베이스 파일 '{CVE_DB_PATH}'를 찾을 수 없습니다."))
-        logging.error(Color.error("'make_cve_db.py'를 먼저 실행하여 데이터베이스를 생성해주세요."))
-        return
-    try:
-        with open(CVE_DB_PATH, 'r', encoding='utf-8') as f:
-            cve_database = json.load(f)
-    except json.JSONDecodeError:
-        logging.error(Color.error(f"오류: CVE DB 파일 '{CVE_DB_PATH}'이 손상되었거나 비어있습니다. 'make_cve_db.py'를 다시 실행해주세요."))
         return
 
     logging.info(Color.header(f"\n총 {len(system_files)}개의 시스템에 대한 분석을 시작합니다..."))
@@ -799,7 +963,7 @@ def main(args):
         # [사용자 요청] CVE별로 결과를 그룹화하기 위해 딕셔너리로 변경
         found_vulnerabilities_map = {}
         for cve_id, cve_data in cve_database.items():
-            cve_findings = []
+            cve_findings = [] # noqa: F841
             # 'affected_release' 확인
             for release in cve_data.get("affected_release", []):
                 product_name = release.get("product_name")
@@ -823,8 +987,9 @@ def main(args):
                 major_ver, minor_ver = os_ver_match.groups()
                 
                 # 주 버전 또는 주.부 버전과 일치하는지 확인
-                is_major_match = f"Red Hat Enterprise Linux {major_ver}" == product_name.split(' for ')[0].strip()
-                is_minor_match = minor_ver and f"Red Hat Enterprise Linux {major_ver}.{minor_ver}" in product_name # noqa: E501
+                # [BUG FIX] is_minor_match의 비교 방향을 수정합니다. 시스템 OS 버전 문자열 안에 제품 이름이 포함되어야 합니다.
+                is_major_match = product_name.split(' for ')[0].strip() == f"Red Hat Enterprise Linux {major_ver}"
+                is_minor_match = minor_ver and product_name in system_os_version
                 if not (is_major_match or is_minor_match):
                     continue
 
@@ -875,6 +1040,7 @@ def main(args):
                     'cve_id': cve_id,
                     'current_package': representative_finding.get('current_package', 'N/A'),
                     'fix_package': representative_finding.get('fix_package', 'N/A'),
+                    'version_comparison': overall_status, # [사용자 요청] 화살표 아이콘을 위해 버전 비교 결과 추가
                 })
 
         # 최종 리포트용 리스트로 변환
@@ -895,17 +1061,11 @@ def main(args):
         
         logging.info(Color.success(f"    - 리포트 생성 완료: {report_path}"))
 
-        # 4. 분석 완료된 시스템 파일 삭제
-        try:
-            os.remove(system_file)
-            logging.info(f"  - [4/4] 분석 완료된 파일 삭제: '{system_file.name}'")
-        except OSError as e:
-            logging.error(Color.error(f"오류: 파일 '{system_file.name}' 삭제 실패 - {e}"))
-
         # [사용자 요청] 인덱스 생성을 위해 리포트 메타데이터 저장 (취약점 개수 정보 추가)
         # [BUG FIX] '조치 필요' 개수가 중복 계산되는 오류 수정
         # 각 CVE에 대해 '조치 필요' 상태인 finding이 하나라도 있으면 1로 계산합니다.
-        nok_count = sum(1 for cve in final_vulnerabilities if any(finding.get('version_comparison', -1) < 0 for finding in cve.get('findings', [])))
+        logging.info(f"    - [3/4] 리포트 메타데이터 생성 중...")
+        nok_count = sum(1 for cve in final_vulnerabilities if any(finding.get('version_comparison', -1) < 0 for finding in cve.get('findings', []))) # noqa: E501
         report_metadata_list.append({
             'hostname': system_info['hostname'],
             'report_filename': report_filename,
@@ -913,6 +1073,7 @@ def main(args):
             'total_vulnerabilities': len(final_vulnerabilities),
             'nok_vulnerabilities': nok_count
         })
+        logging.info(f"    - 분석 완료: '{system_file.name}'")
 
     # [신규] 모든 리포트 생성이 끝난 후, 인덱스 파일 생성
     if report_metadata_list:
@@ -938,7 +1099,11 @@ def main(args):
 if __name__ == "__main__":
     # [BUG FIX] argparse를 추가하여 --server-url 인자를 받도록 합니다.
     parser = argparse.ArgumentParser(description="CVE 취약점 분석 리포트 생성기")
-    parser.add_argument("--server-url", help="AI 요약 기능을 위한 AIBox 서버 URL (예: http://127.0.0.1:5000)")
+    # [통합] --meta-data 대신 --cve-id-file을 받도록 수정합니다.
+    parser.add_argument("--cve-id-file", required=True, help="분석할 CVE ID 목록이 포함된 텍스트 파일 경로")
+    parser.add_argument("--server-url", required=False, help="AI 요약 기능을 위한 AIBox 서버 URL (예: http://127.0.0.1:5000)")
+    # [신규] 분석할 단일 호스트 정보 파일을 지정하는 옵션 추가
+    parser.add_argument("--input-file", help="분석할 단일 시스템 정보 JSON 파일 경로. 지정하지 않으면 /data/iso/AIBox/cve-check/data/ 내의 모든 파일을 처리합니다.")
     parser.add_argument("--no-ai-summary", action="store_true", help="AI 요약 기능 없이 영문 요약으로 리포트를 생성합니다.")
     args = parser.parse_args()
 

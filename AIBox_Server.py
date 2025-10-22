@@ -24,9 +24,18 @@ import subprocess
 import logging
 import logging.handlers
 from collections import OrderedDict
+from pathlib import Path
 import traceback
 import atexit
 import re
+
+# [BUG FIX] 사용자의 로컬 site-packages 경로를 sys.path에 추가합니다.
+# 'Defaulting to user installation'으로 인해 라이브러리가 사용자 디렉터리에 설치되었을 때,
+# 'openpyxl' 등을 찾지 못하는 'ImportError'를 해결합니다.
+import site
+if site.USER_SITE not in sys.path:
+    sys.path.insert(0, site.USER_SITE)
+
 from datetime import datetime, timedelta
 import copy
 import psutil
@@ -75,15 +84,15 @@ except ImportError:
 try:
     import yaml
     IS_YAML_AVAILABLE = True
-except ImportError:
+except ImportError:    
     IS_YAML_AVAILABLE = False
 
-# [사용자 요청] 서버 측 Excel 생성을 위해 openpyxl 라이브러리 추가
+# [BUG FIX] openpyxl 라이브러리 존재 여부를 확인하는 로직 추가
 try:
-    from openpyxl.writer.excel import save_virtual_workbook
+    import openpyxl
     IS_OPENPYXL_AVAILABLE = True
 except ImportError:
-    IS_OPENPYXL_AVAILABLE = False    
+    IS_OPENPYXL_AVAILABLE = False
     IS_TIKTOKEN_AVAILABLE = False
 
 # --- 로깅 및 Flask 앱 설정 ---
@@ -135,6 +144,8 @@ OUTPUT_FOLDER = '/data/iso/AIBox/output'
 CACHE_FOLDER = '/data/iso/AIBox/cache'
 CVE_CHECK_OUTPUT_FOLDER = '/data/iso/AIBox/cve-check/output' # [신규] cve-check 리포트 경로
 RULES_FOLDER = '/data/iso/AIBox/rules'
+CVE_CHECK_DATA_DIR = '/data/iso/AIBox/cve-check/data' # [신규] cve-check 데이터 경로
+CVE_CHECK_DIR = '/data/iso/AIBox/cve-check' # [신규] cve-check 스크립트 경로
 SOS_ANALYZER_SCRIPT = "/data/iso/AIBox/sos_analyzer.py"
 CVE_FOLDER = '/data/iso/AIBox/cve'
 scheduler = None
@@ -181,6 +192,8 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 os.makedirs(CVE_FOLDER, exist_ok=True)
 os.makedirs(CVE_CHECK_OUTPUT_FOLDER, exist_ok=True) # [신규] cve-check 리포트 디렉토리 생성
 os.makedirs(EPSS_FOLDER, exist_ok=True)
+os.makedirs(CVE_CHECK_DIR, exist_ok=True) # [신규] cve-check 디렉토리 생성
+os.makedirs(os.path.join(CVE_CHECK_OUTPUT_FOLDER, "data"), exist_ok=True) # cve-check/data 디렉토리
 os.makedirs(RULES_FOLDER, exist_ok=True)
 # [개선] diskcache는 디렉토리를 자동으로 생성하므로, 이 라인은 더 이상 필요하지 않습니다.
 os.makedirs(CACHE_FOLDER, exist_ok=True)
@@ -265,6 +278,7 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
     with ANALYSIS_LOCK:
         ANALYSIS_STATUS[log_key] = {"status": "queued", "log": ["분석 대기 중..."], "report_file": None, "start_time": time.time()}
 
+    logging.info(f"[{analysis_id}] 백그라운드 분석 스레드 시작. 대상 파일: {file_path}")
     try:
         python_interpreter = "/usr/bin/python3.11"
         output_dir = app.config['OUTPUT_FOLDER']
@@ -277,6 +291,7 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
             "--output", output_dir,
             file_path
         ]
+        logging.info(f"[{analysis_id}] 실행할 분석 명령어: {' '.join(command)}")
 
         with ANALYSIS_LOCK:
             ANALYSIS_STATUS[log_key]["status"] = "running"
@@ -292,6 +307,7 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
             encoding='utf-8',
             errors='replace'
         )
+        logging.info(f"[{analysis_id}] 분석 프로세스 시작됨 (PID: {process.pid}). 실시간 로그 수집을 시작합니다.")
 
         # 실시간으로 출력되는 로그를 읽어 처리합니다.
         if process.stdout:
@@ -301,6 +317,7 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
                     continue
 
                 with ANALYSIS_LOCK:
+                    logging.debug(f"[{analysis_id}] Log: {line}")
                     # 상태 업데이트 로직은 그대로 유지합니다.
                     if "[STEP] EXTRACTING" in line: ANALYSIS_STATUS[log_key]["status"] = "extracting"
                     elif "[STEP] PARSING" in line: ANALYSIS_STATUS[log_key]["status"] = "parsing"
@@ -310,6 +327,7 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
         
         # 프로세스가 종료될 때까지 기다립니다. (타임아웃 20분)
         process.wait(timeout=1200)
+        logging.info(f"[{analysis_id}] 분석 프로세스 종료됨 (PID: {process.pid}, Return Code: {process.returncode}).")
         
         with ANALYSIS_LOCK:
             # [핵심 개선] 분석 프로세스의 성공/실패를 더 명확하게 판단합니다.
@@ -356,19 +374,24 @@ def run_analysis_in_background(file_path, analysis_id, server_url):
                 ANALYSIS_STATUS[log_key]["log"].append(fail_message)
 
     except Exception as e:
+        is_success = False # [수정] 예외 발생 시 성공 플래그를 False로 설정
         with ANALYSIS_LOCK:
             ANALYSIS_STATUS[log_key]["status"] = "failed"
+            logging.error(f"[{analysis_id}] 백그라운드 분석 중 치명적인 오류 발생: {e}", exc_info=True)
             ANALYSIS_STATUS[log_key]["log"].append(f"서버 내부 오류 발생: {e}")
             traceback.print_exc()
     finally:
-        # [사용자 요청] 분석이 성공하든 실패하든, 완료 후에는 원본 sosreport 파일을 삭제하여 디스크 공간을 확보합니다.
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logging.info(f"분석 완료 후 업로드된 sosreport 파일 삭제: {file_path}")
-        except OSError as e:
-            # 파일 삭제 실패가 전체 프로세스에 영향을 주지 않도록 오류만 기록합니다.
-            logging.error(f"업로드된 sosreport 파일 삭제 실패 '{file_path}': {e}")
+        # [사용자 요청] 분석 완료 후 파일을 삭제하는 로직을 비활성화합니다.
+        # # [사용자 요청 수정] 분석이 성공적으로 완료되었을 때만 원본 sosreport 파일을 삭제합니다.
+        # # 실패 시에는 파일을 보존하여 원인 분석이 가능하도록 합니다.
+        # try:
+        #     if is_success and os.path.exists(file_path):
+        #         os.remove(file_path)
+        #         logging.info(f"분석 완료 후 업로드된 sosreport 파일 삭제: {file_path}")
+        # except OSError as e:
+        #     # 파일 삭제 실패가 전체 프로세스에 영향을 주지 않도록 오류만 기록합니다.
+        #     logging.error(f"업로드된 sosreport 파일 삭제 실패 '{file_path}': {e}")
+        pass
 
 
 def cleanup_old_analysis_statuses():
@@ -1036,6 +1059,12 @@ def route_rules_html(): return send_from_directory(SCRIPT_DIR, 'rules.html')
 def route_output(filename): return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
 @app.route('/AIBox/cve/<path:filename>')
 def route_cve_files(filename): return send_from_directory(CVE_FOLDER, filename)
+# [사용자 요청] cve-check 관련 스크립트 다운로드 라우트 추가
+@app.route('/AIBox/cve-check/<path:filename>')
+def route_cve_check_script_files(filename):
+    """gather_bash.sh, gather_py.py와 같은 스크립트 파일을 다운로드합니다."""
+    return send_from_directory(CVE_CHECK_DIR, filename, as_attachment=True)
+
 @app.route('/AIBox/epss/<path:filename>')
 def route_epss_files(filename): return send_from_directory(EPSS_FOLDER, filename)
 
@@ -1161,8 +1190,15 @@ def api_cve_report_for_html():
 
 [Output Format]
 Return ONLY a single valid JSON object with a key "report_markdown" containing the full report."""
-    llm_response_str = call_llm_blocking("You are an elite cybersecurity analyst designed to output JSON.", prompt)
-    summary = _parse_llm_json_response(llm_response_str).get("report_markdown", "Failed to generate report.")
+    # [BUG FIX] call_llm_blocking은 이미 JSON 객체를 반환하므로, _parse_llm_json_response를 중복 호출할 필요가 없습니다.
+    llm_response_obj = call_llm_blocking("You are an elite cybersecurity analyst designed to output JSON.", prompt)
+    
+    # [BUG FIX] LLM 응답이 예상치 못한 형식일 경우를 대비하여 안정성을 강화합니다.
+    if isinstance(llm_response_obj, dict):
+        summary = llm_response_obj.get("report_markdown", "### AI 분석 실패\n- LLM이 유효한 보고서 형식을 반환하지 않았습니다.")
+    else:
+        summary = f"### AI 분석 실패\n- LLM 응답이 예상치 못한 형식입니다: {str(llm_response_obj)}"
+
     final_data = rh_data.copy()
     final_data["comprehensive_summary"] = summary
     return jsonify(final_data)
@@ -1390,6 +1426,11 @@ def api_delete_cve_check_report():
         return jsonify({"error": f"파일 삭제 중 오류 발생: {e}"}), 500
 
 
+@app.route('/AIBox/cve_check.html')
+def route_cve_check_html():
+    """[신규] CVE 분석 자동화 UI 페이지를 렌더링합니다."""
+    return send_from_directory(SCRIPT_DIR, 'cve_check.html')
+
 @app.route('/AIBox/api/sos/analyze_system', methods=['POST'])
 def api_sos_analyze_system():
     try:
@@ -1413,7 +1454,6 @@ def api_sos_analyze_system():
         else: # 기존 security.py와의 호환성을 위한 폴백
             return jsonify({"error": "Invalid request format"}), 400
         
-        # [핵심 개선] 대용량 JSON 응답을 처리하기 위해 스트리밍 방식으로 LLM을 호출하고, 그 결과를 그대로 클라이언트에 스트리밍합니다.
         # [BUG FIX] 요청에 'stream' 플래그가 있는지 확인하여 블로킹/스트리밍 호출을 동적으로 결정합니다.
         # cve_report_generator.py와 같이 단일 응답을 기대하는 클라이언트와의 호환성을 보장합니다.
         if req_data.get('stream', False):
@@ -1422,7 +1462,23 @@ def api_sos_analyze_system():
         else:
             # 블로킹 요청 처리
             response_obj = call_llm_blocking(system_message, user_message=user_message)
-            return jsonify(response_obj)
+
+            # [BUG FIX] create_cve_report.py와 같은 클라이언트가 상세 리포트를 요청했을 때,
+            # AI는 'summary', 'critical_issues' 등을 포함한 JSON 객체를 반환합니다.
+            # 이 경우, 클라이언트가 원하는 것은 'summary' 필드의 마크다운 텍스트이므로,
+            # 해당 텍스트만 추출하여 반환해야 합니다.
+            if isinstance(response_obj, dict) and 'summary' in response_obj and 'critical_issues' in response_obj:
+                # 'summary' 필드의 내용을 최종 응답으로 사용합니다.
+                return Response(response_obj['summary'], mimetype='text/plain; charset=utf-8')
+
+            # [BUG FIX] AI가 순수 텍스트(마크다운)를 반환하는 경우, jsonify()를 사용하면 텍스트가 JSON 문자열로 이중 인코딩되어
+            # 클라이언트에서 '\ucde8\uc57d\uc810'와 같이 깨져 보입니다.
+            # 응답이 문자열인 경우, 순수 텍스트로 반환하도록 수정합니다.
+            if isinstance(response_obj, str):
+                return Response(response_obj, mimetype='text/plain; charset=utf-8')
+            else:
+                # 그 외의 경우(JSON 객체 등)에만 jsonify를 사용합니다.
+                return jsonify(response_obj)
         
     except Exception as e:
         logging.error(f"CVE analysis error: {e}", exc_info=True)
@@ -1468,6 +1524,7 @@ def api_cache_epss():
 @app.route('/AIBox/api/cve/export-excel', methods=['GET'])
 def api_export_cve_excel():
     """[신규] cve_report_generator.py가 생성한 최종 CVE 목록을 읽어 Excel 파일을 생성하고 다운로드합니다."""
+    import io
     if not IS_OPENPYXL_AVAILABLE:
         return "Excel export functionality is disabled because 'openpyxl' library is not installed.", 501
 
@@ -1488,7 +1545,10 @@ def api_export_cve_excel():
             return "Failed to create Excel workbook.", 500
 
         # 메모리 상의 워크북을 바이트 스트림으로 변환
-        virtual_workbook_data = save_virtual_workbook(workbook)
+        virtual_workbook = io.BytesIO()
+        workbook.save(virtual_workbook)
+        virtual_workbook.seek(0)
+        virtual_workbook_data = virtual_workbook.read()
         
         filename = f"RHEL_Vulnerability_Report_{datetime.now().strftime('%Y%m%d')}.xlsx"
         
@@ -1500,6 +1560,25 @@ def api_export_cve_excel():
     except Exception as e:
         logging.error(f"Excel export error: {e}", exc_info=True)
         return "An internal error occurred while generating the Excel file.", 500
+
+@app.route('/AIBox/api/cve/download-report-html', methods=['GET'])
+def api_download_cve_report_html():
+    """[신규] cve_report_generator.py가 생성한 최신 HTML 리포트 파일을 다운로드합니다."""
+    try:
+        # cve_report_generator.py가 사용하는 리포트 파일 경로
+        report_path = os.path.join(OUTPUT_FOLDER, 'rhel_vulnerability_report.html')
+
+        if not os.path.exists(report_path):
+            return "리포트 파일을 찾을 수 없습니다. 먼저 리포트를 생성해주세요.", 404
+
+        return send_from_directory(
+            directory=OUTPUT_FOLDER,
+            path='rhel_vulnerability_report.html',
+            as_attachment=True
+        )
+    except Exception as e:
+        logging.error(f"HTML report download error: {e}", exc_info=True)
+        return "리포트 다운로드 중 오류가 발생했습니다.", 500
 
 @app.route('/AIBox/api/cve/generate-report', methods=['POST'])
 def api_generate_cve_report():
@@ -1518,9 +1597,13 @@ def api_generate_cve_report():
         script_path = os.path.join(SCRIPT_DIR, 'create_cve_report.py')
         python_interpreter = "/usr/bin/python3.11" # 또는 sys.executable
 
-        # 스크립트 실행에 필요한 인자 구성
-        # 서버 자신을 가리키는 URL을 동적으로 생성하여 전달
-        server_url_for_script = f"http://127.0.0.1:{CONFIG.get('port', 5000)}/AIBox/api/cve/analyze"
+        # [BUG FIX] create_cve_report.py는 AI 분석을 위해 '/api/sos/analyze_system' 엔드포인트를 사용하도록 설계되었습니다.
+        # 이전 코드에서는 존재하지 않는 '/api/cve/analyze' 경로를 전달하여 통신 오류가 발생했습니다.
+        # 이제 올바른 엔드포인트 URL을 동적으로 생성하여 전달함으로써,
+        # cve_report.html -> AIBox_Server -> create_cve_report.py -> AIBox_Server (AI 분석) -> create_cve_report.py -> AIBox_Server -> cve_report.html
+        # 로 이어지는 전체 프로세스가 정상적으로 동작하도록, 서버의 기본 URL만 전달하도록 수정합니다.
+        server_url_for_script = f"http://127.0.0.1:{CONFIG.get('port', 5000)}"
+
         command = [
             python_interpreter,
             script_path,
@@ -1567,7 +1650,7 @@ def api_llm_health_check():
 
         # [BUG FIX] 서버의 LLM 요청 큐를 사용하지 않고 직접 호출하여 데드락을 방지합니다.
         # 이 API는 서버의 상태를 확인하는 용도이므로, 일반적인 요청 처리 흐름과 분리하는 것이 안전합니다.
-        raw_response_str = _call_llm_single_blocking(system_message, user_message, model_to_use, request_id="health-check")
+        raw_response_str = _call_llm_single_blocking(system_message, user_message, model_to_use, max_tokens=10, request_id="health-check")
         
         # [BUG FIX] LLM 응답이 순수 텍스트("OK")일 수 있으므로, json.loads()를 사용하지 않고 문자열을 직접 확인합니다.
         # 먼저 응답이 오류를 나타내는 JSON 형식인지 확인합니다.
@@ -1595,6 +1678,202 @@ def api_llm_health_check():
     except Exception as e:
         logging.error(f"LLM 상태 점검 중 예기치 않은 오류 발생: {e}", exc_info=True)
         return jsonify({"status": "error", "message": "서버 내부 오류 발생", "details": str(e)}), 500
+
+@app.route('/AIBox/api/cve-check/analysis-status/<analysis_id>', methods=['GET'])
+def api_cve_check_analysis_status(analysis_id):
+    with ANALYSIS_LOCK:
+        status_info = ANALYSIS_STATUS.get(analysis_id)
+        if status_info:
+            return jsonify(status_info)
+        return jsonify({"status": "not_found", "log": ["해당 분석 ID를 찾을 수 없습니다."]}), 404
+
+def run_cve_check_analysis_background(analysis_id, files_to_process, cve_ids_content):
+    """
+    [신규] CVE 분석 요청을 백그라운드에서 처리하는 함수.
+    1. CVE 목록 파일 생성
+    2. 각 호스트 파일에 대해 make_cve_db.py 실행
+    3. 각 메타데이터에 대해 cve_check_report.py 실행
+    4. 생성된 리포트들을 압축
+    [수정] 모든 호스트에 대해 공통 CVE DB를 사용하고, 각 호스트를 개별적으로 분석한 후, 최종적으로 모든 리포트를 압축합니다.
+    """
+    with ANALYSIS_LOCK:
+        ANALYSIS_STATUS[analysis_id] = {
+            "status": "queued",
+            "log": ["분석 대기열에 추가되었습니다."],
+            "start_time": time.time()
+        }
+    logging.info(f"[{analysis_id}] CVE 분석 백그라운드 작업 시작. 처리할 파일: {len(files_to_process)}개")
+
+    # [BUG FIX] NameError 방지를 위해 임시 파일 목록 변수를 try 블록 이전에 초기화합니다.
+    # 이 변수들은 분석 과정에서 생성되고, finally 블록에서 정리됩니다.
+    # [BUG FIX] 파일 생성 경로를 올바른 cve-check/meta 디렉토리로 수정합니다.
+    timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+    cve_check_meta_dir_for_creation = Path("/data/iso/AIBox/cve-check/meta")
+    common_cve_list_path = cve_check_meta_dir_for_creation / f"CVEID-{timestamp_str}.txt"
+    common_meta_db_path = cve_check_meta_dir_for_creation / f"makecve-{timestamp_str}.json"
+    
+    temp_files_to_clean = [common_cve_list_path, common_meta_db_path]
+    is_success = False  # [수정] finally 블록에서의 UnboundLocalError를 방지하기 위해 미리 선언합니다.
+
+    try:
+        # [사용자 요청 수정] 분석 시작 시, 이전 작업의 결과물일 수 있는 파일들을 정리합니다.
+        # 이전에는 이 로직이 API 핸들러에 있어, 파일이 생성되기도 전에 삭제되는 문제가 있었습니다.
+        # 이제 백그라운드 스레드 내에서, 파일 생성 직전에 정리하도록 수정합니다.
+        logging.info(f"[{analysis_id}] 이전 분석 결과 파일 정리 시작...")
+        cve_check_output_dir_for_cleanup = Path("/data/iso/AIBox/cve-check/output")
+        cve_check_meta_dir_for_cleanup = Path("/data/iso/AIBox/cve-check/meta")
+
+        # output 및 meta 디렉토리의 모든 파일 삭제
+        if cve_check_output_dir_for_cleanup.exists():
+            for item in cve_check_output_dir_for_cleanup.iterdir():
+                if item.is_file(): item.unlink()
+        if cve_check_meta_dir_for_cleanup.exists():
+            for item in cve_check_meta_dir_for_cleanup.iterdir():
+                if item.is_file(): item.unlink()
+        logging.info(f"[{analysis_id}] 이전 분석 결과 파일 정리 완료.")
+        python_interpreter = "/usr/bin/python3.11"
+        cve_check_data_dir = Path("/data/iso/AIBox/cve-check/data")
+        cve_check_meta_dir = Path("/data/iso/AIBox/cve-check/meta")
+        cve_check_output_dir = Path("/data/iso/AIBox/cve-check/output")
+
+        cve_check_meta_dir.mkdir(exist_ok=True)
+        cve_check_output_dir.mkdir(exist_ok=True)
+
+        # [수정] 분석 성공 여부를 추적하는 플래그. 모든 단계가 성공해야 True를 유지합니다.
+        is_success = True
+
+        # [사용자 요청] 분석할 CVE ID 개수와 호스트 파일 개수를 로그에 기록합니다.
+        num_cves = len(cve_ids_content.strip().split('\n'))
+        num_hosts = len(files_to_process)
+        logging.info(f"[{analysis_id}] 분석 대상: {num_hosts}개 호스트, {num_cves}개 CVE ID")
+
+        with ANALYSIS_LOCK:
+            ANALYSIS_STATUS[analysis_id]["status"] = "running"
+            ANALYSIS_STATUS[analysis_id]["log"].append(f"분석 시작 (총 {len(files_to_process)}개 호스트)")
+
+        # 1. 모든 CVE ID에 대한 공통 메타데이터 DB 생성
+        common_cve_list_path.write_text(cve_ids_content, encoding='utf-8')
+        logging.info(f"[{analysis_id}] CVE ID 목록을 '{common_cve_list_path.name}' 파일에 저장했습니다. 내용:\n---\n{cve_ids_content}\n---")
+
+        # 2. 각 호스트 파일에 대해 개별적으로 리포트 생성
+        generated_report_paths = []
+        
+        # [수정] cve_check_report.py를 한 번만 호출하여 모든 파일을 처리하도록 변경
+        with ANALYSIS_LOCK:
+            ANALYSIS_STATUS[analysis_id]["log"].append(f"모든 호스트 파일에 대한 리포트 생성 시작...")
+        
+        report_cmd = [
+            python_interpreter, os.path.join(SCRIPT_DIR, "cve-check", "cve_check_report.py"),
+            # [사용자 요청] cve_check_report.py가 AI 분석을 위해 호출할 정확한 전체 API 엔드포인트 주소를 전달합니다.
+            "--server-url", "http://127.0.0.1",
+            "--cve-id-file", str(common_cve_list_path), # [통합] 생성된 CVE ID 목록 파일 경로를 전달
+            # --input-file 인자를 제거하여 cve_check_report.py가 SYSTEM_DATA_DIR의 모든 파일을 처리하도록 함
+        ]
+        logging.info(f"[{analysis_id}] 리포트 생성 명령어 실행: {' '.join(report_cmd)}")
+        
+        # [최종 해결] 자식 프로세스의 실시간 출력을 처리하여 파이프 버퍼 교착 상태(deadlock)를 방지합니다.
+        # bash 셸에서 직접 실행하는 것과 같이 모든 로그를 실시간으로 수집하고 UI에 전달할 수 있습니다.
+        # [BUG FIX] 자식 프로세스가 올바른 프록시 설정을 상속받도록 환경 변수를 명시적으로 전달합니다.
+        # 특히, no_proxy에 127.0.0.1을 추가하여 로컬 AIBox 서버와의 통신이 프록시를 타지 않도록 보장합니다.
+        process_env = os.environ.copy()
+        no_proxy_list = [val.strip() for val in process_env.get('no_proxy', '').split(',') if val.strip()]
+        if '127.0.0.1' not in no_proxy_list: no_proxy_list.append('127.0.0.1')
+        if 'localhost' not in no_proxy_list: no_proxy_list.append('localhost')
+        process_env['no_proxy'] = ','.join(no_proxy_list)
+
+        cve_check_script_dir = os.path.join(SCRIPT_DIR, "cve-check")
+        process = subprocess.Popen(
+            report_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', cwd=cve_check_script_dir, env=process_env
+        )
+
+        # 실시간으로 출력되는 로그를 읽어 처리합니다.
+        if process.stdout:
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if not line: continue
+                logging.info(f"[{analysis_id}][cve_check_report] {line}")
+                with ANALYSIS_LOCK:
+                    ANALYSIS_STATUS[analysis_id]["log"].append(line)
+        
+        process.wait() # 프로세스가 완전히 종료될 때까지 대기
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, report_cmd, output="", stderr="스크립트 실행 실패. 위 로그를 확인하세요.")
+        
+        # [수정] cve_check_report.py가 모든 파일을 처리한 후, output 디렉토리의 모든 HTML 파일을 수집
+        generated_report_paths = list(cve_check_output_dir.glob("*.html"))
+        if not generated_report_paths:
+            raise Exception("cve_check_report.py가 HTML 리포트를 생성하지 못했습니다.")
+
+        # 3. 모든 리포트 압축
+        if generated_report_paths:
+            # [수정] zip 파일명은 항상 timestamp 기반으로 생성 (여러 파일 처리 시)
+            if len(files_to_process) == 1:
+                zip_base_name = f"{Path(files_to_process[0]).stem}-cvecheck"
+            else:
+                zip_base_name = f"cvecheck-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            zip_filename = f"{zip_base_name}.zip"
+            zip_filepath = Path(app.config['OUTPUT_FOLDER']) / zip_filename
+            
+            with ANALYSIS_LOCK:
+                ANALYSIS_STATUS[analysis_id]["log"].append(f"분석 결과 압축 중... -> {zip_filename}")
+
+            import zipfile
+            with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for report_file in generated_report_paths:
+                    if report_file.is_file():
+                        logging.info(f"[{analysis_id}] 압축 파일에 추가: {report_file.name}")
+                        zf.write(report_file, arcname=report_file.name)
+            
+            with ANALYSIS_LOCK:
+                ANALYSIS_STATUS[analysis_id]["status"] = "complete"
+                ANALYSIS_STATUS[analysis_id]["log"].append("분석 및 압축 완료.")
+                ANALYSIS_STATUS[analysis_id]["zip_file"] = zip_filename
+        else:
+            is_success = False
+            raise Exception("압축할 리포트 파일이 생성되지 않았습니다.")
+
+    except subprocess.CalledProcessError as e:
+        is_success = False
+        error_log = f"분석 스크립트 실행 실패: {e.stderr}"
+        logging.error(error_log)
+        with ANALYSIS_LOCK:
+            ANALYSIS_STATUS[analysis_id]["status"] = "failed"
+            ANALYSIS_STATUS[analysis_id]["log"].append(error_log)
+    except Exception as e:
+        is_success = False
+        logging.error(f"CVE 분석 백그라운드 작업 실패: {e}", exc_info=True)
+        with ANALYSIS_LOCK:
+            ANALYSIS_STATUS[analysis_id]["status"] = "failed"
+            ANALYSIS_STATUS[analysis_id]["log"].append(f"서버 내부 오류: {e}")
+    finally:
+        # [사용자 요청] 분석이 성공적으로 완료되면, 10초 후 생성된 임시 파일들을 삭제합니다.
+        if is_success:
+            with ANALYSIS_LOCK:
+                ANALYSIS_STATUS[analysis_id]["log"].append("분석 완료. 10초 후 임시 파일을 정리합니다...")
+            logging.info(f"[{analysis_id}] 분석 성공. 10초 후 임시 파일 정리를 시작합니다.")
+            time.sleep(10)
+
+            files_to_delete = []
+            # 1. 분석에 사용된 호스트 정보 파일
+            files_to_delete.extend([Path(p) for p in files_to_process])
+            # 2. 생성된 임시 메타 파일
+            files_to_delete.extend(temp_files_to_clean)
+            # 3. 생성된 모든 output 파일 (리포트, 인덱스 등)
+            cve_check_output_dir = Path("/data/iso/AIBox/cve-check/output")
+            if cve_check_output_dir.exists():
+                files_to_delete.extend(list(cve_check_output_dir.glob("*")))
+
+            deleted_count = 0
+            for file_path in files_to_delete:
+                try:
+                    if file_path.is_file():
+                        file_path.unlink()
+                        logging.info(f"[{analysis_id}] 임시 파일 삭제: {file_path}")
+                        deleted_count += 1
+                except OSError as e:
+                    logging.error(f"[{analysis_id}] 임시 파일 삭제 실패 '{file_path}': {e}")
+            logging.info(f"[{analysis_id}] 총 {deleted_count}개의 임시 파일을 정리했습니다.")
 
 def test_llm_connection(config):
     """
@@ -1671,6 +1950,41 @@ def api_upload_and_analyze():
         except Exception as e:
             return jsonify({"error": f"Failed to save file or start analysis: {str(e)}"}), 500
 
+@app.route('/AIBox/api/cve-check/start-analysis', methods=['POST'])
+def api_cve_check_start_analysis():
+    """[신규] CVE 분석을 시작하는 API 엔드포인트."""
+    if 'host_files' not in request.files:
+        return jsonify({"error": "호스트 정보 파일이 없습니다."}), 400
+    
+    host_files = request.files.getlist('host_files')
+    cve_ids_content = request.form.get('cve_ids', '')
+
+    if not host_files or not cve_ids_content.strip():
+        return jsonify({"error": "파일과 CVE ID를 모두 입력해야 합니다."}), 400
+
+    cve_check_data_dir = Path(CVE_CHECK_DATA_DIR)
+    cve_check_data_dir.mkdir(exist_ok=True)
+    
+    # [BUG FIX] UnboundLocalError를 해결하기 위해 analysis_id를 먼저 생성합니다.
+    analysis_id = str(uuid.uuid4())
+
+    saved_file_paths = []
+    for file in host_files:
+        if file and file.filename:
+            filename = secure_filename(file.filename)
+            file_path = cve_check_data_dir / filename
+            file.save(file_path)
+            saved_file_paths.append(str(file_path))
+
+    if not saved_file_paths:
+        return jsonify({"error": "유효한 파일이 업로드되지 않았습니다."}), 400
+
+    # 백그라운드에서 분석 실행
+    thread = threading.Thread(target=run_cve_check_analysis_background, args=(analysis_id, saved_file_paths, cve_ids_content))
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({"message": "CVE 분석이 시작되었습니다.", "analysis_id": analysis_id}), 202
 #--- 서버 실행 ---
 if __name__ == '__main__':
     # [사용자 요청] YAML 설정 파일 로드 로직 추가

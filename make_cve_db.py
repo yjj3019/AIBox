@@ -29,7 +29,7 @@ class Color:
 logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
 
 # CVE 정보를 가져올 URL
-LOCAL_CVE_URL = "http://127.0.0.1:5000/AIBox/cve/{cve_id}.json"
+LOCAL_CVE_URL = "http://127.0.0.1/AIBox/cve/{cve_id}.json"
 REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
 
 # CVE DB 저장 경로
@@ -38,20 +38,29 @@ REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}
 def fetch_cve_data(cve_id):
     """[수정] 재시도 로직이 추가된 CVE 데이터 조회 함수"""
     urls_to_try = [
-        {"url": LOCAL_CVE_URL.format(cve_id=cve_id), "source": "로컬 서버"},
-        {"url": REDHAT_CVE_URL.format(cve_id=cve_id), "source": "Red Hat API"}
+        {"url": LOCAL_CVE_URL.format(cve_id=cve_id), "source": "로컬 서버", "use_proxy": False},
+        {"url": REDHAT_CVE_URL.format(cve_id=cve_id), "source": "Red Hat API", "use_proxy": True}
     ]
     max_retries = 3
 
     for source_info in urls_to_try:
-        url, source = source_info["url"], source_info["source"]
+        url, source, use_proxy = source_info["url"], source_info["source"], source_info["use_proxy"]
         for attempt in range(max_retries):
+            logging.debug(f"    - [{cve_id}] {source}에서 조회 시도 (시도 {attempt + 1})...") # noqa: E501
             try:
-                response = requests.get(url, timeout=20)
+                # [사용자 요청] 로컬 서버는 프록시를 비활성화하고, 외부 서버는 시스템 프록시를 사용하도록 수정합니다.
+                proxies_to_use = None
+                if not use_proxy:
+                    proxies_to_use = {'http': None, 'https': None}
+
+                response = requests.get(url, timeout=20, proxies=proxies_to_use)
+
                 if response.status_code == 200:
-                    if attempt > 0: logging.info(f" -> [{cve_id}] {source}에서 재시도 성공 (시도 {attempt + 1}).")
+                    if attempt > 0: logging.info(f" -> [{cve_id}] {source}에서 재시도 성공 (시도 {attempt + 1}).") # noqa: E501
                     return response.json()
-                if response.status_code == 404: break # 404는 재시도 불필요
+                if response.status_code == 404:
+                    logging.debug(f"    - [{cve_id}] {source}에 정보 없음 (404).") # noqa: E501
+                    break # 404는 재시도 불필요
                 response.raise_for_status()
             except requests.RequestException as e:
                 if attempt < max_retries - 1: time.sleep(1)
@@ -91,8 +100,7 @@ def extract_cve_info(cve_data):
 def main():
     parser = argparse.ArgumentParser(description="CVE ID 목록을 읽어 CVE 데이터베이스를 생성합니다.")
     parser.add_argument("cve_list_file", type=str, help="CVE ID 목록이 포함된 텍스트 파일 경로")
-    # [요청사항] 출력 파일을 지정하는 옵션 추가
-    parser.add_argument("--output", type=str, default="/data/iso/AIBox/cve-check/meta/cve-check_db.json", help="생성될 CVE 데이터베이스 파일의 경로")
+    parser.add_argument("--output", type=str, required=True, help="생성될 CVE 데이터베이스 파일의 경로")
     args = parser.parse_args()
 
     cve_list_path = Path(args.cve_list_file)
@@ -114,6 +122,7 @@ def main():
     
     with open(cve_list_path, 'r') as f:
         cve_ids = [line.strip() for line in f if line.strip()]
+    logging.info(f"파일 '{cve_list_path.name}'에서 {len(cve_ids)}개의 CVE ID를 읽었습니다.")
 
     # DB 파일 디렉토리 생성
     cve_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,9 +138,11 @@ def main():
     with tqdm(total=len(cve_ids), desc="CVE 수집 진행률", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
         for cve_id in cve_ids:
             pbar.set_description(f"Processing {cve_id}")
+            logging.debug(f"  - 처리 시작: {cve_id}") # noqa: E501
             if cve_id in cve_database:
                 skipped_count += 1
                 pbar.update(1)
+                logging.debug(f"    - 건너뜀 (이미 DB에 존재)") # noqa: E501
                 continue
             
             cve_data = fetch_cve_data(cve_id)
@@ -140,9 +151,11 @@ def main():
                 if extracted_info:
                     cve_database[cve_id] = extracted_info
                     success_count += 1
+                    logging.debug(f"    - 수집 성공") # noqa: E501
             else:
                 failure_count += 1
                 failed_cves.append(cve_id)
+                logging.debug(f"    - 수집 실패") # noqa: E501
             
             pbar.set_postfix_str(f"성공: {Color.success(str(success_count))}, 실패: {Color.error(str(failure_count))}, 건너뜀: {Color.warn(str(skipped_count))}")
             pbar.update(1)

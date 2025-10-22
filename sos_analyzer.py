@@ -1793,16 +1793,10 @@ class AIAnalyzer:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                logging.info(f"AI 서버에 분석 요청: {url} (시도 {attempt + 1}/{max_retries})")
-                # [BUG FIX] sos/analyze_system 엔드포인트로 보낼 때, data가 'prompt_template'과 'data' 키를
-                # 포함하는 딕셔너리 형태이므로, 이를 그대로 json 인자로 전달해야 합니다.
-                # 기존에는 data 딕셔너리 자체를 'prompt' 키의 값으로 잘못 감싸고 있었습니다.
-                if endpoint == 'sos/analyze_system' and 'prompt_template' in data:
-                    payload = data
-                else: # 기존 방식 (하위 호환성)
-                    payload = {"prompt": data}
-                response = requests.post(url, json=payload, timeout=timeout)
-                
+                logging.info(f"AI 서버에 분석 요청: {url} (시도 {attempt + 1}/{max_retries})") # [BUG FIX] AI 서버 요청 시, 'prompt' 키로 데이터를 감싸지 않고 요청 본문(payload)을 직접 전달하도록 수정합니다.
+                # 서버의 /api/sos/analyze_system 엔드포인트는 요청 본문이 'prompt_template'과 'data' 키를 포함하는 객체 자체이기를 기대합니다.
+                response = requests.post(url, json=data, timeout=timeout)
+
                 if attempt > 0:
                     logging.info(Color.success(f"AI 서버 재연결 성공 (시도 {attempt + 1}/{max_retries}): {url}"))
 

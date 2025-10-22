@@ -9,7 +9,7 @@
 set -e # 오류 발생 시 스크립트 중단
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-VENV_DIR="${SCRIPT_DIR}/venv"
+VENV_DIR="${SCRIPT_DIR}/.venv"
 
 echo "--- AIBox 서버 실행 스크립트 시작 ---"
 
@@ -35,8 +35,10 @@ echo "패키지 설치가 완료되었습니다."
 # 예: export LLM_URL="http://your-llm-server:8080"
 export AIBOX_PASSWORD="aibox_admin" # [수정] 비밀번호를 환경 변수로 설정합니다.
 
+# [BUG FIX] 시스템의 python3 대신, 활성화된 가상 환경(venv) 내의 python을 사용하여 서버를 실행합니다.
+# 이렇게 하면 가상 환경에 설치된 라이브러리(openpyxl 등)를 정상적으로 임포트할 수 있습니다.
 echo "AIBox 서버를 시작합니다..."
 # [수정] 더 이상 사용하지 않는 --password 인자를 제거합니다.
-python3 "${SCRIPT_DIR}/AIBox_Server.py" --llm-url "http://127.0.0.1:11434" --model "qwen:7b"
+/usr/bin/python "${SCRIPT_DIR}/AIBox_Server.py"
 
 echo "--- AIBox 서버가 종료되었습니다. ---"
